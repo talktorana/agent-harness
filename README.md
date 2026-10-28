@@ -174,6 +174,16 @@ volumes:
 
 `--memory-export` / `--memory-import` move the tree between hosts.
 
+## Documentation
+
+| | |
+|---|---|
+| [Examples](docs/EXAMPLES.md) | ten worked use cases, with the commands to run |
+| [Guide](docs/GUIDE.md) | writing tasks and `system.md`, memory hygiene, troubleshooting |
+| [Architecture](docs/ARCHITECTURE.md) | how it works, and why each piece is that shape |
+
+Start with the examples — they show the range faster than any description.
+
 ## Files
 
 ```
@@ -193,3 +203,7 @@ Not a framework and not production multi-tenant infrastructure. It is a
 single-user tool that runs one task at a time and asks before it writes. That
 is the right shape for an assistant you supervise — and the wrong shape for
 something you leave unattended against systems you care about.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
