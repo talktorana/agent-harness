@@ -1,0 +1,37 @@
+# The agent harness. Mount the project it works on read-only and keep it off
+# the network it could otherwise damage.
+#
+#   docker compose run --rm agent "explain how the retry policy works"
+#
+# Security posture, in order of importance:
+#   * the project is mounted READ-ONLY at /project
+#   * /workspace is writable scratch; nothing there is load-bearing
+#   * the agent has NO docker socket and NO ssh keys, so it cannot restart
+#     services or reach the host it runs on
+#   * write_file to /project is refused by the mount, not by policy
+# To give it more power later, add a scoped deploy key or an API -- not the
+# socket.
+services:
+  agent:
+    build: .
+    image: agent-harness:1.0.0
+    env_file: .env
+    environment:
+      AGENT_PROJECT_ROOT: /project
+      AGENT_CONFIRM_WRITES: "0"
+      # Memory is the agent's accumulated knowledge. On the container's own
+      # filesystem it dies with the container and every recreate starts the
+      # agent knowing nothing -- the exact regression memory exists to prevent.
+      AGENT_MEMORY_ROOT: /data/memories
+    volumes:
+      # Read-only view of the codebase. This is what the agent inspects,
+      # tests and reasons about.
+      - ../project:/project:ro
+      # Writable scratch and transcripts.
+      - ./workspace:/workspace
+      - ./out:/out
+      # Memory. Mounted read-write so the agent can record what it learns.
+      - ./memories:/data/memories
+    working_dir: /workspace
+    stdin_open: true
+    tty: true

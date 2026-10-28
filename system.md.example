@@ -1,0 +1,53 @@
+<!--
+  system.md -- the project's own prompt.
+
+  The harness is domain-free: it does not know what this system does or what
+  is dangerous to change in it. This file is appended to the system prompt
+  under "This project". Put it at <project>/system.md, or point
+  AGENT_PROMPT_FILE at it to keep it out of the tree the agent edits.
+
+  Keep it SHORT. The agent reads this before every task. Two things matter:
+  what must not change without approval, and what the vocabulary means.
+-->
+
+# What this is
+
+One paragraph. Enough that someone who has never seen the repo knows what it
+is for and who depends on it.
+
+# Do not change without explicit approval
+
+Bullet list. Be specific about *behaviour*, not files:
+
+- The `Posting` wire format — clients pin it.
+- The double-entry invariants checked in `ledger/validate.py`.
+- Any migration that rewrites rows older than the current release.
+- Authn/authz checks, rate limits, or anything that fails *open* when a
+  dependency is unavailable.
+
+If the agent cannot tell a load-bearing behaviour from an ordinary refactor,
+it will eventually refactor one.
+
+# Vocabulary
+
+Short glossary. Every codebase has words that mean something specific:
+
+- **Voucher** — an immutable group of postings.
+- **Settlement** — a separate, idempotent step. Never assume one implies the
+  other.
+- **Draft** — may be mutated; **posted** may not.
+
+# Working agreements
+
+Anything specific to this project's workflow:
+
+- Tests: `python -m pytest -q`. The integration suite needs the database up
+  and takes ~90s; the unit suite is 4s.
+- Do not edit generated files in `build/`.
+- Feature flags live in `config/flags.toml`; changing one is a deploy.
+
+# What is safe to do freely
+
+Say so explicitly if there is anything the agent can always do — running the
+test suite, reading any file, regenerating the API client. Naming it stops the
+agent from asking.

@@ -1,0 +1,21 @@
+# Secrets. Never commit.
+.env
+
+# Per-task run logs. They echo whatever the agent looked at, which may include
+# private project detail -- and they are runtime artefacts, not source.
+sessions/
+memories/session/
+
+# Memory snapshots written before a destructive edit.
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Scratch
+.tmp/
+out/
+workspace/
