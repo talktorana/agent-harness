@@ -4,6 +4,10 @@ Each one is a real shape of task, with the command, what the agent actually
 does, and what you get back. Adapt the wording — the quality of the answer
 follows the quality of the question.
 
+For infrastructure — GKE, GCP, Terraform, monitoring and incident work — see
+[DEVOPS.md](DEVOPS.md). Those examples carry an **autonomy level**, which is
+the part worth reading before you run anything.
+
 Assume `harness` is `python run.py`, and `AGENT_PROJECT_ROOT` points at the
 codebase you mean.
 
