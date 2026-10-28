@@ -179,10 +179,13 @@ volumes:
 | | |
 |---|---|
 | [Examples](docs/EXAMPLES.md) | ten worked use cases, with the commands to run |
+| [DevOps & infrastructure](docs/DEVOPS.md) | GKE, GCP, Terraform, monitoring — and what to let it do alone |
 | [Guide](docs/GUIDE.md) | writing tasks and `system.md`, memory hygiene, troubleshooting |
 | [Architecture](docs/ARCHITECTURE.md) | how it works, and why each piece is that shape |
 
-Start with the examples — they show the range faster than any description.
+Start with the examples — they show the range faster than any description. If
+you are pointing this at infrastructure, read the DevOps one first: it is
+mostly about the autonomy boundary, and that is the part that matters.
 
 ## Files
 
