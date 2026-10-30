@@ -549,6 +549,63 @@ class ApplySemanticsTest(ApplierTestBase):
         self.handle(path)
         self.assertEqual(os.stat(target).st_mode & 0o777, 0o750)
 
+    def test_existing_file_owner_is_preserved(self):
+        """A root-run applier must not flip deployed code to root-owned.
+
+        Hosts with systemd and no cron run this unit as root (it needs docker
+        for restarts), and a naive write leaves every applied file root:root.
+        Mixed ownership is what made the outbox readable-but-unwritable to its
+        next non-root caller, so ownership is carried across deliberately.
+
+        Checked by recording the chown calls rather than asserting real uids,
+        so the test is meaningful without root on any platform.
+        """
+        target = self.root / "engine" / "owned.py"
+        target.write_text("old", encoding="utf-8")
+        st = os.stat(target)
+        calls = []
+        real_chown = getattr(os, "chown", None)
+        if real_chown is None:
+            self.skipTest("this platform has no os.chown")
+        with mock.patch("deploy_applier.os.chown",
+                        side_effect=lambda p, uid, gid: calls.append((uid, gid))):
+            path, _ = self.stage([{"target": "engine/owned.py",
+                                   "payload": "new"}])
+            self.assertEqual(self.handle(path)["status"], "applied")
+        self.assertIn((st.st_uid, st.st_gid), calls,
+                      f"owner {st.st_uid}:{st.st_gid} was not re-applied; "
+                      f"chown calls: {calls}")
+        self.assertEqual(target.read_text(encoding="utf-8"), "new")
+
+    def test_a_new_file_inherits_the_parent_directory_owner(self):
+        """So a deploy never drops a lone root-owned file into a user tree."""
+        st = os.stat(self.root / "engine")
+        calls = []
+        if getattr(os, "chown", None) is None:
+            self.skipTest("this platform has no os.chown")
+        with mock.patch("deploy_applier.os.chown",
+                        side_effect=lambda p, uid, gid: calls.append((uid, gid))):
+            path, _ = self.stage([{"target": "engine/brand_new.py",
+                                   "payload": "new"}])
+            self.assertEqual(self.handle(path)["status"], "applied")
+        self.assertIn((st.st_uid, st.st_gid), calls, calls)
+
+    def test_a_refused_chown_does_not_fail_an_already_successful_write(self):
+        """The write is the deliverable; ownership is best-effort."""
+        if getattr(os, "chown", None) is None:
+            self.skipTest("this platform has no os.chown")
+
+        def deny(path, uid, gid):
+            raise PermissionError(1, "not permitted to chown")
+
+        with mock.patch("deploy_applier.os.chown", side_effect=deny):
+            path, _ = self.stage([{"target": "engine/nochown.py",
+                                   "payload": "written\n"}])
+            receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual((self.root / "engine" / "nochown.py").read_text(
+            encoding="utf-8"), "written\n")
+
     def test_no_tmp_file_is_left_behind(self):
         path, _ = self.stage([{"target": "engine/clean.py", "payload": "x"}])
         self.handle(path)
