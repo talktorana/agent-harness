@@ -1,0 +1,48 @@
+{
+  "_readme": [
+    "Copy to providers.json and fill in keys. Keys are read from the",
+    "environment variable named by api_key_env (preferred) or from api_key.",
+    "Never commit a real key. The web UI's /models endpoint never returns",
+    "key material.",
+    "Aliases on the left of 'models' are what you type and select in the UI;",
+    "values on the right are the provider's real model ids on the wire.",
+    "Add any OpenAI-compatible endpoint the same way: base_url + models."
+  ],
+  "default": {
+    "provider": "openrouter",
+    "model": "deepseek-v4.1-flash"
+  },
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "api_key": "",
+      "models": {
+        "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash-1017",
+        "deepseek-v4-pro": "deepseek/deepseek-v4-pro-0813",
+        "claude-sonnet-4.6": "anthropic/claude-sonnet-4.6",
+        "gemini-3-flash": "google/gemini-3-flash-preview",
+        "provider-5-mini": "openai/google/gemma-4-31B-it-fp8-mini"
+      }
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "api_key": "",
+      "models": {
+        "gpt-5-mini": "google/gemma-4-31B-it-fp8-mini",
+        "gpt-5": "gpt-5"
+      }
+    },
+    "ollama-local": {
+      "_comment": "Local models need no key; any non-empty value works.",
+      "base_url": "http://localhost:11434/v1",
+      "api_key_env": "",
+      "api_key": "ollama",
+      "models": {
+        "provider3-coder": "provider3-coder:latest",
+        "llama3.1": "llama3.1:8b"
+      }
+    }
+  }
+}

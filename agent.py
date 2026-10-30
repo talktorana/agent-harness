@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 import config
+import llm
 import tools_media
 from memory import MemoryStore
 from prompts import build_system
@@ -123,15 +124,20 @@ def assemble_stream(chunks, emit=None) -> SimpleNamespace:
 
 
 class Agent:
-    def __init__(self, verbose: bool = True, on_token=None):
+    def __init__(self, verbose: bool = True, on_token=None,
+                 provider: Optional[str] = None,
+                 model: Optional[str] = None):
         # max_retries=0 because _complete() does its own backoff. The SDK's
         # internal retries stacked on top of ours turned one hung call into
         # many minutes of silence with nothing in the transcript to explain it.
-        self.client = OpenAI(base_url=config.BASE_URL, api_key=config.API_KEY,
-                             timeout=config.API_TIMEOUT_SEC, max_retries=0)
+        # The endpoint is resolved per task from the provider catalogue
+        # (llm.py): explicit choice > providers.json default > environment.
+        self.resolved = llm.resolve(provider, model)
+        self.client = llm.client_for(self.resolved)
         # The system prompt is built per task, once the session and its memory
         # scope exist -- so this starts empty and run() fills it in.
         self.messages: List[Dict[str, Any]] = []
+        self.verbose = verbose
         # Optional sink for streamed tokens (the web UI appends them to the
         # live transcript; the CLI prints them as they arrive).
         self.on_token = on_token
@@ -220,7 +226,7 @@ class Agent:
         and only give up once both are exhausted -- so a busy engine costs time,
         not the whole monitoring pass.
         """
-        chain = [config.MODEL]
+        chain = [self.resolved.model_id]
         if config.FALLBACK_MODEL:
             chain.append(config.FALLBACK_MODEL)
         problems: List[str] = []
@@ -328,8 +334,8 @@ class Agent:
         # Session record and memory come first: the model should see its own
         # notes before it acts, and the record of what it did should exist even
         # if this dies on the very first API call.
-        self.session = SessionLog(task=task, model=config.MODEL,
-                                  base_url=config.BASE_URL)
+        self.session = SessionLog(task=task, model=self.resolved.label(),
+                                  base_url=self.resolved.base_url)
         set_memory_session(self.session.session_id)
 
         memory = MemoryStore(session_id=self.session.session_id)
@@ -472,6 +478,9 @@ class Agent:
 
 def run_task(task: str, verbose: bool = True,
              images: Optional[List[str]] = None,
-             on_token=None) -> str:
+             on_token=None,
+             provider: Optional[str] = None,
+             model: Optional[str] = None) -> str:
     """Convenience entry point."""
-    return Agent(verbose=verbose, on_token=on_token).run(task, images=images)
+    return Agent(verbose=verbose, on_token=on_token, provider=provider,
+                 model=model).run(task, images=images)
