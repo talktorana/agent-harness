@@ -6,6 +6,7 @@
 """
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -220,6 +221,13 @@ def main() -> int:
                         help="List configured providers and model aliases, "
                              "then exit.")
     parser.add_argument("--base-url", help="Override AGENT_BASE_URL.")
+    parser.add_argument("--routes", metavar="SPEC",
+                        help="Model-routing fallback chain: "
+                             "'prov/model-a,prov2/model-b'. Tried in order "
+                             "when the primary route is dead or exhausted.")
+    parser.add_argument("--routes-file", metavar="PATH",
+                        help="Path to a routes.json fallback chain file "
+                             "(see routes.json.example).")
     parser.add_argument("--steps", type=int, help="Override AGENT_MAX_STEPS.")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print the final answer.")
@@ -246,6 +254,15 @@ def main() -> int:
         config.MAX_STEPS = args.steps
     if args.no_confirm:
         config.CONFIRM_WRITES = False
+
+    if args.routes:
+        os.environ["AGENT_ROUTES"] = args.routes
+    if args.routes_file:
+        # llm binds ROUTES_FILE at import time, which already happened --
+        # patch the module attribute so this run honours the flag.
+        os.environ["AGENT_ROUTES_FILE"] = args.routes_file
+        import llm as _llm_routes
+        _llm_routes.ROUTES_FILE = Path(args.routes_file).expanduser()
 
     if args.check:
         return check_connection()
@@ -298,7 +315,12 @@ def main() -> int:
 
     print(f"\033[90mmodel={resolved.label()} ({resolved.model_id})  "
           f"base={resolved.base_url}  "
-          f"root={config.PROJECT_ROOT}  max_steps={config.MAX_STEPS}\033[0m\n")
+          f"root={config.PROJECT_ROOT}  max_steps={config.MAX_STEPS}\033[0m")
+    chain = llm.route_chain(args.provider, args.model)
+    if len(chain) > 1:
+        trail = " -> ".join(f"{p}/{m}" for p, m in chain)
+        print(f"\033[90mroute chain: {trail}\033[0m")
+    print()
 
     answer = run_task(task, verbose=not args.quiet, images=args.image or None,
                       provider=args.provider, model=args.model)

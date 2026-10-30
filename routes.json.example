@@ -1,0 +1,33 @@
+{
+  "_comment": "Ordered model-routing fallback chain. First entry is the preferred model; later entries are tried when a route is dead (unknown model, bad key) or exhausted (retries). Override with env AGENT_ROUTES='prov/model,prov/model'.",
+  "routes": [
+    {
+      "provider": "gateway",
+      "model": "gateway-reasoning"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-fast"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-mid"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-alt"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-pro"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-large"
+    },
+    {
+      "provider": "gateway",
+      "model": "gateway-experimental"
+    }
+  ]
+}

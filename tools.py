@@ -31,6 +31,7 @@ from tools_media import view_image
 from tools_repo_map import repo_map
 from tools_safety import guard_command
 from tools_session import session_list, session_read, session_search
+import tools_todo  # module namespace: set_todo_session below
 from tools_todo import manage_todo_list, todo_show
 
 #: Prefer an explicit bash. On Windows ``shell=True`` gives CMD, which
@@ -93,7 +94,9 @@ _SANDBOX = PythonSandbox()
 #: directory and supplies the exit code -- so the call reports success while
 #: doing something else entirely. Rewriting the path in the tool removes a
 #: whole class of "it looked like it worked".
-_MNT_DRIVE = re.compile(r"(?<![\w.])/mnt/([A-Za-z])/")#: Shared memory tree, the same one the editor writes to.
+_MNT_DRIVE = re.compile(r"(?<![\w.])/mnt/([A-Za-z])/")
+
+#: Shared memory tree, the same one the editor writes to.
 _MEMORY = MemoryStore()
 
 

@@ -42,7 +42,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 
@@ -92,7 +92,7 @@ def providers() -> Dict[str, Dict[str, Any]]:
     data = _load_file()
     raw = data.get("providers") or {}
     if not isinstance(raw, dict):
-        raise providerError("'providers' must be an object.")
+        raise ProviderError("'providers' must be an object.")
     for name, pcfg in raw.items():
         if not isinstance(pcfg, dict):
             continue
@@ -143,7 +143,7 @@ def resolve(provider: Optional[str] = None,
     """Turn a (provider, model) request into a concrete endpoint.
 
     Precedence: explicit arguments > file default > environment provider.
-    Raises providerError with an actionable message on unknown names or
+    Raises ProviderError with an actionable message on unknown names or
     missing keys -- never returns a half-configured endpoint.
     """
     table = providers()
@@ -208,6 +208,14 @@ def catalog() -> Dict[str, Any]:
             "models": sorted(models.keys()) if isinstance(models, dict) else [],
             "key_configured": _has_key(pcfg),
         }
+    # The fallback chain as labels: the UI shows "a → b → c" so the operator
+    # can see WHERE a task will land when the primary is busy. Key-free like
+    # everything else in this payload -- it is served over HTTP.
+    try:
+        out["routes"] = [f"{p}/{m}" for p, m in configured_chain()]
+    except ProviderError as exc:
+        out["routes"] = []
+        out["routes_error"] = str(exc)
     return out
 
 
@@ -218,3 +226,114 @@ def _has_key(pcfg: Dict[str, Any]) -> bool:
     inline = str(pcfg.get("api_key") or "").strip()
     return bool(inline) and not inline.startswith(
         ("CHANGE_ME", "your-", "sk-PLACEHOLDER"))
+
+
+# --------------------------------------------------------------------- routes
+#
+# MODEL ROUTING: an ordered chain of (provider, model) pairs. The agent tries
+# route 1; if that endpoint is overloaded, rate-limited, down, or simply does
+# not have the model, it moves to route 2, and so on -- across PROVIDERS, not
+# just model ids, because the failure modes that matter overnight (a whole
+# gateway flapping, a quota exhausting) are per-provider, not per-model.
+#
+# Sources, highest precedence first:
+#   1. an explicit (provider, model) handed to Agent()/CLI -- it PREPENDS to
+#      the configured chain, so a one-off choice still enjoys the fallbacks;
+#   2. AGENT_ROUTES env:  "prov/model-a, prov/model-b, prov2/model-c"
+#   3. routes.json beside the harness: {"routes": [{"provider":..,"model":..}]}
+#   4. the legacy behaviour: primary model + AGENT_FALLBACK_MODEL.
+#
+# Routes are resolved LAZILY, one turn at a time (agent.py): a route whose key
+# is missing or whose alias is unknown costs a logged skip, not the whole
+# chain. That is deliberate -- overnight, a half-configured third route must
+# never stop the first two from working.
+
+#: The routing file, beside the harness. Absent is valid.
+ROUTES_FILE = Path(os.environ.get(
+    "AGENT_ROUTES_FILE",
+    str(Path(__file__).resolve().parent / "routes.json")))
+
+
+def parse_route_spec(raw: str) -> List[Tuple[str, str]]:
+    """Parse an AGENT_ROUTES-style string into (provider, model) pairs.
+
+    ``"prov/model-a,prov/model-b"`` -- a bare model with no slash inherits the
+    catalogue's default provider, so a one-provider chain stays terse.
+    Empty items are ignored; whitespace is forgiven.
+    """
+    pairs: List[Tuple[str, str]] = []
+    default_provider = default_choice()[0]
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "/" in item:
+            prov, model = item.split("/", 1)
+            prov, model = prov.strip(), model.strip()
+        else:
+            prov, model = default_provider, item
+        if prov and model:
+            pairs.append((prov, model))
+    return pairs
+
+
+def _routes_from_file() -> List[Tuple[str, str]]:
+    if not ROUTES_FILE.is_file():
+        return []
+    try:
+        data = json.loads(ROUTES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProviderError(f"{ROUTES_FILE} is not readable JSON: {exc}")
+    raw = data.get("routes") if isinstance(data, dict) else data
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProviderError(f"{ROUTES_FILE.name}: 'routes' must be a list.")
+    pairs: List[Tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, dict) and item.get("model"):
+            prov = str(item.get("provider") or default_choice()[0]).strip()
+            pairs.append((prov, str(item["model"]).strip()))
+        elif isinstance(item, str) and item.strip():
+            pairs.extend(parse_route_spec(item))
+    return pairs
+
+
+def configured_chain() -> List[Tuple[str, str]]:
+    """The route chain from the environment or routes.json (may be empty)."""
+    env_raw = os.environ.get("AGENT_ROUTES", "").strip()
+    if env_raw:
+        return parse_route_spec(env_raw)
+    return _routes_from_file()
+
+
+def route_chain(provider: Optional[str] = None,
+                model: Optional[str] = None) -> List[Tuple[str, str]]:
+    """The full ordered fallback chain for a request.
+
+    The resulting pairs are NOT resolved here -- resolution happens per turn in
+    the agent so that one dead route degrades the chain instead of failing the
+    task. Duplicates are collapsed, keeping first occurrence (order is the
+    whole point of a route list).
+    """
+    primary: Tuple[str, str]
+    if provider or model:
+        d_provider, d_model = default_choice()
+        primary = (provider or d_provider, model or d_model)
+    else:
+        primary = default_choice()  # type: ignore[assignment]
+
+    chain: List[Tuple[str, str]] = [primary]
+    chain.extend(configured_chain())
+    if config.FALLBACK_MODEL:
+        # Legacy single-provider fallback: same provider as the primary,
+        # appended last so newer route configs win the middle slots.
+        chain.append((primary[0], config.FALLBACK_MODEL))
+
+    seen: set = set()
+    ordered: List[Tuple[str, str]] = []
+    for pair in chain:
+        if pair not in seen:
+            seen.add(pair)
+            ordered.append(pair)
+    return ordered

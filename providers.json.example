@@ -9,8 +9,8 @@
     "Add any OpenAI-compatible endpoint the same way: base_url + models."
   ],
   "default": {
-    "provider": "openrouter",
-    "model": "deepseek-v4.1-flash"
+    "provider": "gateway",
+    "model": "gateway-reasoning"
   },
   "providers": {
     "openrouter": {
@@ -42,6 +42,19 @@
       "models": {
         "provider3-coder": "provider3-coder:latest",
         "llama3.1": "llama3.1:8b"
+      }
+    },
+    "gateway": {
+      "base_url": "https://gateway.example.com/v1",
+      "api_key_env": "GATEWAY_API_KEY",
+      "models": {
+        "gateway-fast": "vendor-a/fast-model",
+        "gateway-mid": "vendor-a/mid-model",
+        "gateway-reasoning": "vendor-b/reasoning-model",
+        "gateway-alt": "vendor-c/alt-model",
+        "gateway-pro": "vendor-c/pro-model",
+        "gateway-large": "vendor-d/large-model",
+        "gateway-experimental": "vendor-e/experimental-model"
       }
     }
   }
