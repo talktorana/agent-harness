@@ -24,6 +24,7 @@ from memory import MemoryStore
 from prompts import build_system
 from session import SessionLog
 from tools import HANDLERS, TOOLS, set_memory_session
+from tools_repo_map import build_repo_map
 
 # Statuses that mean "the service is momentarily unable", not "your request is
 # wrong". Only these are worth waiting out.
@@ -237,9 +238,19 @@ class Agent:
         set_memory_session(self.session.session_id)
 
         memory = MemoryStore(session_id=self.session.session_id)
+        # The structural map is built once per task, not per step: it is the
+        # same codebase for the whole run, and rebuilding it every turn would
+        # pay AST-parse cost for nothing. A failure degrades to no map -- the
+        # task must never die while assembling its own prompt.
+        try:
+            repo_map = (build_repo_map() if config.REPO_MAP_ENABLED else "")
+        except Exception as exc:  # noqa: BLE001
+            repo_map = ""
+            self._log({"event": "repo_map_failed", "error": str(exc)[:300]})
         system = build_system(memory.head("repo"),
                               str(memory.path_for("repo")),
-                              str(config.PROJECT_ROOT))
+                              str(config.PROJECT_ROOT),
+                              repo_map=repo_map)
         self.messages.append({"role": "system", "content": system})
         self.messages.append({"role": "user", "content": task})
         self._log({"event": "task", "task": task})

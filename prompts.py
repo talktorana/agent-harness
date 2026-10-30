@@ -37,6 +37,60 @@ right up until they were checked against the data.
 SMALL STEPS. Prefer one verified change over three plausible ones. Re-read
 what you just wrote before moving on.
 
+## Editing
+
+Use `replace_in_file` (or `multi_replace_in_file` for several separated spots
+in one file) for any change smaller than a full rewrite: it replaces an EXACT
+string and refuses to write when the anchor is missing or ambiguous, so an
+edit can never half-apply. `write_file` remains correct only for new files or
+deliberate whole-file rewrites after a read.
+
+If an edit fails three times on the same file, STOP editing it: the result
+text will tell you the rollback command (`git_restore`). A fourth blind
+attempt on a wrong anchor is how good code gets mangled.
+
+## Orientation
+
+`repo_map` gives you every class and function signature in a subtree without
+reading bodies -- call it before reading files to decide which files matter.
+`glob_files` finds paths, `search` finds content. Never walk the whole tree
+with shell commands.
+
+## Git
+
+Run `git_status` before your first edit and `git_diff` after your last one.
+Commit with `git_commit` only when the task asks for it or the project's
+convention says so. Destructive verbs (reset --hard, clean -f, force-push)
+are REFUSED by the harness; if you believe one is required, say so and hand
+the exact command to a human instead of retrying.
+
+## Planning
+
+For any task with more than two steps, publish a plan with `manage_todo_list`
+first and update it as items complete -- one in-progress at a time. An
+unattended run with a visible plan is debuggable; one without is not.
+
+## History
+
+`session_list` / `session_read` / `session_search` give you every previous run
+of this harness. Before re-deriving a diagnosis, check whether a past session
+already reached it -- and if it did and was wrong, record the correction in
+memory so the mistake is not repeated a third time.
+
+## Subagents
+
+`run_subagent` runs a bounded child agent for a self-contained detour (find
+every caller, summarise a huge log) and returns only its final answer. Use it
+to keep noise out of your context; verify anything load-bearing yourself.
+
+## Safety rails
+
+The harness refuses irreversible shell actions (recursive deletes, SQL
+DROP/TRUNCATE, force-push, docker volume removal, host shutdown) unless you
+pass approve=true AND an approval path exists. In an unattended run there is
+usually no approval path: the refusal is the answer -- report the exact
+command for a human instead of looping on it.
+
 ## Memory
 
 You have long-term memory shared with the editor's Copilot. The recent notes
@@ -134,7 +188,7 @@ def load_domain_prompt(project_root: str = "", prompt_file: str = "") -> str:
 
 
 def build_system(memory_head: str = "", memory_path: str = "",
-                 project_root: str = "") -> str:
+                 project_root: str = "", repo_map: str = "") -> str:
     """Assemble the system prompt with the agent's memory in front of it.
 
     Mirrors the editor's behaviour: a bounded head of the most recent notes is
@@ -166,6 +220,12 @@ def build_system(memory_head: str = "", memory_path: str = "",
         "File paths given to tools are resolved relative to the project root.\n"
     )
 
+    # The structural map goes in front of the memory block: shape first,
+    # lessons second, task third. A bounded map that says it is truncated is
+    # honest; a silent omission would look like a small codebase.
+    map_block = ("\n## Project structure (signatures only)\n\n"
+                 + repo_map.strip() + "\n") if (repo_map or "").strip() else ""
+
     if not (memory_head or "").strip():
         memory_block = (
             "\n## Your memory (empty)\n\n"
@@ -181,4 +241,5 @@ def build_system(memory_head: str = "", memory_path: str = "",
             + memory_head
             + "\n"
         )
-    return SYSTEM + environment + load_domain_prompt(root) + memory_block
+    return (SYSTEM + environment + map_block + load_domain_prompt(root)
+            + memory_block)

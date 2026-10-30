@@ -147,6 +147,34 @@ PYTHON_MAX_OUTPUT = int(os.environ.get("AGENT_PYTHON_MAX_OUTPUT", "6000"))
 SESSIONS_DIR = Path(os.environ.get(
     "AGENT_SESSIONS_DIR", str(Path(__file__).resolve().parent / "sessions")))
 
+# --- copilot-parity layers --------------------------------------------------
+# Exact-string edits are the safe default; a whole-file write can silently
+# drop content the model never saw. replace_in_file refuses ambiguous matches.
+EDIT_MAX_MATCHES = int(os.environ.get("AGENT_EDIT_MAX_MATCHES", "1"))
+# Structural overview injected into the system prompt so the model knows the
+# shape of the codebase before it reads anything. Bounded: a 200k-line monorepo
+# must not eat the context window.
+REPO_MAP_MAX_CHARS = int(os.environ.get("AGENT_REPO_MAP_CHARS", "6000"))
+REPO_MAP_ENABLED = os.environ.get("AGENT_REPO_MAP", "1") == "1"
+# Safety rails. Irreversible shell actions (rm -rf, DROP TABLE, force-push,
+# docker rm -v ...) are REFUSED unless the caller passes approve=True AND one
+# of these is set: interactive confirmation, or AGENT_AUTO_APPROVE for a
+# trusted unattended run. Destructive git verbs get their own gate.
+AUTO_APPROVE = os.environ.get("AGENT_AUTO_APPROVE", "0") == "1"
+ALLOW_DESTRUCTIVE_GIT = os.environ.get("AGENT_ALLOW_DESTRUCTIVE_GIT", "0") == "1"
+# Three consecutive failures on the same file trigger a rollback suggestion
+# (git restore from HEAD) rather than a fourth blind edit.
+MAX_FILE_FAILURES = int(os.environ.get("AGENT_MAX_FILE_FAILURES", "3"))
+# Streaming output for the interactive CLI and the web UI.
+STREAM = os.environ.get("AGENT_STREAM", "1") == "1"
+# Web chat UI (optional dependency group: requirements-web.txt).
+WEBUI_HOST = os.environ.get("AGENT_WEBUI_HOST", "127.0.0.1")
+WEBUI_PORT = int(os.environ.get("AGENT_WEBUI_PORT", "8787"))
+# Scheduler: cron-lite job file so unattended missions run in the cloud.
+SCHEDULE_FILE = Path(os.environ.get(
+    "AGENT_SCHEDULE_FILE",
+    str(Path(__file__).resolve().parent / "schedule.json")))
+
 # --- memory ---------------------------------------------------------------
 def _find_memory_tree(project_name: str):
     """Locate the memory tree the editor's Copilot writes to.
