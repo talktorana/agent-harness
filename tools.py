@@ -20,6 +20,14 @@ from config import (CONFIRM_PYTHON_MUTATIONS, CONFIRM_WRITES, MAX_TOOL_CHARS,
                     PROJECT_ROOT, TOOL_TIMEOUT_SEC)
 from memory import MemoryStore
 from python_exec import PythonSandbox
+from tools_delegate import run_subagent
+from tools_edit import glob_files, multi_replace_in_file, replace_in_file
+from tools_git import (git_commit, git_diff, git_log, git_restore, git_show,
+                       git_status)
+from tools_repo_map import repo_map
+from tools_safety import guard_command
+from tools_session import session_list, session_read, session_search
+from tools_todo import manage_todo_list, todo_show
 
 #: Prefer an explicit bash. On Windows ``shell=True`` gives CMD, which
 #: understands none of the project's tooling -- pipes, ``$(...)``, ``&&`` --
@@ -88,6 +96,9 @@ _MEMORY = MemoryStore()
 def set_memory_session(session_id: str) -> None:
     """Point the session memory scope at the current task's notes file."""
     _MEMORY.session_id = session_id
+    # The visible plan lives with the session too, so a crash still shows
+    # what was intended and what was left undone.
+    tools_todo.set_todo_session(session_id)
 
 
 
@@ -129,11 +140,22 @@ def _normalize_paths(command: str):
                        "/<drive>/]\n")
 
 
-def run_command(command: str, cwd: str = None, timeout_sec: int = None) -> str:
+def run_command(command: str, cwd: str = None, timeout_sec: int = None,
+                approve: bool = False, reason: str = "") -> str:
     """Run a shell command. Covers git, tests, grep, ssh, docker -- use this
-    instead of guessing at file contents or repository state."""
+    instead of guessing at file contents or repository state.
+
+    Irreversible commands (rm -rf, DROP TABLE, force-push, docker volume rm,
+    ...) are REFUSED unless ``approve`` is true AND an approval path exists
+    (AGENT_AUTO_APPROVE or an interactive terminal). A refusal tells you the
+    exact command to hand to a human instead.
+    """
+    allowed, why = guard_command(command, approve=bool(approve))
+    if not allowed:
+        return why
     timeout = timeout_sec or TOOL_TIMEOUT_SEC
     command, note = _normalize_paths(command)
+    note = (why + "\n" if why else "") + note
     try:
         if BASH:
             proc = subprocess.run(
@@ -383,6 +405,14 @@ TOOLS = [
                     "description": "Working directory. Defaults to project root."},
             "timeout_sec": {"type": "integer",
                             "description": "Max seconds to wait. Default 180."},
+            "approve": {"type": "boolean",
+                        "description": "Set true ONLY to request an "
+                                       "irreversible command you have decided "
+                                       "is required; it may still be refused "
+                                       "in unattended runs."},
+            "reason": {"type": "string",
+                       "description": "One line: why the irreversible action "
+                                      "is necessary."},
         },
         ["command"],
     ),
@@ -531,6 +561,171 @@ TOOLS = [
         {},
         [],
     ),
+    _fn(
+        "replace_in_file",
+        "Edit a file by replacing an EXACT string. The old text must appear "
+        "exactly once (or exactly expected_replacements times); zero matches "
+        "means re-read the file, several means your anchor is ambiguous. "
+        "Nothing is written unless the count matches, so an edit can never "
+        "half-apply. PREFER THIS over write_file for any change smaller than "
+        "a whole-file rewrite.",
+        {
+            "path": {"type": "string", "description": "File path."},
+            "old": {"type": "string",
+                    "description": "Exact existing text, with surrounding "
+                                   "context lines."},
+            "new": {"type": "string", "description": "Replacement text."},
+            "expected_replacements": {"type": "integer",
+                                      "description": "Default 1."},
+        },
+        ["path", "old", "new"],
+    ),
+    _fn(
+        "multi_replace_in_file",
+        "Apply several exact replacements to ONE file atomically: if any edit's "
+        "anchor is missing or ambiguous, NOTHING is applied. Use when a change "
+        "touches several separated places in the same file.",
+        {
+            "path": {"type": "string", "description": "File path."},
+            "edits": {"type": "array",
+                      "items": {"type": "object",
+                                "properties": {
+                                    "old": {"type": "string"},
+                                    "new": {"type": "string"}},
+                                "required": ["old", "new"]},
+                      "description": "Ordered exact replacements."},
+        },
+        ["path", "edits"],
+    ),
+    _fn(
+        "glob_files",
+        "Find files by path pattern, e.g. '**/*.py' or 'engine/validate_*.py'. "
+        "Use to discover WHERE things live before reading; use search() for "
+        "content. Skips .git, caches and vendor directories.",
+        {
+            "pattern": {"type": "string", "description": "Glob pattern."},
+            "path": {"type": "string", "description": "Root dir. Default '.'."},
+            "max_results": {"type": "integer", "description": "Cap. Default 200."},
+        },
+        ["pattern"],
+    ),
+    _fn(
+        "repo_map",
+        "Structural overview of a subtree: every class and function signature, "
+        "no bodies. Read THIS first to decide which files matter; it is far "
+        "cheaper than reading them all.",
+        {
+            "path": {"type": "string", "description": "Subtree. Default '.'."},
+            "max_chars": {"type": "integer",
+                          "description": "Cap on map size. Default from config."},
+        },
+        [],
+    ),
+    _fn(
+        "git_status",
+        "Working-tree state: branch plus staged/unstaged/untracked files. Run "
+        "before editing (know the baseline) and after (know what you changed).",
+        {}, [],
+    ),
+    _fn(
+        "git_diff",
+        "The current diff, optionally staged-only or scoped to one path. Use "
+        "after edits to verify WHAT changed, not just that something did.",
+        {"staged": {"type": "boolean", "description": "Limit to the index."},
+         "path": {"type": "string", "description": "Scope to one file."}},
+        [],
+    ),
+    _fn(
+        "git_log",
+        "Recent commits (hash, date, subject), optionally for one path. Use to "
+        "find the last known-good revision before rolling a file back.",
+        {"limit": {"type": "integer", "description": "Default 15."},
+         "path": {"type": "string", "description": "Scope to one file."}},
+        [],
+    ),
+    _fn(
+        "git_show",
+        "Show one commit with its patch, or a file at a revision ('rev:path').",
+        {"revision": {"type": "string"},
+         "path": {"type": "string"}},
+        ["revision"],
+    ),
+    _fn(
+        "git_commit",
+        "Stage paths (or everything) and commit. Say WHY in the message. A "
+        "caution-class action: recorded and narrated, not refused.",
+        {"message": {"type": "string"},
+         "paths": {"type": "array", "items": {"type": "string"}}},
+        ["message"],
+    ),
+    _fn(
+        "git_restore",
+        "Roll ONE file back to a revision (default HEAD) -- the safe undo the "
+        "safety rails point at after repeated failed edits. Discards that "
+        "file's uncommitted changes.",
+        {"path": {"type": "string"},
+         "from_revision": {"type": "string", "description": "Default HEAD."}},
+        ["path"],
+    ),
+    _fn(
+        "session_list",
+        "Recent agent sessions, newest first. The name encodes start time and "
+        "session id -- this is the timeline of what the harness has been asked.",
+        {"limit": {"type": "integer", "description": "Default 20."}}, [],
+    ),
+    _fn(
+        "session_read",
+        "Read one past session transcript (head and tail). Use for 'how did "
+        "the last attempt at this end?'.",
+        {"name": {"type": "string",
+                  "description": "Session file name or stem."},
+         "max_chars": {"type": "integer", "description": "Default 8000."}},
+        ["name"],
+    ),
+    _fn(
+        "session_search",
+        "Search ALL session transcripts for text or regex. 'What did we try "
+        "last time this failed?' is usually already written down.",
+        {"pattern": {"type": "string"},
+         "limit": {"type": "integer", "description": "Default 30."}},
+        ["pattern"],
+    ),
+    _fn(
+        "manage_todo_list",
+        "Publish your plan and its progress. Replace the WHOLE list each time "
+        "with items {id, title, status in not-started|in-progress|completed}; "
+        "at most one in-progress. Update it as you finish each item -- an "
+        "operator watching an unattended run reads this to know where you are.",
+        {"items": {"type": "array",
+                   "items": {"type": "object",
+                             "properties": {
+                                 "id": {"type": "integer"},
+                                 "title": {"type": "string"},
+                                 "status": {"type": "string",
+                                            "enum": ["not-started",
+                                                     "in-progress",
+                                                     "completed"]}},
+                             "required": ["id", "title", "status"]}}},
+        ["items"],
+    ),
+    _fn(
+        "todo_show",
+        "Render the current plan without changing it.", {}, [],
+    ),
+    _fn(
+        "run_subagent",
+        "Hand a SELF-CONTAINED subtask (research, summarising a huge log, "
+        "finding every caller) to a fresh child agent with its own session "
+        "and step budget; only its final answer comes back. Use it to keep "
+        "noise out of your own context, then decide yourself -- a subagent's "
+        "answer is evidence, not a verdict.",
+        {"prompt": {"type": "string",
+                    "description": "Complete instructions; the child cannot "
+                                   "ask you follow-ups."},
+         "steps": {"type": "integer", "description": "Child step budget. "
+                                                     "Default 12."}},
+        ["prompt"],
+    ),
 ]
 
 
@@ -546,4 +741,20 @@ HANDLERS = {
     "memory_revise": memory_revise,
     "memory_retire": memory_retire,
     "memory_status": memory_status,
+    "replace_in_file": replace_in_file,
+    "multi_replace_in_file": multi_replace_in_file,
+    "glob_files": glob_files,
+    "repo_map": repo_map,
+    "git_status": git_status,
+    "git_diff": git_diff,
+    "git_log": git_log,
+    "git_show": git_show,
+    "git_commit": git_commit,
+    "git_restore": git_restore,
+    "session_list": session_list,
+    "session_read": session_read,
+    "session_search": session_search,
+    "manage_todo_list": manage_todo_list,
+    "todo_show": todo_show,
+    "run_subagent": run_subagent,
 }

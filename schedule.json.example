@@ -1,0 +1,16 @@
+{
+  "jobs": [
+    {
+      "id": "example-interval",
+      "every_min": 30,
+      "enabled": false,
+      "message": "Run a full monitoring pass on the project and report findings."
+    },
+    {
+      "id": "example-daily",
+      "at": "02:30",
+      "enabled": false,
+      "message": "Summarise yesterday's sessions into repo memory."
+    }
+  ]
+}

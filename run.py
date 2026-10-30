@@ -79,6 +79,18 @@ def memory_transfer(export_to: str, import_from: str) -> int:
     return 0
 
 
+def _sched(argv) -> int:
+    """Run scheduler.main with an argv of our choosing."""
+    import scheduler
+    import sys as _sys
+    saved = _sys.argv
+    _sys.argv = ["scheduler"] + list(argv)
+    try:
+        return scheduler.main()
+    finally:
+        _sys.argv = saved
+
+
 def check_connection() -> int:
     """Verify the endpoint and key BEFORE running a task.
 
@@ -201,6 +213,15 @@ def main() -> int:
     parser.add_argument("--steps", type=int, help="Override AGENT_MAX_STEPS.")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print the final answer.")
+    parser.add_argument("--serve", action="store_true",
+                        help="Run the zero-dependency web chat UI instead of "
+                             "a one-shot task.")
+    parser.add_argument("--schedule", action="store_true",
+                        help="Run the cron-lite scheduler daemon.")
+    parser.add_argument("--schedule-once", action="store_true",
+                        help="Run due scheduled jobs once, then exit.")
+    parser.add_argument("--schedule-list", action="store_true",
+                        help="Print schedule.json and exit.")
     args = parser.parse_args()
 
     if args.model:
@@ -217,6 +238,16 @@ def main() -> int:
 
     if args.memory_export or args.memory_import:
         return memory_transfer(args.memory_export, args.memory_import)
+
+    if args.serve:
+        import webui
+        return webui.main()
+    if args.schedule or args.schedule_once or args.schedule_list:
+        if args.schedule_list:
+            return _sched(["--list"])
+        if args.schedule_once:
+            return _sched(["--once"])
+        return _sched([])
 
     if not config.API_KEY:
         print("AGENT_API_KEY is not set. Export it or put it in .env before "

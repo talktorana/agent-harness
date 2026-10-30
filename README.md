@@ -11,7 +11,7 @@ that can actually kill runaway code, a session record of what was really done,
 retry that distinguishes "busy" from "your key is wrong", and memory that is
 correctable rather than append-only.
 
-No framework, no database, no service to run. Nine Python files and an
+No framework, no database, no service to run. A handful of Python files and an
 OpenAI-compatible endpoint.
 
 ## Quickstart
@@ -20,6 +20,8 @@ OpenAI-compatible endpoint.
 cp .env.example .env          # add your key and point AGENT_PROJECT_ROOT at your project
 python run.py --check         # proves the key with a real completion
 python run.py "explain how the retry policy works"
+python run.py --serve         # browser chat UI on http://127.0.0.1:8787
+python run.py --schedule      # cron-lite daemon over schedule.json
 ```
 
 `--check` matters. Listing models is **not** an auth gate on at least one
@@ -174,6 +176,30 @@ volumes:
 
 `--memory-export` / `--memory-import` move the tree between hosts.
 
+## Copilot-parity layers
+
+The loop above is what an editor agent feels like from the inside. These are
+the surfaces that make it feel like one from the outside:
+
+| Layer | Tool / entry point | What it replaces |
+|---|---|---|
+| Precision edits | `replace_in_file`, `multi_replace_in_file` | whole-file overwrites; ambiguous anchors are refused, three failed edits suggest `git_restore` |
+| Orientation | `repo_map`, `glob_files` | the editor's symbol index |
+| Git awareness | `git_status`, `git_diff`, `git_log`, `git_show`, `git_commit`, `git_restore` | the SCM view |
+| Safety rails | `run_command(approve=...)` + `tools_safety` | the human in the loop: irreversible verbs are refused and reported instead of run |
+| Visible plan | `manage_todo_list`, `todo_show` | the editor's todo panel |
+| History recall | `session_list`, `session_read`, `session_search` | chat history search |
+| Subagents | `run_subagent` | delegated research with a bounded child session |
+| Chat UI | `python run.py --serve` | the editor chat pane (stdlib HTTP, polling) |
+| Scheduler | `python run.py --schedule`, `schedule.json` | cron for unattended missions |
+
+The safety rails are the load-bearing part. `tools_safety.classify_command`
+sorts every shell command into `ok` / `caution` / `irreversible`; the last
+needs the model's explicit `approve=true` **and** an approval path
+(`AGENT_AUTO_APPROVE=1` or a TTY). In an unattended run there is usually no
+approval path, so the refusal text tells the model to hand the exact command
+to a human -- which is what you want a robot to do at 3am.
+
 ## Documentation
 
 | | |
@@ -190,22 +216,32 @@ mostly about the autonomy boundary, and that is the part that matters.
 ## Files
 
 ```
-run.py         CLI (--check, --memory-export/-import)
-agent.py       the loop
-tools.py       tool schemas and handlers
-prompts.py     the system prompt, plus your system.md
-python_exec.py persistent interpreter for run_python
-memory.py      three-scope memory
-session.py     per-task action log
-config.py      settings, provenance, memory discovery
+run.py             CLI (--check, --serve, --schedule*, --memory-export/-import)
+agent.py           the loop
+webui.py           zero-dependency browser chat UI
+scheduler.py       cron-lite daemon over schedule.json
+tools.py           tool schemas and handlers
+tools_edit.py      exact-string edits, glob, per-file failure tracking
+tools_git.py       guarded git verbs
+tools_repo_map.py  bounded structural overview (AST for Python)
+tools_safety.py    irreversible-command classification and gating
+tools_session.py   searchable history of past runs
+tools_todo.py      the visible plan
+tools_delegate.py  bounded subagents
+prompts.py         the system prompt, plus your system.md
+python_exec.py     persistent interpreter for run_python
+memory.py          three-scope memory
+session.py         per-task action log
+config.py          settings, provenance, memory discovery
 ```
 
 ## What this is not
 
 Not a framework and not production multi-tenant infrastructure. It is a
-single-user tool that runs one task at a time and asks before it writes. That
-is the right shape for an assistant you supervise — and the wrong shape for
-something you leave unattended against systems you care about.
+single-user tool that runs one task at a time and asks before it writes.
+Unattended use (`--schedule`, `AGENT_AUTO_APPROVE`) is opt-in and stays inside
+the safety rails above: what the rails refuse, the run reports instead of
+doing.
 
 ## Licence
 
