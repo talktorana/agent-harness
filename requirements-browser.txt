@@ -1,0 +1,7 @@
+# Optional: headless browser automation (tools_browser.py).
+# Install, then fetch the browser binary once:
+#   pip install -r requirements-browser.txt
+#   playwright install chromium
+# Without this file's dependency the browser_* tools report NOT AVAILABLE
+# and everything else keeps working.
+playwright>=1.44

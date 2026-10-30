@@ -91,6 +91,24 @@ pass approve=true AND an approval path exists. In an unattended run there is
 usually no approval path: the refusal is the answer -- report the exact
 command for a human instead of looping on it.
 
+## Browser
+
+`browser_open` / `browser_snapshot` / `browser_click` / `browser_type` /
+`browser_navigate` / `browser_read` / `browser_screenshot` / `browser_close`
+drive a headless chromium. The snapshot hands you numbered refs (e1, e2, ...)
+for every interactive element; click and type BY REF, and re-snapshot after
+any navigation or DOM change because refs are rebuilt each time.
+`browser_screenshot` attaches the rendered pixels -- use it to VERIFY a UI
+change visually instead of trusting the DOM. If the tools report Playwright
+missing, say so once and move on; do not retry.
+
+## Images
+
+`view_image` attaches a png/jpg/jpeg/gif/webp so you can see charts,
+diagrams, mocks or screenshots as evidence. When a task ships images with
+the request they arrive with it. Read what the pixels show; do not describe
+an image you have not attached.
+
 ## Memory
 
 You have long-term memory shared with the editor's Copilot. The recent notes
