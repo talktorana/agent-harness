@@ -21,6 +21,7 @@ from config import (CONFIRM_PYTHON_MUTATIONS, CONFIRM_WRITES, MAX_TOOL_CHARS,
 from memory import MemoryStore
 from python_exec import PythonSandbox
 from tools_delegate import run_subagent
+from tools_deploy import deploy_request, deploy_status, guard_project_write
 from tools_edit import glob_files, multi_replace_in_file, replace_in_file
 from tools_browser import (browser_click, browser_close, browser_navigate,
                            browser_open, browser_read, browser_screenshot,
@@ -217,6 +218,12 @@ def write_file(path: str, content: str) -> str:
     """Create or overwrite a file. Overwrites the WHOLE file, so read it first
     and pass the full intended content -- never assume you know what is there."""
     p = _resolve(path)
+    # Gated deployments must be changed through a deploy request, not edited
+    # in place: the request is what the host applier validates, backs up and
+    # can roll back. Refusing here makes that impossible to bypass quietly.
+    refusal = guard_project_write(str(p))
+    if refusal:
+        return f"REFUSED: {refusal}"
     if CONFIRM_WRITES:
         preview = content if len(content) < 400 else content[:400] + "..."
         print(f"\n[write_file] {p}  ({len(content)} chars)")
@@ -802,6 +809,55 @@ TOOLS = [
         "Release the browser and every handle. Call when done browsing.",
         {}, [],
     ),
+    _fn(
+        "deploy_request",
+        "Propose a change to the DEPLOYMENT and let the host decide. Stages a "
+        "schema-versioned request (every target path, its bytes, their sha256, "
+        "a purpose, optional compose services and an optional verification "
+        "command) into the outbox. A host-side applier re-checks path "
+        "containment, checksums, request age and the deployment's readiness "
+        "gate, backs every target up and can roll back -- the agent never "
+        "applies its own edits to a live system. Use dry_run to rehearse all "
+        "gates without touching anything. Runtime-state files, secrets and "
+        ".git are refused outright.",
+        {
+            "purpose": {"type": "string",
+                        "description": "Why this change is needed. Recorded in "
+                                       "the receipt, so write the reason a "
+                                       "reviewer would want."},
+            "files": {"type": "array",
+                      "description": "Files to change. Each item is "
+                                     "{target, content} or {target, source} "
+                                     "where target is RELATIVE to the deploy "
+                                     "root and source is an existing file to "
+                                     "stage bytes from.",
+                      "items": {"type": "object",
+                                "properties": {
+                                    "target": {"type": "string"},
+                                    "content": {"type": "string"},
+                                    "source": {"type": "string"}}}},
+            "services": {"type": "array", "items": {"type": "string"},
+                         "description": "Compose services to rebuild/restart "
+                                        "after applying. Only honoured when the "
+                                        "host runs with restart permission."},
+            "verify_command": {"type": "string",
+                               "description": "Shell command the host runs "
+                                              "after writing. A non-zero exit "
+                                              "restores the backups."},
+            "dry_run": {"type": "boolean",
+                        "description": "Evaluate every gate and write a "
+                                       "receipt, but change no file."},
+        },
+        ["purpose", "files"],
+    ),
+    _fn(
+        "deploy_status",
+        "Show the deploy outbox: requests waiting for the host, and the "
+        "verdicts (applied / refused / failed / dry_run) with reasons for what "
+        "it already decided. Read this after staging a request instead of "
+        "assuming it landed.",
+        {}, [],
+    ),
 ]
 
 
@@ -842,4 +898,6 @@ HANDLERS = {
     "browser_read": browser_read,
     "browser_screenshot": browser_screenshot,
     "browser_close": browser_close,
+    "deploy_request": deploy_request,
+    "deploy_status": deploy_status,
 }

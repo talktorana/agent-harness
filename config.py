@@ -277,3 +277,35 @@ MEMORY_HEAD_LINES = int(os.environ.get("AGENT_MEMORY_HEAD_LINES", "120"))
 
 # --- transcript ----------------------------------------------------------
 TRANSCRIPT = os.environ.get("AGENT_TRANSCRIPT", "")
+
+# --- deployment (agent -> host applier) -----------------------------------
+# The agent never restarts a production container itself. It writes a REQUEST
+# into an outbox; a host-side applier decides whether it may be applied
+# (checksums, path containment, broker-state gate, backups, rollback). That
+# split is the safety property, so "gated" is the default and "direct" only
+# changes WHO invokes the applier, never whether one runs.
+DEPLOY_MODE = os.environ.get("AGENT_DEPLOY_MODE", "gated").strip().lower()
+if DEPLOY_MODE not in ("gated", "direct"):
+    raise ValueError(
+        f"AGENT_DEPLOY_MODE must be 'gated' or 'direct', got {DEPLOY_MODE!r}")
+DEPLOY_ROOT = os.environ.get("AGENT_DEPLOY_ROOT", "").strip()
+DEPLOY_OUTBOX = os.environ.get("AGENT_DEPLOY_OUTBOX", "").strip()
+DEPLOY_APPLIER = os.environ.get("AGENT_DEPLOY_APPLIER", "").strip()
+DEPLOY_ALLOW_RESTART = os.environ.get(
+    "AGENT_DEPLOY_ALLOW_RESTART", "0") == "1"
+# Payload ceilings. A deploy request is a handful of source files; a request
+#: this large means the agent is trying to stage something else entirely.
+DEPLOY_MAX_FILES = int(os.environ.get("AGENT_DEPLOY_MAX_FILES", "20"))
+DEPLOY_MAX_BYTES = int(os.environ.get("AGENT_DEPLOY_MAX_BYTES", str(4 << 20)))
+# The refuse list is DEPLOYMENT knowledge, not harness knowledge: which files
+# are runtime state rather than code depends on the project. Comma-separated
+# names, prefixes ("prefix=") and suffixes ("suffix="). Secrets and .git are
+# always refused regardless, and the host applier re-checks whatever the agent
+# proposes -- this copy only makes a refusal early and readable.
+#
+#   AGENT_DEPLOY_FORBIDDEN=positions.json,suffix=.sqlite,prefix=runtime-
+DEPLOY_FORBIDDEN = tuple(
+    part.strip() for part in
+    os.environ.get("AGENT_DEPLOY_FORBIDDEN", "").split(",") if part.strip())
+# Policy file handed to the host applier (readiness gate + domain refusals).
+DEPLOY_POLICY = os.environ.get("AGENT_DEPLOY_POLICY", "").strip()

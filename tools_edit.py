@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from config import PROJECT_ROOT
+from tools_deploy import guard_project_write
 from tools_safety import failure_note
 
 #: Directories that are never part of a search or a repo map: walking them
@@ -53,6 +54,12 @@ def replace_in_file(path: str, old: str, new: str,
     written unless the count matches, so a failed edit cannot half-apply.
     """
     p = _resolve(path)
+    # In gated deployments the file is read-only anyway; this refuses EARLY
+    # and says what to do instead, and it also covers a host-mounted tree
+    # where the agent does have write access.
+    refusal = guard_project_write(str(p))
+    if refusal:
+        return f"REFUSED: {refusal}"
     if not p.is_file():
         return _fail(path, f"NOT FOUND: {p}")
     try:
@@ -83,6 +90,9 @@ def multi_replace_in_file(path: str, edits: List[Dict[str, str]]) -> str:
     file state that never existed.
     """
     p = _resolve(path)
+    refusal = guard_project_write(str(p))
+    if refusal:
+        return f"REFUSED: {refusal}"
     if not p.is_file():
         return f"NOT FOUND: {p}"
     try:
