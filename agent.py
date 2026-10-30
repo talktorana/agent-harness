@@ -15,11 +15,13 @@ eventually.
 import json
 import random
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
 import config
+import tools_media
 from memory import MemoryStore
 from prompts import build_system
 from session import SessionLog
@@ -67,8 +69,61 @@ def _backoff(attempt: int, retry_after: Optional[float]) -> float:
     return min(delay, 60.0)
 
 
+def assemble_stream(chunks, emit=None) -> SimpleNamespace:
+    """Fold SSE chunks into one message-shaped object.
+
+    Streaming tool calls arrive FRAGMENTED: one chunk may carry the id, the
+    next the name, a dozen more slices of the JSON arguments. They are
+    reassembled per ``delta.tool_calls[].index`` so the caller sees exactly
+    the shape the non-streaming path returns -- the loop below cannot tell
+    the difference, which is the point.
+    """
+    content: List[str] = []
+    calls: Dict[int, Dict[str, Any]] = {}
+    for chunk in chunks:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+        text = getattr(delta, "content", None)
+        if text:
+            content.append(text)
+            if emit is not None:
+                emit(text)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            # index 0 is FALSY: `or`-fallbacks would open a new slot for every
+            # fragment of the first parallel call. Only a missing index falls
+            # back to the running count.
+            idx = getattr(tc, "index", None)
+            slot = calls.setdefault(
+                idx if isinstance(idx, int) else len(calls),
+                {"id": None, "name": None, "args": []})
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["args"].append(fn.arguments)
+    tool_calls = None
+    if calls:
+        tool_calls = [
+            SimpleNamespace(
+                id=slot["id"] or f"call_{i}",
+                function=SimpleNamespace(
+                    name=slot["name"] or "",
+                    arguments="".join(slot["args"]) or "{}"))
+            for i, slot in sorted(calls.items())
+        ]
+    return SimpleNamespace(content="".join(content) or None,
+                           tool_calls=tool_calls)
+
+
 class Agent:
-    def __init__(self, verbose: bool = True):
+    def __init__(self, verbose: bool = True, on_token=None):
         # max_retries=0 because _complete() does its own backoff. The SDK's
         # internal retries stacked on top of ours turned one hung call into
         # many minutes of silence with nothing in the transcript to explain it.
@@ -77,7 +132,9 @@ class Agent:
         # The system prompt is built per task, once the session and its memory
         # scope exist -- so this starts empty and run() fills it in.
         self.messages: List[Dict[str, Any]] = []
-        self.verbose = verbose
+        # Optional sink for streamed tokens (the web UI appends them to the
+        # live transcript; the CLI prints them as they arrive).
+        self.on_token = on_token
         self.steps = 0
         self.session: Optional[SessionLog] = None
         self._transcript = None
@@ -95,6 +152,16 @@ class Agent:
         if self.verbose:
             print(text, flush=True)
 
+    def _emit_token(self, text: str) -> None:
+        """One streamed token: print without a newline, fan out to the sink."""
+        if self.verbose:
+            print(text, end="", flush=True)
+        if self.on_token is not None:
+            try:
+                self.on_token(text)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _log(self, record: Dict[str, Any]) -> None:
         if self._transcript:
             self._transcript.write(json.dumps(record, default=str) + "\n")
@@ -102,10 +169,17 @@ class Agent:
 
     # --------------------------------------------------------------- tools
 
-    def _run_tool(self, name: str, args: Dict[str, Any]) -> str:
+    def _run_tool(self, name: str, args: Dict[str, Any]):
+        """Run one tool. Returns (log_text, message_content).
+
+        The two differ only for multimodal results: an image envelope logs as
+        a one-line caption but reaches the model as a real image part, so the
+        transcript stays readable while the model still SEES the pixels.
+        """
         handler = HANDLERS.get(name)
         if handler is None:
-            return f"UNKNOWN TOOL: {name}. Available: {sorted(HANDLERS)}"
+            return (f"UNKNOWN TOOL: {name}. Available: {sorted(HANDLERS)}",
+                    f"UNKNOWN TOOL: {name}. Available: {sorted(HANDLERS)}")
         self._say(f"\n\033[36m[{name}]\033[0m "
                   f"{json.dumps(args, default=str)[:300]}")
         started = time.monotonic()
@@ -118,6 +192,15 @@ class Agent:
             # needs to see the failure and choose a different route.
             result = f"TOOL ERROR ({type(exc).__name__}): {exc}"
         elapsed = time.monotonic() - started
+        content: Any = result
+        payload = tools_media.parse_image_envelope(result)
+        if payload is not None:
+            result = tools_media.caption(payload)
+            content = [
+                {"type": "text", "text": result},
+                {"type": "image_url",
+                 "image_url": {"url": tools_media.data_url(payload)}},
+            ]
         self._say(f"\033[90m{str(result)[:1200]}\033[0m"
                   + (f"\n\033[90m... [{elapsed:.1f}s]\033[0m"
                      if elapsed > 2 else ""))
@@ -125,7 +208,7 @@ class Agent:
                    "result": str(result)[:20000], "seconds": round(elapsed, 2)})
         if self.session:
             self.session.action(self.steps, name, args, str(result), elapsed)
-        return result
+        return result, content
 
     # ----------------------------------------------------------------- api
 
@@ -164,6 +247,18 @@ class Agent:
                     if use_tools:
                         request["tools"] = TOOLS
                         request["tool_choice"] = "auto"
+                    if config.STREAM and (self.verbose or self.on_token):
+                        # Streamed: tokens print as they arrive and the web
+                        # UI shows the answer forming. assemble_stream folds
+                        # the chunks back into the same message shape the
+                        # batched path returns, so nothing downstream differs.
+                        stream = self.client.chat.completions.create(
+                            **request, stream=True)
+                        message = assemble_stream(stream, self._emit_token)
+                        if self.verbose:
+                            print(flush=True)
+                        return SimpleNamespace(
+                            choices=[SimpleNamespace(message=message)])
                     response = self.client.chat.completions.create(**request)
                 except Exception as exc:  # noqa: BLE001
                     if not _is_transient(exc):
@@ -229,7 +324,7 @@ class Agent:
 
     # ---------------------------------------------------------------- loop
 
-    def run(self, task: str) -> str:
+    def run(self, task: str, images: Optional[List[str]] = None) -> str:
         # Session record and memory come first: the model should see its own
         # notes before it acts, and the record of what it did should exist even
         # if this dies on the very first API call.
@@ -252,8 +347,27 @@ class Agent:
                               str(config.PROJECT_ROOT),
                               repo_map=repo_map)
         self.messages.append({"role": "system", "content": system})
-        self.messages.append({"role": "user", "content": task})
-        self._log({"event": "task", "task": task})
+        if images:
+            # Attach the pixels up front: a task that says "look at the
+            # screenshot" is unanswerable if the screenshot arrives later.
+            parts: List[Dict[str, Any]] = [{"type": "text", "text": task}]
+            for image in images:
+                envelope = tools_media.view_image(image)
+                payload = tools_media.parse_image_envelope(envelope)
+                if payload is not None:
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": tools_media.data_url(payload)}})
+                else:
+                    parts.append({"type": "text",
+                                  "text": f"[image {image} unavailable: "
+                                          f"{envelope}]"})
+            self.messages.append({"role": "user", "content": parts})
+        else:
+            self.messages.append({"role": "user", "content": task})
+        self._log({"event": "task", "task": task,
+                   "images": list(images or [])})
 
         for step in range(1, config.MAX_STEPS + 1):
             self.steps = step
@@ -330,11 +444,11 @@ class Agent:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {"__raw__": tc.function.arguments}
-                result = self._run_tool(tc.function.name, args)
+                result, content = self._run_tool(tc.function.name, args)
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": result,
+                    "content": content,
                 })
 
         self._say(f"\n[stopped] reached {config.MAX_STEPS} steps")
@@ -356,6 +470,8 @@ class Agent:
                 f"{self.session.md_path if self.session else 'the session log'}.")
 
 
-def run_task(task: str, verbose: bool = True) -> str:
+def run_task(task: str, verbose: bool = True,
+             images: Optional[List[str]] = None,
+             on_token=None) -> str:
     """Convenience entry point."""
-    return Agent(verbose=verbose).run(task)
+    return Agent(verbose=verbose, on_token=on_token).run(task, images=images)

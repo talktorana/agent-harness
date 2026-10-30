@@ -216,6 +216,10 @@ def main() -> int:
     parser.add_argument("--serve", action="store_true",
                         help="Run the zero-dependency web chat UI instead of "
                              "a one-shot task.")
+    parser.add_argument("--image", action="append", default=[],
+                        metavar="PATH",
+                        help="Attach an image (png/jpg/jpeg/gif/webp) to the "
+                             "task. Repeatable.")
     parser.add_argument("--schedule", action="store_true",
                         help="Run the cron-lite scheduler daemon.")
     parser.add_argument("--schedule-once", action="store_true",
@@ -268,7 +272,7 @@ def main() -> int:
           f"key from {config.source_of('AGENT_API_KEY')}  "
           f"(run --check to prove it works)\033[0m\n")
 
-    answer = run_task(task, verbose=not args.quiet)
+    answer = run_task(task, verbose=not args.quiet, images=args.image or None)
     print("\n" + "=" * 72)
     print(answer)
     return 0

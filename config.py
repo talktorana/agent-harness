@@ -175,6 +175,21 @@ SCHEDULE_FILE = Path(os.environ.get(
     "AGENT_SCHEDULE_FILE",
     str(Path(__file__).resolve().parent / "schedule.json")))
 
+# --- browser automation (optional: requirements-browser.txt) -----------------
+# Headless chromium via Playwright. The tools degrade to a clear
+# NOT AVAILABLE message when the dependency is absent, so a slim image keeps
+# working without it.
+BROWSER_HEADLESS = os.environ.get("AGENT_BROWSER_HEADLESS", "1") == "1"
+BROWSER_TIMEOUT_MS = int(os.environ.get("AGENT_BROWSER_TIMEOUT_MS", "30000"))
+BROWSER_SNAPSHOT_CHARS = int(os.environ.get("AGENT_BROWSER_SNAPSHOT_CHARS",
+                                            "4000"))
+BROWSER_MAX_REFS = int(os.environ.get("AGENT_BROWSER_MAX_REFS", "120"))
+
+# --- multimodal input --------------------------------------------------------
+IMAGES_ENABLED = os.environ.get("AGENT_IMAGES", "1") == "1"
+IMAGE_MAX_BYTES = int(os.environ.get("AGENT_IMAGE_MAX_BYTES",
+                                     str(8 * 1024 * 1024)))
+
 # --- memory ---------------------------------------------------------------
 def _find_memory_tree(project_name: str):
     """Locate the memory tree the editor's Copilot writes to.

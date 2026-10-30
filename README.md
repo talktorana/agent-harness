@@ -190,8 +190,11 @@ the surfaces that make it feel like one from the outside:
 | Visible plan | `manage_todo_list`, `todo_show` | the editor's todo panel |
 | History recall | `session_list`, `session_read`, `session_search` | chat history search |
 | Subagents | `run_subagent` | delegated research with a bounded child session |
-| Chat UI | `python run.py --serve` | the editor chat pane (stdlib HTTP, polling) |
+| Chat UI | `python run.py --serve` | the editor chat pane (stdlib HTTP, streaming tokens) |
 | Scheduler | `python run.py --schedule`, `schedule.json` | cron for unattended missions |
+| Browser | `browser_*` tools (Playwright, optional) | the editor's browser preview: snapshot refs, click/type, screenshots the model can SEE |
+| Images | `view_image`, `run.py --image PATH` | multimodal input: charts, mocks, screenshots as evidence |
+| Streaming | on by default (`AGENT_STREAM=1`) | tokens print as they arrive; the web UI shows the answer forming |
 
 The safety rails are the load-bearing part. `tools_safety.classify_command`
 sorts every shell command into `ok` / `caution` / `irreversible`; the last
@@ -199,6 +202,18 @@ needs the model's explicit `approve=true` **and** an approval path
 (`AGENT_AUTO_APPROVE=1` or a TTY). In an unattended run there is usually no
 approval path, so the refusal text tells the model to hand the exact command
 to a human -- which is what you want a robot to do at 3am.
+
+Browser automation is an optional dependency:
+
+```bash
+pip install -r requirements-browser.txt
+playwright install chromium
+```
+
+Without it every `browser_*` tool returns one clear NOT AVAILABLE line and
+the rest of the harness is unaffected. `browser_screenshot` returns the PNG
+as a multimodal envelope, so the model verifies UI work with its eyes rather
+than by trusting the DOM.
 
 ## Documentation
 
@@ -228,6 +243,8 @@ tools_safety.py    irreversible-command classification and gating
 tools_session.py   searchable history of past runs
 tools_todo.py      the visible plan
 tools_delegate.py  bounded subagents
+tools_browser.py   headless chromium (Playwright, optional)
+tools_media.py     multimodal image envelopes
 prompts.py         the system prompt, plus your system.md
 python_exec.py     persistent interpreter for run_python
 memory.py          three-scope memory

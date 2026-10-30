@@ -22,8 +22,12 @@ from memory import MemoryStore
 from python_exec import PythonSandbox
 from tools_delegate import run_subagent
 from tools_edit import glob_files, multi_replace_in_file, replace_in_file
+from tools_browser import (browser_click, browser_close, browser_navigate,
+                           browser_open, browser_read, browser_screenshot,
+                           browser_snapshot, browser_type)
 from tools_git import (git_commit, git_diff, git_log, git_restore, git_show,
                        git_status)
+from tools_media import view_image
 from tools_repo_map import repo_map
 from tools_safety import guard_command
 from tools_session import session_list, session_read, session_search
@@ -726,6 +730,75 @@ TOOLS = [
                                                      "Default 12."}},
         ["prompt"],
     ),
+    _fn(
+        "view_image",
+        "Attach an image file (png/jpg/jpeg/gif/webp) so you can SEE it -- "
+        "charts, screenshots, diagrams, UI mocks. The pixels arrive with the "
+        "tool result; the transcript keeps only a caption.",
+        {"path": {"type": "string", "description": "Image file path."},
+         "note": {"type": "string",
+                  "description": "Optional one-line note about what to look "
+                                 "for."}},
+        ["path"],
+    ),
+    _fn(
+        "browser_open",
+        "Launch the headless browser (Playwright chromium) and load a URL "
+        "(http/https/file). Returns the first snapshot. If Playwright is not "
+        "installed the tool says so; report that instead of retrying.",
+        {"url": {"type": "string"}},
+        ["url"],
+    ),
+    _fn(
+        "browser_snapshot",
+        "Numbered interactive elements (refs e1, e2, ...) plus a bounded page "
+        "text excerpt. Refs are rebuilt on every snapshot and valid until the "
+        "next one -- click/type by ref rather than guessing selectors.",
+        {}, [],
+    ),
+    _fn(
+        "browser_click",
+        "Click by snapshot ref, CSS selector, or visible text.",
+        {"ref": {"type": "string"}, "selector": {"type": "string"},
+         "text": {"type": "string"}},
+        [],
+    ),
+    _fn(
+        "browser_type",
+        "Type into an input by ref or selector. clear replaces content; "
+        "submit presses Enter afterwards.",
+        {"ref": {"type": "string"}, "selector": {"type": "string"},
+         "text": {"type": "string"}, "submit": {"type": "boolean"},
+         "clear": {"type": "boolean"}},
+        ["text"],
+    ),
+    _fn(
+        "browser_navigate",
+        "Go to a URL, or 'back' / 'forward' / 'reload'.",
+        {"target": {"type": "string"}},
+        ["target"],
+    ),
+    _fn(
+        "browser_read",
+        "The page's full visible text, bounded. Use when the snapshot excerpt "
+        "is not enough.",
+        {"max_chars": {"type": "integer", "description": "Default 20000."}},
+        [],
+    ),
+    _fn(
+        "browser_screenshot",
+        "Capture the viewport and ATTACH it so you can see the rendered page. "
+        "The PNG is also saved under sessions/ for the record. This is how "
+        "you verify a UI change visually.",
+        {"path": {"type": "string",
+                  "description": "Optional destination PNG path."}},
+        [],
+    ),
+    _fn(
+        "browser_close",
+        "Release the browser and every handle. Call when done browsing.",
+        {}, [],
+    ),
 ]
 
 
@@ -757,4 +830,13 @@ HANDLERS = {
     "manage_todo_list": manage_todo_list,
     "todo_show": todo_show,
     "run_subagent": run_subagent,
+    "view_image": view_image,
+    "browser_open": browser_open,
+    "browser_snapshot": browser_snapshot,
+    "browser_click": browser_click,
+    "browser_type": browser_type,
+    "browser_navigate": browser_navigate,
+    "browser_read": browser_read,
+    "browser_screenshot": browser_screenshot,
+    "browser_close": browser_close,
 }

@@ -57,6 +57,7 @@ async function poll(){
   if(!cur)return;
   const r=await fetch('/task/'+cur);const j=await r.json();
   log.innerHTML='';(j.lines||[]).forEach(l=>add(l.role,l.text));
+  if(j.stream){add('a',j.stream+'\u258c');}
   state.textContent=j.status;
   if(j.status==='done'||j.status==='error'){clearInterval(timer);cur=null;
     go.disabled=false;return;}
@@ -80,14 +81,19 @@ def _start_task(text: str) -> str:
         _TASKS[task_id] = record
 
     def work():
-        agent = Agent(verbose=False)
+        def on_token(token: str) -> None:
+            with _LOCK:
+                record["stream"] = record.get("stream", "") + token
+        agent = Agent(verbose=False, on_token=on_token)
         try:
             answer = agent.run(text)
             record["answer"] = answer
+            record["stream"] = ""
             record["lines"].append({"role": "a", "text": answer})
             record["status"] = "done"
         except Exception as exc:  # noqa: BLE001
             record["status"] = "error"
+            record["stream"] = ""
             record["lines"].append(
                 {"role": "e", "text": f"{type(exc).__name__}: {exc}"})
     threading.Thread(target=work, daemon=True).start()
