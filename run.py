@@ -98,20 +98,22 @@ def check_connection() -> int:
     you have already written a prompt and waited. This asks the API a cheap
     question first and says exactly what is broken.
     """
-    from openai import OpenAI
+    import llm
 
-    print(f"base   : {config.BASE_URL}")
-    print(f"model  : {config.MODEL}")
-    print(f"key    : {'set (' + str(len(config.API_KEY)) + ' chars)' if config.API_KEY else 'MISSING'}"
-          f"   [from {config.source_of('AGENT_API_KEY')}]")
+    try:
+        resolved = llm.resolve()
+    except llm.ProviderError as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    model_id = resolved.model_id
+
+    print(f"provider: {resolved.label()}")
+    print(f"base   : {resolved.base_url}")
+    print(f"model  : {model_id}")
+    print(f"key    : set ({len(resolved.api_key)} chars)")
     print(f"root   : {config.PROJECT_ROOT}")
-    print(f"model from: {config.source_of('AGENT_MODEL')}")
     print(f"root  from: {config.source_of('AGENT_PROJECT_ROOT')}")
     print()
-
-    if not config.API_KEY:
-        print("FAIL: AGENT_API_KEY is empty. Put it in agent-harness/.env.")
-        return 2
 
     shadowed = [k for k, v in config.SOURCES.items() if "shadows" in v]
     if shadowed:
@@ -121,7 +123,7 @@ def check_connection() -> int:
         print("  An exported value from an old session will win silently. "
               "unset it if that is not what you meant.\n")
 
-    client = OpenAI(base_url=config.BASE_URL, api_key=config.API_KEY)
+    client = llm.client_for(resolved)
 
     # 1. What can be reached. NOTE: on this provider /models is NOT an auth
     # gate -- a deliberately bogus key listed all 94 models -- so passing here
@@ -129,7 +131,7 @@ def check_connection() -> int:
     try:
         models = client.models.list()
     except Exception as exc:  # noqa: BLE001
-        print(f"FAIL: could not reach {config.BASE_URL} -> "
+        print(f"FAIL: could not reach {resolved.base_url} -> "
               f"{type(exc).__name__}: {exc}")
         return 2
     ids = [getattr(m, "id", "") for m in models.data]
@@ -140,7 +142,7 @@ def check_connection() -> int:
     print("\nprobing inference with a one-token completion...")
     try:
         probe = client.chat.completions.create(
-            model=config.MODEL,
+            model=model_id,
             messages=[{"role": "user",
                        "content": "Reply with the single word OK."}],
             max_tokens=32,
@@ -151,8 +153,9 @@ def check_connection() -> int:
               f"{type(exc).__name__}: {exc}")
         print()
         if "401" in str(exc) or "UNAUTHORIZED" in str(exc):
-            print("  The KEY was rejected by " + config.BASE_URL + ".")
-            print(f"  It came from: {config.source_of('AGENT_API_KEY')}")
+            print("  The KEY was rejected by " + resolved.base_url + ".")
+            print(f"  provider: {resolved.label()} "
+                  f"(key from its api_key_env / api_key)")
             print("  Likely causes:")
             print("   - a stale AGENT_API_KEY exported in this shell is "
                   "shadowing the one in .env (see the WARNING above)")
@@ -166,18 +169,18 @@ def check_connection() -> int:
                   "the model name below.")
         return 2
     said = (probe.choices[0].message.content or "").strip()
-    used = getattr(probe, "model", config.MODEL)
+    used = getattr(probe, "model", model_id)
     print(f"OK: the key is accepted. probe replied {said!r} "
           f"(served by {used})")
 
     # 3. Is the configured model one of the listed ones?
-    if config.MODEL in ids:
-        print(f"OK: model '{config.MODEL}' is available.")
+    if model_id in ids:
+        print(f"OK: model '{model_id}' is available.")
         return 0
 
-    print(f"\nWARN: model '{config.MODEL}' is NOT in the list.")
+    print(f"\nWARN: model '{model_id}' is NOT in the list.")
     # Show the closest matches so the fix is obvious.
-    stem = config.MODEL.split("/")[-1].lower().split("-")[0]
+    stem = model_id.split("/")[-1].lower().split("-")[0]
     near = [i for i in ids if stem and stem in i.lower()][:15]
     if near:
         print("      Models matching '" + stem + "':")
@@ -208,7 +211,14 @@ def main() -> int:
                              "then exit. The existing tree is kept as .bak.")
     parser.add_argument("--no-confirm", action="store_true",
                         help="Apply write_file without asking (use with care).")
-    parser.add_argument("--model", help="Override AGENT_MODEL.")
+    parser.add_argument("--model", help="Override the model alias (or raw id "
+                                         "on the env provider).")
+    parser.add_argument("--provider",
+                        help="provider name from providers.json "
+                             "(default: file default, else 'env').")
+    parser.add_argument("--models", action="store_true",
+                        help="List configured providers and model aliases, "
+                             "then exit.")
     parser.add_argument("--base-url", help="Override AGENT_BASE_URL.")
     parser.add_argument("--steps", type=int, help="Override AGENT_MAX_STEPS.")
     parser.add_argument("--quiet", action="store_true",
@@ -240,6 +250,12 @@ def main() -> int:
     if args.check:
         return check_connection()
 
+    if args.models:
+        import json as _json
+        import llm
+        print(_json.dumps(llm.catalog(), indent=2))
+        return 0
+
     if args.memory_export or args.memory_import:
         return memory_transfer(args.memory_export, args.memory_import)
 
@@ -253,10 +269,23 @@ def main() -> int:
             return _sched(["--once"])
         return _sched([])
 
-    if not config.API_KEY:
-        print("AGENT_API_KEY is not set. Export it or put it in .env before "
-              "running. Try `python run.py --check` to verify.")
+    if not config.API_KEY and not args.provider:
+        # With a providers.json the key may come from any provider's env
+        # var, so the old AGENT_API_KEY gate is only right when no provider
+        # was named. Resolution below is the real gate in that case.
+        import llm as _llm_probe
+        if not _llm_probe.PROVIDERS_FILE.is_file():
+            print("AGENT_API_KEY is not set. Export it or put it in .env "
+                  "before running. Try `python run.py --check`.")
+            return 2
+
+    import llm
+    try:
+        resolved = llm.resolve(args.provider, args.model)
+    except llm.ProviderError as exc:
+        print(f"LLM CONFIG ERROR: {exc}")
         return 2
+    args.provider, args.model = resolved.provider, resolved.model
 
     task = " ".join(args.task).strip()
     if not task:
@@ -267,12 +296,12 @@ def main() -> int:
     if not task:
         return 1
 
-    print(f"\033[90mmodel={config.MODEL}  base={config.BASE_URL}  "
-          f"root={config.PROJECT_ROOT}  max_steps={config.MAX_STEPS}\n"
-          f"key from {config.source_of('AGENT_API_KEY')}  "
-          f"(run --check to prove it works)\033[0m\n")
+    print(f"\033[90mmodel={resolved.label()} ({resolved.model_id})  "
+          f"base={resolved.base_url}  "
+          f"root={config.PROJECT_ROOT}  max_steps={config.MAX_STEPS}\033[0m\n")
 
-    answer = run_task(task, verbose=not args.quiet, images=args.image or None)
+    answer = run_task(task, verbose=not args.quiet, images=args.image or None,
+                      provider=args.provider, model=args.model)
     print("\n" + "=" * 72)
     print(answer)
     return 0

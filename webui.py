@@ -44,13 +44,39 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  button:disabled{opacity:.4;cursor:default}
 </style></head><body><div id="wrap">
 <h3>agent-harness <span class="m" id="state"></span></h3>
+<div id="pick" class="m">
+ <select id="prov"></select><select id="mod"></select>
+</div>
 <div id="log"></div>
 <form id="f"><textarea id="q" placeholder="task..."></textarea>
 <button id="go">send</button></form>
 <script>
 const log=document.getElementById('log'),q=document.getElementById('q'),
-      go=document.getElementById('go'),state=document.getElementById('state');
-let cur=null,timer=null;
+      go=document.getElementById('go'),state=document.getElementById('state'),
+      prov=document.getElementById('prov'),mod=document.getElementById('mod');
+let cur=null,timer=null,CAT=null;
+function fillModels(){
+  mod.innerHTML='';
+  const p=CAT&&CAT.providers[prov.value];
+  ((p&&p.models)||[]).forEach(m=>{
+    const o=document.createElement('option');o.value=m;o.textContent=m;
+    mod.appendChild(o);});
+  if(CAT&&CAT.default&&CAT.default[0]===prov.value&&CAT.default[1]){
+    mod.value=CAT.default[1];}
+}
+async function loadCatalog(){
+  try{const r=await fetch('/models');CAT=await r.json();}catch(e){CAT=null;}
+  if(!CAT)return;
+  prov.innerHTML='';
+  Object.keys(CAT.providers).forEach(name=>{
+    const o=document.createElement('option');o.value=name;
+    o.textContent=name+(CAT.providers[name].key_configured?'':' (no key)');
+    prov.appendChild(o);});
+  if(CAT.default&&CAT.default[0])prov.value=CAT.default[0];
+  fillModels();
+}
+prov.onchange=fillModels;
+loadCatalog();
 function add(cls,text){const d=document.createElement('div');d.className=cls;
   d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;}
 async function poll(){
@@ -66,17 +92,20 @@ document.getElementById('f').onsubmit=async e=>{
   e.preventDefault();const text=q.value.trim();if(!text||cur)return;
   q.value='';add('u','> '+text);go.disabled=true;state.textContent='queued';
   const r=await fetch('/chat',{method:'POST',
-    headers:{'content-type':'application/json'},body:JSON.stringify({text})});
+    headers:{'content-type':'application/json'},
+    body:JSON.stringify({text, provider:prov.value||null,
+                         model:mod.value||null})});
   const j=await r.json();cur=j.id;timer=setInterval(poll,1500);poll();
 };
 </script></div></body></html>"""
 
 
-def _start_task(text: str) -> str:
+def _start_task(text: str, provider=None, model=None) -> str:
     from agent import Agent
 
     task_id = uuid.uuid4().hex[:10]
-    record = {"id": task_id, "status": "running", "lines": [], "answer": ""}
+    record = {"id": task_id, "status": "running", "lines": [], "answer": "",
+              "provider": provider, "model": model}
     with _LOCK:
         _TASKS[task_id] = record
 
@@ -84,7 +113,8 @@ def _start_task(text: str) -> str:
         def on_token(token: str) -> None:
             with _LOCK:
                 record["stream"] = record.get("stream", "") + token
-        agent = Agent(verbose=False, on_token=on_token)
+        agent = Agent(verbose=False, on_token=on_token,
+                      provider=provider, model=model)
         try:
             answer = agent.run(text)
             record["answer"] = answer
@@ -127,6 +157,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, json.dumps(payload).encode(),
                            "application/json")
+        elif self.path == "/models":
+            import llm
+            try:
+                payload = llm.catalog()
+            except Exception as exc:  # noqa: BLE001
+                payload = {"providers": {}, "default": [],
+                           "error": str(exc)[:300]}
+            self._send(200, json.dumps(payload).encode(),
+                       "application/json")
         elif self.path == "/health":
             self._send(200, json.dumps({"ok": True,
                                         "tasks": len(_TASKS)}).encode(),
@@ -141,13 +180,18 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         try:
-            text = (json.loads(raw or b"{}").get("text") or "").strip()
+            body = json.loads(raw or b"{}")
+            text = (body.get("text") or "").strip()
+            provider = body.get("provider") or None
+            model = body.get("model") or None
         except ValueError:
-            text = ""
+            text, provider, model = "", None, None
         if not text:
             self._send(400, b'{"error":"empty text"}', "application/json")
             return
-        self._send(200, json.dumps({"id": _start_task(text)}).encode(),
+        self._send(200,
+                   json.dumps({"id": _start_task(text, provider,
+                                                  model)}).encode(),
                    "application/json")
 
 

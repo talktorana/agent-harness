@@ -28,6 +28,46 @@ python run.py --schedule      # cron-lite daemon over schedule.json
 provider — a bogus key lists them all — so the check makes a one-token
 completion instead.
 
+## Choosing a model: the provider catalogue
+
+The harness speaks to any OpenAI-compatible endpoint DIRECTLY — no proxy in
+between. `providers.json` (copy `providers.json.example`) names them:
+
+```json
+{
+  "default": {"provider": "provider", "model": "provider-v4.1-flash"},
+  "providers": {
+    "provider": {
+      "base_url": "https://provider",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "models": {"provider-v4.1-flash": "provider"}
+    },
+    "ollama-local": {
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "models": {"provider3-coder": "qwen3-coder:latest"}
+    }
+  }
+}
+```
+
+* **Keys** come from the environment variable named by `api_key_env`
+  (preferred) or an inline `api_key`. The example ships empty; the web UI's
+  `/models` endpoint never returns key material.
+* **Aliases** on the left of `models` are what you type and select; the right
+  side is the provider's real id on the wire. A provider rename is one line.
+* **Precedence:** explicit `--provider` (or the web UI dropdowns) >
+  `providers.json` default > the legacy `AGENT_BASE_URL`/`AGENT_API_KEY`/
+  `AGENT_MODEL` triple, which still works untouched as provider `env`.
+* **Failures are configuration errors, raised before the first tool call:**
+  unknown provider, unknown alias, missing key — each names what to fix.
+
+```bash
+python run.py --models                       # list the catalogue
+python run.py --provider provider --model provider-v4.1-flash "task..."
+python run.py --serve                        # pick provider+model in the browser
+```
+
 ## The three ideas
 
 ### 1. Generated code that remembers
@@ -250,6 +290,7 @@ python_exec.py     persistent interpreter for run_python
 memory.py          three-scope memory
 session.py         per-task action log
 config.py          settings, provenance, memory discovery
+llm.py             generic provider catalogue: resolve, keys, web-UI catalog
 ```
 
 ## What this is not
