@@ -242,14 +242,26 @@ async function poll(){
   go.disabled=(j.status==='running'||j.status==='stopping'||j.status==='queued');
   if(j.status==='done'||j.status==='error'||j.status==='stopped'){
    clearInterval(timer);timer=null;cur=null;
-   if(liveBub)liveBub.className='bub';
    const lines=j.lines||[];
-   if(lines.length){const last=lines[lines.length-1];
-    if(last.role==='a'){lastAnswer=last.text;}}
-   if(j.status!=='done'&&lines.length===0&&j.stream)lastAnswer=j.stream;
+   const last=lines.length?lines[lines.length-1]:null;
+   if(last&&last.role==='a')lastAnswer=last.text;
+   // The answer bubble only exists if some poll happened to catch a partial
+   // stream. A task that FINISHES BETWEEN POLLS therefore left the transcript
+   // showing the question and nothing else (live 2026-10-30: the answer was
+   // in the payload and in lastAnswer, but never on screen). The final line
+   // is authoritative, so render it whether or not a stream was ever seen.
+   if(last&&last.text){
+    if(!liveBub){liveBub=row(last.role);}
+    else if(last.role==='e'){liveBub.parentNode.className='row e';}
+    liveBub.className='bub';
+    liveBub.textContent=last.text;
+    if(last.role==='a')lastAnswer=last.text;
+   }
+   if(j.status!=='done'&&!last&&j.stream)lastAnswer=j.stream;
+   scroll();
    document.getElementById('copy').disabled=!lastAnswer;
    document.getElementById('regen').disabled=!lastText;
-   liveBub=null;liveTools=null;
+   liveTools=null;liveBub=null;
   }
  }catch(e){}
 }
