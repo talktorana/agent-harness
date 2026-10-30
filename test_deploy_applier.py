@@ -484,6 +484,49 @@ class ApplySemanticsTest(ApplierTestBase):
         self.assertEqual(target.read_text(encoding="utf-8"), "original\n",
                          "a failed verification must not leave the change in")
 
+    def test_a_verifier_that_could_not_run_is_not_reported_as_test_failure(self):
+        """127/126 mean the shell never reached the verifier.
+
+        Live 2026-10-30: a verify_command naming a Windows-pathed interpreter
+        came back rc=127 under ``bash -lc`` ("No such file or directory"), and
+        the receipt said "verification failed" -- which reads as a broken test
+        suite and sends the next person debugging code that was never run. The
+        file is still restored, but the reason must name the real fault.
+        """
+        target = self.root / "engine" / "v127.py"
+        target.write_text("original\n", encoding="utf-8")
+        path, _ = self.stage([{"target": "engine/v127.py",
+                               "payload": "replacement\n"}],
+                             verify_command="nonexistent-verifier-xyz --all")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["verify_rc"], 127)
+        self.assertIn("could not be executed", receipt["reason"])
+        self.assertNotIn("verification failed (rc=127)", receipt["reason"],
+                         "must not read like a failing test suite")
+        self.assertEqual(receipt["verify_command"],
+                         "nonexistent-verifier-xyz --all")
+        self.assertEqual(target.read_text(encoding="utf-8"), "original\n",
+                         "an unrun verifier must still roll the file back")
+
+    def test_a_verifier_that_never_ran_cannot_report_success_through_a_pipe(self):
+        """`missing_cmd | tail` exits with tail's 0 -- a green light from nothing.
+
+        Proved in the sandbox dry-run: the receipt read ``verify_rc: 0`` beside
+        "No such file or directory", so a deploy was applied on the strength of a
+        verifier that was never executed. The applier therefore runs every
+        verifier with pipefail, making the missing command fatal.
+        """
+        path, _ = self.stage([{"target": "engine/pipe.py", "payload": "p\n"}],
+                             verify_command="nonexistent-verifier-xyz | tail -1")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "failed",
+                         "a verifier that never ran must not pass the gate")
+        self.assertEqual(receipt["verify_rc"], 127)
+        self.assertIn("could not be executed", receipt["reason"])
+        self.assertFalse((self.root / "engine" / "pipe.py").exists(),
+                         "nothing may be applied on an unverified change")
+
     def test_successful_verification_keeps_the_change(self):
         path, _ = self.stage([{"target": "engine/ok.py", "payload": "new\n"}],
                              verify_command="exit 0")

@@ -488,6 +488,15 @@ def write_payloads(targets: List[Path], pairs: List[Tuple[str, Any]]) -> None:
         os.replace(tmp, target)
 
 
+#: Prefix for every verification command. Without it a verifier that never ran
+#: reports SUCCESS: `run_tests | tail` exits with tail's status, so a missing
+#: interpreter upstream is invisible. Proved in the sandbox dry-run 2026-10-30,
+#: where the receipt read verify_rc=0 next to "No such file or directory" --
+#: the one outcome that must never pass a gate is a green light from a verifier
+#: that was never executed.
+VERIFY_SHELL_PREFIX = "set -o pipefail; "
+
+
 def run_command(cmd: List[str], cwd: Path,
                 timeout: float) -> Tuple[int, str]:
     proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
@@ -607,16 +616,33 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
 
         verify = req.get("verify_command")
         if isinstance(verify, str) and verify.strip():
-            rc, tail = run_command(["bash", "-lc", verify], root, test_timeout)
+            rc, tail = run_command(
+                ["bash", "-lc", VERIFY_SHELL_PREFIX + verify], root,
+                test_timeout)
             if rc != 0:
                 restore_backup(made)
+                # 126/127 mean the shell could not RUN the verifier (not found,
+                # not executable). That is a configuration error in the request,
+                # and reporting it as "tests failed" sends the next reader
+                # hunting for a broken suite that was never invoked -- live
+                # 2026-10-30: a Windows-pathed interpreter under `bash -lc`
+                # produced exactly that (rc=127, "No such file or directory").
+                if rc in (126, 127):
+                    reason = (
+                        f"verification command could not be executed "
+                        f"(rc={rc}); originals restored. The verifier never "
+                        f"ran, so this is a request/config fault, not a test "
+                        f"failure: {tail.strip()[:200]}")
+                else:
+                    reason = (f"verification failed (rc={rc}); originals "
+                              f"restored")
                 receipt = write_receipt(
-                    outbox, path, "failed",
-                    f"verification failed (rc={rc}); originals restored",
-                    {**plan, "verify_rc": rc, "verify_output": tail,
-                     "backups": made})
+                    outbox, path, "failed", reason,
+                    {**plan, "verify_rc": rc, "verify_command": verify,
+                     "verify_output": tail, "backups": made})
                 return json.loads(receipt.read_text(encoding="utf-8"))
             plan["verify_rc"] = rc
+            plan["verify_command"] = verify
             plan["verify_output"] = tail[-800:]
 
         services = list(req.get("services") or [])
