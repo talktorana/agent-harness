@@ -354,6 +354,51 @@ class ToolOutputTest(DeployTestBase):
         self.assertIn("readiness gate", out)
         self.assertFalse((self.root / "engine" / "nopolicy.py").exists())
 
+    def test_direct_mode_against_a_read_only_root_explains_itself(self):
+        """The sidecar mounts the root read-only, so `direct` cannot apply.
+
+        The failure must name the fix. An OSError bubbling up from three layers
+        down ("Read-only file system") leaves the model guessing, and guessing
+        is how an agent starts trying to work around a safety property.
+        """
+        self.mode("direct")
+        with mock.patch.object(tools_deploy, "root_is_writable",
+                               return_value=False):
+            out = tools_deploy.deploy_request(
+                purpose="apply in place",
+                files=[{"target": "engine/nope.py", "content": "x"}])
+        self.assertIn("status: unapplied", out)
+        self.assertIn("read-only", out)
+        self.assertIn("AGENT_ROOT_MOUNT_MODE=rw", out)
+        self.assertIn("ops/apply_deploys.py", out,
+                      "must offer the gated path as the working alternative")
+        self.assertFalse((self.root / "engine" / "nope.py").exists())
+
+    def test_a_dry_run_is_still_allowed_on_a_read_only_root(self):
+        """Rehearsal touches no target, so read-only must not block it."""
+        self.mode("direct")
+        with mock.patch.object(tools_deploy, "root_is_writable",
+                               return_value=False):
+            out = tools_deploy.deploy_request(
+                purpose="rehearse only",
+                files=[{"target": "engine/dry2.py", "content": "y"}],
+                dry_run=True)
+        self.assertIn("status: dry_run", out)
+        self.assertNotIn("status: unapplied", out)
+        self.assertFalse((self.root / "engine" / "dry2.py").exists())
+
+    def test_gated_mode_is_unaffected_by_a_read_only_root(self):
+        """Gated writes nothing itself, so the mount mode is irrelevant to it."""
+        self.mode("gated")
+        with mock.patch.object(tools_deploy, "root_is_writable",
+                               return_value=False):
+            out = tools_deploy.deploy_request(
+                purpose="stage a proposal",
+                files=[{"target": "engine/gated.py", "content": "z"}])
+        self.assertIn("STAGED", out)
+        self.assertIn("Gated mode", out)
+        self.assertFalse((self.root / "engine" / "gated.py").exists())
+
     def test_deploy_status_reports_pending_and_decided(self):
         self.mode("gated")
         tools_deploy.deploy_request(
@@ -428,6 +473,214 @@ class RegistrationTest(unittest.TestCase):
         text = schema["description"].lower()
         for probe in ("host", "sha256", "dry_run"):
             self.assertIn(probe, text)
+
+
+class PolicyForbidTest(DeployTestBase):
+    """The early refusal must read the policy the HOST gate enforces.
+
+    One list, two readers. Live 2026-10-30 the two copies had drifted -- the
+    policy forbade the gate's own control-plane files, ``AGENT_DEPLOY_FORBIDDEN``
+    did not -- so the container staged a proposal to rewrite
+    ``ops/deploy_policy.json`` and only the host gate caught it. Nothing was
+    ever unsafe: the host is authoritative and it refused. But two lists that
+    can disagree is exactly how a second layer's failure becomes a silent
+    bypass, so the container now reads the policy itself and the env list is
+    only ever additive.
+    """
+
+    #: What a deployment ships: control-plane files, runtime state, directories.
+    POLICY_FORBID = {"names": ["deploy_policy.json", "routes.json", "owner.svg"],
+                     "dirs": ["secrets"],
+                     "prefixes": ["collector.log"],
+                     "suffixes": [".jsonl"]}
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "secrets").mkdir()
+        (self.root / "ops").mkdir()
+        doc = dict(POLICY_DOC, forbid=self.POLICY_FORBID)
+        self.policy.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        # Start blank: prove the policy supplies the names, not the env list.
+        self.patch_forbidden(("only-in-env.json",))
+        self.clear_cache()
+        self.addCleanup(self.clear_cache)
+
+    @staticmethod
+    def clear_cache():
+        tools_deploy.reset_policy_cache()
+
+    def patch_forbidden(self, specs):
+        patcher = mock.patch.object(config, "DEPLOY_FORBIDDEN", specs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.clear_cache()
+
+    def tighten_policy(self, extra_name):
+        """Rewrite the policy AND move its mtime clearly forward.
+
+        Without the utime bump this test passes on the cache being absent and
+        fails spuriously on a filesystem that records whole seconds, because the
+        cache is keyed on mtime to stay live without a re-parse per target.
+        """
+        doc = dict(POLICY_DOC, forbid=dict(
+            self.POLICY_FORBID, names=list(self.POLICY_FORBID["names"]) + [extra_name]))
+        self.policy.write_text(json.dumps(doc), encoding="utf-8")
+        os.utime(self.policy, (2 ** 31, 2 ** 31))
+        self.clear_cache()
+
+    def refuse_reason(self, target, content="payload"):
+        with self.assertRaises(tools_deploy.DeployError) as exc:
+            tools_deploy.compose_deploy_request(
+                purpose="p", files=[{"target": target, "content": content}])
+        return str(exc.exception)
+
+    def test_policy_names_refuse_early_alone_the_env_list_does_not_carry_them(self):
+        """The regression from the live drift, stated so it can never recur."""
+        joined = " ".join(config.DEPLOY_FORBIDDEN or ())
+        self.assertNotIn("deploy_policy.json", joined)
+        self.assertEqual(tools_deploy.policy_forbid().get("names"),
+                         self.POLICY_FORBID["names"])
+        for target in ("ops/deploy_policy.json", "ops/agent/routes.json"):
+            message = self.refuse_reason(target)
+            self.assertIn("may never be written", message, target)
+            self.assertTrue(tools_deploy.is_forbidden(target), target)
+
+    def test_policy_directories_are_refused(self):
+        """Runtime data and secrets are off limits by DIRECTORY, not by name."""
+        for target in ("secrets/totp.txt", "secrets/nested/deep.json"):
+            message = self.refuse_reason(target)
+            self.assertIn("secrets", message, target)
+            self.assertIn("policy", message.lower(), target)
+        self.assertIn("secrets", tools_deploy.forbidden_dirs())
+
+    def test_git_stays_refused_even_though_the_policy_never_mentions_it(self):
+        """A deployment policy cannot opt a project into VCS corruption."""
+        self.assertIn(".git", tools_deploy.forbidden_dirs())
+        self.assertIn(".git", self.refuse_reason(".git/hooks/pre-commit"))
+
+    def test_policy_prefixes_and_suffixes_apply(self):
+        self.assertTrue(tools_deploy.is_forbidden("data/collector.log"))
+        self.assertTrue(tools_deploy.is_forbidden("data/collector.log.1"))
+        self.assertTrue(tools_deploy.is_forbidden("data/closed_positions.jsonl"))
+
+    def test_env_layer_adds_refusals_the_policy_lacks(self):
+        self.assertTrue(tools_deploy.is_forbidden("only-in-env.json"),
+                        "the env list must still refuse on its own")
+
+    def test_generic_secret_refusals_survive_a_policy_that_omits_them(self):
+        """A policy can add to the generic floor, never subtract from it."""
+        for target in ("server.key", "cert.pem", ".env"):
+            self.assertTrue(tools_deploy.is_forbidden(target), target)
+
+    def test_a_tightened_policy_takes_effect_without_a_restart(self):
+        """The web UI is long-lived; an operator's edit must be seen live."""
+        self.assertFalse(tools_deploy.is_forbidden("ops/new_control.json"))
+        self.tighten_policy("new_control.json")
+        self.assertTrue(tools_deploy.is_forbidden("ops/new_control.json"))
+
+    def test_an_unreadable_policy_degrades_to_the_env_floor_it_does_not_fail(self):
+        """The host gate stays authoritative, so this must never be a crash."""
+        patcher = mock.patch.object(config, "DEPLOY_POLICY",
+                                    str(self.root / "absent.json"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.clear_cache()
+        self.assertEqual({}, tools_deploy.policy_forbid())
+        self.assertFalse(tools_deploy.is_forbidden("engine/collector.py"))
+        self.assertTrue(tools_deploy.is_forbidden("server.key"),
+                        "generic floor must apply with no policy at all")
+
+    def test_a_malformed_policy_is_ignored_rather_than_raising(self):
+        self.policy.write_text("{not json", encoding="utf-8")
+        self.clear_cache()
+        self.assertEqual({}, tools_deploy.policy_forbid())
+        self.assertFalse(tools_deploy.is_forbidden("engine/collector.py"))
+
+    def test_a_policy_without_a_forbid_section_is_legal(self):
+        self.policy.write_text(json.dumps(
+            {"readiness": POLICY_DOC["readiness"]}), encoding="utf-8")
+        self.clear_cache()
+        self.assertEqual({}, tools_deploy.policy_forbid())
+        self.assertTrue(tools_deploy.is_forbidden(".env"))
+
+    def test_direct_mode_runs_the_same_gate_so_a_proposal_is_refused_there_too(self):
+        """Direct mode changes WHO runs the gate, never WHETHER one does.
+
+        ``deploy_request`` is the tool boundary, so a refusal arrives as TEXT
+        for the model to read rather than as a raise: an exception there would
+        surface as a crash mid-task instead of as an explanation of what to do
+        instead. ``compose_deploy_request`` below is the raising layer.
+        """
+        self.mode("direct")
+        out = tools_deploy.deploy_request(
+            purpose="widen my own safe states",
+            files=[{"target": "ops/deploy_policy.json",
+                    "content": '{"readiness": {"safe_states": ["busy"]}}'}],
+            verify_command="true")
+        self.assertIn("DEPLOY REQUEST REFUSED", out)
+        self.assertIn("may never be written", out)
+        self.assertFalse((self.root / "ops" / "deploy_policy.json").exists(),
+                         "a refused deploy must not have written anything")
+        self.assertEqual([], list(self.outbox.glob("*.deploy.json")),
+                         "a refusal must not stage a request either")
+
+    def test_the_gate_itself_cannot_be_rewritten_by_a_proposal(self):
+        """Everything control-plane, whichever layer would catch it.
+
+        Only names THIS fixture's policy forbids belong in the ``is_forbidden``
+        loop: DIRECTORY refusals live one layer up, in ``_check_target``, which
+        raises rather than returning a bool. ``is_forbidden('secrets/x')`` is
+        False by design -- it inspects a leaf name -- while the proposal is
+        still refused end to end, as the next two tests pin down. Asserting
+        directory rules here would encode a false belief about the layering.
+        """
+        for target in ("ops/deploy_policy.json", "ops/agent/routes.json",
+                       "engine/collector.log"):
+            self.assertTrue(tools_deploy.is_forbidden(target), target)
+            out = tools_deploy.deploy_request(
+                purpose="probe", files=[{"target": target, "content": "x"}])
+            self.assertIn("DEPLOY REQUEST REFUSED", out, target)
+            self.assertEqual([], list(self.outbox.glob("*.deploy.json")),
+                             f"{target} must not be staged")
+
+    def test_policy_directories_refuse_at_the_layer_that_enforces_them(self):
+        """``forbid.dirs`` is enforced by _check_target, which raises.
+
+        Verified live 2026-10-30 rather than assumed: ``is_forbidden`` answers
+        False for ``secrets/totp.txt`` because it only sees a leaf name, yet the
+        proposal is refused and nothing is staged.
+        """
+        for target in ("secrets/totp.txt", "secrets/nested/deep.json"):
+            self.assertFalse(tools_deploy.is_forbidden(target),
+                             f"{target}: leaf-name check is not the dir layer")
+            with self.assertRaises(tools_deploy.DeployError) as exc:
+                tools_deploy.compose_deploy_request(
+                    purpose="p", files=[{"target": target, "content": "x"}])
+            self.assertIn("secrets", str(exc.exception), target)
+            self.assertIn("policy", str(exc.exception).lower(), target)
+        self.assertEqual([], list(self.outbox.glob("*.deploy.json")),
+                         "a directory refusal must stage nothing")
+
+    def test_git_is_refused_end_to_end_even_though_the_policy_never_mentions_it(self):
+        """A deployment policy cannot opt a project into VCS corruption."""
+        with self.assertRaises(tools_deploy.DeployError):
+            tools_deploy.compose_deploy_request(
+                purpose="p", files=[{"target": ".git/hooks/pre-commit",
+                                     "content": "x"}])
+        self.assertIn(".git", tools_deploy.forbidden_dirs())
+
+    def test_a_policy_name_the_env_list_lacks_is_still_refused_end_to_end(self):
+        """The drift regression, driven through the tool an agent actually calls."""
+        self.patch_forbidden(())          # env list contributes nothing
+        self.clear_cache()
+        out = tools_deploy.deploy_request(
+            purpose="widen my own safe states",
+            files=[{"target": "ops/deploy_policy.json",
+                    "content": '{"readiness": {"safe_states": ["busy"]}}'}])
+        self.assertIn("DEPLOY REQUEST REFUSED", out)
+        self.assertIn("deploy_policy.json", out)
+        self.assertEqual([], list(self.outbox.glob("*.deploy.json")))
+        self.assertFalse((self.root / "ops" / "deploy_policy.json").exists())
 
 
 if __name__ == "__main__":

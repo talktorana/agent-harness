@@ -65,15 +65,28 @@ GENERIC_FORBIDDEN_DIRS = frozenset({".git"})
 def is_forbidden(target: str) -> bool:
     """True when this target may never be written by an agent, in any mode.
 
-    Deployment-specific names come from the configuration; the generic secret
-    and VCS refusals do not, so forgetting to list ``.env`` in a project's
-    config cannot make it writable. The configuration is read on every call
-    rather than cached at import: a long-running web UI process must see a
-    changed refusal list, and a caller that narrows it for one request must
-    not have its change ignored because a module-level constant was frozen
-    first.
+    Three layers, all of which can only ADD refusals:
+
+    * ``GENERIC_*`` -- secrets and VCS metadata, refused by every deployment
+      regardless of configuration, so forgetting to list ``.env`` somewhere
+      cannot make it writable;
+    * the deployment's POLICY FILE -- the same source of truth the host applier
+      enforces (see ``policy_forbid``);
+    * ``AGENT_DEPLOY_FORBIDDEN`` -- an extra env-level layer for a process that
+      has no readable policy, or wants refusals even earlier.
+
+    Read on every call rather than cached at import: a long-running web UI must
+    see a changed list, and a caller narrowing it for one request must not have
+    that ignored because a module constant froze first.
     """
     names, prefixes, suffixes = _parse_forbidden(config.DEPLOY_FORBIDDEN)
+    policy = policy_forbid()
+    names = names | {str(n) for n in (policy.get("names") or ())
+                     if isinstance(n, str) and n.strip()}
+    prefixes += tuple(str(x) for x in (policy.get("prefixes") or ())
+                      if isinstance(x, str) and x)
+    suffixes += tuple(str(x) for x in (policy.get("suffixes") or ())
+                      if isinstance(x, str) and x)
     name = Path(target.replace("\\", "/")).name
     lowered = name.lower()
     if name in GENERIC_FORBIDDEN_NAMES or name in names:
@@ -83,6 +96,80 @@ def is_forbidden(target: str) -> bool:
         return True
     return any(lowered.endswith(s.lower())
                for s in GENERIC_FORBIDDEN_SUFFIXES + suffixes)
+
+
+#: Cache for the policy's refuse list, invalidated on mtime. Re-read every call
+#: would stat and parse a file per target; caching forever would miss an
+#: operator tightening the policy while the web UI process keeps running.
+_POLICY_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "forbid": None}
+
+
+def reset_policy_cache() -> None:
+    """Return the policy cache to its empty state.
+
+    Distinct from ``_POLICY_CACHE.clear()``: clearing empties the dict, and a
+    later read does ``cache["path"]`` -- a KeyError on a shape that exists only
+    between the two. Tests and config reloads must reset keys, not drop them.
+    """
+    _POLICY_CACHE.update({"path": None, "mtime": None, "forbid": None})
+
+
+def _policy_path() -> Optional[Path]:
+    raw = (config.DEPLOY_POLICY or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else (Path(config.PROJECT_ROOT) / p)
+
+
+def policy_forbid() -> Dict[str, Any]:
+    """The refuse list from the deployment's own policy file.
+
+    Reading the SAME file the host applier enforces is what stops the two
+    lists drifting apart. Live 2026-10-30: the policy gained the gate's own
+    control-plane filenames, and the ``AGENT_DEPLOY_FORBIDDEN`` env list did
+    not, so the agent could stage a request to rewrite ``ops/deploy_policy.json``
+    -- caught only later, by the host gate. Defence in depth still held, but
+    two disagreeing lists is precisely the condition that turns a second-layer
+    failure into a silent bypass.
+
+    Never raises: the host gate remains authoritative, so an unreadable policy
+    degrades to "no extra early refusals" rather than making every deploy fail.
+    """
+    p = _policy_path()
+    if p is None:
+        return {}
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return {}
+    cache = _POLICY_CACHE
+    if cache["path"] == str(p) and cache["mtime"] == mtime \
+            and isinstance(cache["forbid"], dict):
+        return cache["forbid"]
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    forbid = doc.get("forbid") if isinstance(doc, dict) else None
+    result = forbid if isinstance(forbid, dict) else {}
+    cache.update(path=str(p), mtime=mtime, forbid=result)
+    return result
+
+
+def forbidden_dirs() -> frozenset:
+    """Directory components no target may live under."""
+    policy_dirs = {str(d) for d in (policy_forbid().get("dirs") or ())
+                   if isinstance(d, str) and d.strip()}
+    return GENERIC_FORBIDDEN_DIRS | frozenset(policy_dirs)
+
+
+def root_is_writable() -> bool:
+    """Can this process actually write inside the deployment root?"""
+    try:
+        return os.access(str(deploy_root()), os.W_OK)
+    except OSError:
+        return False
 
 
 class DeployError(RuntimeError):
@@ -147,6 +234,13 @@ def _check_target(target: str) -> None:
         raise DeployError(
             f"{name!r} is runtime state or a secret and may never be written "
             f"by an agent, in any mode")
+    banned_dirs = forbidden_dirs()
+    hit = next((part for part in Path(norm).parts[:-1] if part in banned_dirs),
+               None)
+    if hit is not None:
+        raise DeployError(
+            f"deploy target is under {hit!r}, which the deployment's policy "
+            f"refuses as a target directory: {target!r}")
     if ".git" in Path(norm).parts:
         raise DeployError(f"deploy target is inside .git: {target!r}")
 
@@ -303,6 +397,27 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
             verify_command=request.get("verify_command"))
         path = composed["_request_path"]
     receipt_path = Path(str(path)[:-len(REQUEST_SUFFIX)] + RECEIPT_SUFFIX)
+    if not dry_run and not is_gated() and not root_is_writable():
+        # direct mode applies IN PLACE, so a read-only root makes it impossible.
+        # The default sidecar mount is deliberately read-only: gated mode's
+        # refusal lives in this process, but the agent also has a shell, and a
+        # redirect would step over an in-process check. Failing here with the
+        # reason beats an opaque OSError from three layers down.
+        return {
+            "status": "unapplied",
+            "reason": (
+                "AGENT_DEPLOY_MODE=direct needs to write inside the deployment "
+                f"root, but {deploy_root()} is read-only (the sidecar mounts it "
+                ":ro by default, which is what makes the no-direct-write "
+                "guarantee a kernel one rather than only an in-process one). "
+                "Either stage the request and let the HOST apply it -- "
+                "`python3 ops/apply_deploys.py --once`, which is what gated "
+                "mode is for -- or recreate the container with "
+                "AGENT_ROOT_MOUNT_MODE=rw, accepting that a shell inside it can "
+                "then rewrite the deployment bypassing the gate."),
+            "request_path": str(path), "mode": config.DEPLOY_MODE,
+            "dry_run": dry_run, "receipt_path": str(receipt_path),
+            "applier_output": ""}
     try:
         rc, output = run_applier(dry_run=dry_run)
     except DeployError as exc:
