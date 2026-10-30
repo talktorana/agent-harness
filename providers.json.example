@@ -9,8 +9,8 @@
     "Add any OpenAI-compatible endpoint the same way: base_url + models."
   ],
   "default": {
-    "provider": "openrouter",
-    "model": "deepseek-v4.1-flash"
+    "provider": "inferhub",
+    "model": "inferhub-qwen3.8-max-0902"
   },
   "providers": {
     "openrouter": {
@@ -42,6 +42,19 @@
       "models": {
         "provider3-coder": "provider3-coder:latest",
         "llama3.1": "llama3.1:8b"
+      }
+    },
+    "inferhub": {
+      "base_url": "https://api.inferhub.dev/v1",
+      "api_key_env": "INFERHUB_API_KEY",
+      "models": {
+        "inferhub-deepseek-v4-pro-0813": "ali/deepseek-v4-pro-0813",
+        "inferhub-kimi-k3": "ali/kimi-k3",
+        "inferhub-qwen3.8-max-0902": "ali/qwen3.8-max-0902",
+        "inferhub-glm-5.3": "cb/glm-5.3",
+        "inferhub-kimi-k3.1-pro": "cb/kimi-k3.1-pro",
+        "inferhub-deepseek-v4-pro": "cbcn/deepseek-v4-pro",
+        "inferhub-mimo-v2.6-pro": "ocg/mimo-v2.6-pro"
       }
     }
   }

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -118,6 +119,148 @@ class EnvOverrideTest(unittest.TestCase):
             res = llm.resolve()
             self.assertEqual(res.provider, "env")
             self.assertEqual(res.base_url, config.BASE_URL)
+
+
+class RoutingTest(unittest.TestCase):
+    """Ordered fallback chains across providers (llm.route_chain)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.file = Path(self.tmp.name) / "providers.json"
+        self.file.write_text(json.dumps(CATALOG), encoding="utf-8")
+        patcher = mock.patch.object(llm, "PROVIDERS_FILE", self.file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"TEST_ALPHA_KEY": "k1",
+                                           "AGENT_ROUTES": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_parse_route_spec(self):
+        self.assertEqual(llm.parse_route_spec("alpha/fast, beta/only"),
+                         [("alpha", "fast"), ("beta", "only")])
+        # A bare model inherits the catalogue default provider.
+        self.assertEqual(llm.parse_route_spec("fast"), [("alpha", "fast")])
+        self.assertEqual(llm.parse_route_spec(" , "), [])
+
+    def test_explicit_primary_prepends_and_dedups(self):
+        with mock.patch.dict(os.environ, {"AGENT_ROUTES":
+                                          "alpha/fast, alpha/smart"}):
+            chain = llm.route_chain("beta", "only")
+        self.assertEqual(chain[0], ("beta", "only"))
+        self.assertEqual(chain[1:], [("alpha", "fast"), ("alpha", "smart")])
+
+    def test_file_routes_when_no_env(self):
+        rf = Path(self.tmp.name) / "routes.json"
+        rf.write_text(json.dumps({"routes": [
+            {"provider": "alpha", "model": "smart"},
+            {"provider": "beta", "model": "only"}]}), encoding="utf-8")
+        with mock.patch.object(llm, "ROUTES_FILE", rf):
+            chain = llm.route_chain()
+        self.assertEqual(chain, [("alpha", "fast"), ("alpha", "smart"),
+                                 ("beta", "only")])
+
+    def test_legacy_fallback_appended_last(self):
+        with mock.patch.object(config, "FALLBACK_MODEL", "alpha-smart-2"), \
+                mock.patch.dict(os.environ, {"AGENT_ROUTES": "beta/only"}):
+            chain = llm.route_chain()
+        self.assertEqual(chain[0], ("alpha", "fast"))
+        self.assertEqual(chain[-1], ("alpha", "alpha-smart-2"))
+
+
+def _routing_agent(test, chain, clients):
+    """Build an Agent whose route chain and per-route clients are faked.
+
+    The patches are registered on the test's cleanup -- they must stay alive
+    while _complete runs, not just during construction.
+    """
+    import agent as agent_mod
+
+    resolved = {pair: llm.Resolved(provider=pair[0], model=pair[1],
+                                   model_id=pair[1] + "-id",
+                                   base_url=f"https://{pair[0]}.example/v1",
+                                   api_key="k") for pair in chain}
+    for target, kw in (
+            ("route_chain", {"return_value": list(chain)}),
+            ("resolve", {"side_effect": lambda p=None, m=None:
+                         resolved[(p, m)]}),
+            ("client_for", {"side_effect": lambda r: clients[r.provider]})):
+        patcher = mock.patch.object(llm, target, **kw)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    return agent_mod.Agent(verbose=False)
+
+
+def _api_status_error_cls():
+    """Find the SDK's APIStatusError class without naming the package.
+
+    Vendor module names are deliberately never written literally in this repo
+    (they get mangled in transit); we load the SDK by executing one of
+    agent.py's own import paths, then fish the class out of sys.modules.
+    """
+    import sys
+    import agent as agent_mod
+    agent_mod._is_route_dead(Exception())  # forces the SDK import to run
+    for mod in list(sys.modules.values()):
+        cls = getattr(mod, "APIStatusError", None)
+        if isinstance(cls, type) and issubclass(cls, Exception):
+            return cls
+    raise RuntimeError("SDK APIStatusError not importable")
+
+
+class RouteFallbackLoopTest(unittest.TestCase):
+    """_complete must step across providers when a route is dead."""
+
+    def _status_error(self, status, msg):
+        import httpx
+        cls = _api_status_error_cls()
+        return cls(msg, response=httpx.Response(
+            status, request=httpx.Request("POST", "http://x")), body=None)
+
+    def test_dead_route_skips_to_next_provider(self):
+        dead = self._status_error(404, "model_not_found: x")
+
+        class DeadClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=self)
+
+            def create(self, **kw):
+                raise dead
+
+        class GoodClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=self)
+
+            def create(self, **kw):
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="ok", tool_calls=None))])
+
+        chain = [("alpha", "fast"), ("beta", "only")]
+        a = _routing_agent(self, chain, {"alpha": DeadClient(),
+                                         "beta": GoodClient()})
+        with mock.patch.object(config, "STREAM", False):
+            resp = a._complete(use_tools=False)
+        self.assertEqual(resp.choices[0].message.content, "ok")
+
+    def test_all_routes_dead_raises_with_every_verdict(self):
+        dead = self._status_error(404, "model_not_found: x")
+
+        class DeadClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=self)
+
+            def create(self, **kw):
+                raise dead
+
+        chain = [("alpha", "fast"), ("beta", "only")]
+        a = _routing_agent(self, chain, {"alpha": DeadClient(),
+                                         "beta": DeadClient()})
+        with mock.patch.object(config, "STREAM", False):
+            with self.assertRaises(RuntimeError) as ctx:
+                a._complete(use_tools=False)
+        self.assertIn("alpha/fast", str(ctx.exception))
+        self.assertIn("beta/only", str(ctx.exception))
 
 
 if __name__ == "__main__":

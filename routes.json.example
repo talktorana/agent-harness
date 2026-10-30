@@ -1,0 +1,33 @@
+{
+  "_comment": "Ordered model-routing fallback chain. First entry is the preferred model; later entries are tried when a route is dead (unknown model, bad key) or exhausted (retries). Override with env AGENT_ROUTES='prov/model,prov/model'.",
+  "routes": [
+    {
+      "provider": "inferhub",
+      "model": "inferhub-qwen3.8-max-0902"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-deepseek-v4-pro-0813"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-kimi-k3"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-glm-5.3"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-kimi-k3.1-pro"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-deepseek-v4-pro"
+    },
+    {
+      "provider": "inferhub",
+      "model": "inferhub-mimo-v2.6-pro"
+    }
+  ]
+}

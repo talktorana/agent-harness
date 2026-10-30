@@ -68,6 +68,45 @@ python run.py --provider provider --model provider-v4.1-flash "task..."
 python run.py --serve                        # pick provider+model in the browser
 ```
 
+## Model routing: an ordered fallback chain
+
+One model is a single point of failure. Overnight that is not a hypothesis, it
+is an observation: a gateway returned 503 `no available provider` for one
+alias and 400 `invalid_parameter_error` for another in the same hour, while a
+third answered instantly. Routing makes the harness ride through it.
+
+A **route** is one `(provider, model)` pair. A task carries an ordered chain of
+them and `_complete` walks it:
+
+```
+inferhub/inferhub-qwen3.8-max-0902  ->  route 2  ->  route 3  ->  ...   (first success wins)
+```
+
+**Where the chain comes from** (first non-empty wins after the primary):
+
+1. `AGENT_ROUTES` env — `"inferhub/inferhub-qwen3.8-max-0902, otherprov/other-model"`. A bare
+   model inherits the catalogue's default provider.
+2. `routes.json` beside the harness (copy `routes.json.example`) —
+   `{"routes": [{"provider": "inferhub", "model": "inferhub-qwen3.8-max-0902"}, ...]}`.
+3. The legacy `FALLBACK_MODEL` knob, appended LAST so it never pre-empts the
+   chain you just configured.
+
+The pair you ask for (`--provider`/`--model`, or the web UI dropdowns) always
+comes FIRST and the rest of the chain follows, deduplicated. Non-primary routes
+resolve **lazily, per turn**, so one half-configured entry degrades the chain
+instead of killing the task.
+
+```bash
+export INFERHUB_API_KEY=...                          # the key, from your environment
+python run.py --models                                  # catalogue + chain
+python run.py --routes "inferhub/alias-a, inferhub/alias-b" "task..."
+python run.py --routes-file routes.json "task..."
+```
+
+With `providers.json.example` copied into place, the default chain is every
+alias of the `inferhub` gateway in order, `inferhub-qwen3.8-max-0902` first — so a routing
+setup needs nothing beyond the key, and `--routes` is for one-off overrides.
+
 ## The three ideas
 
 ### 1. Generated code that remembers
@@ -187,7 +226,16 @@ Adding one is a description and a function. **The description is the product**
 Transient failures (429 "engine overloaded", 5xx, dropped connections, empty
 completions) retry with exponential backoff, honouring `Retry-After`.
 Permanent ones — a bad key, an unknown model — fail immediately, because
-waiting cannot fix those. One model call is bounded (`AGENT_API_TIMEOUT_SEC`),
+waiting cannot fix those.
+
+On top of that sits ROUTING (see above): a route that answers with a dead
+status — 400/401/402/403/404/405/410/413/422, or `model_not_found` — skips
+straight to the next `(provider, model)` in the chain instead of burning
+backoff on it; a route whose retries are EXHAUSTED (429/5xx storm) moves on
+too. Only when every route has spoken does the run fail, and the raised error
+lists each route's verdict so the log says which doors were tried and what
+each one said. Events `route_dead` and `route_switch` land in the session log
+and the web UI's activity feed, so a failover is visible rather than silent. One model call is bounded (`AGENT_API_TIMEOUT_SEC`),
 and the SDK's own retries are disabled so they cannot stack on ours.
 
 The step budget warns the model before the cut-off, and on exhaustion makes

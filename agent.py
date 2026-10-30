@@ -50,6 +50,26 @@ def _is_transient(exc: BaseException) -> bool:
         return status in _TRANSIENT_STATUS or bool(status and status >= 500)
     return False
 
+# Statuses that mean "THIS route can never serve the request": unknown model,
+# wrong or missing key for that provider, payload the provider refuses (image
+# parts on a text-only model, oversized context). Retrying them burns backoff
+# budget; the NEXT ROUTE, however, may serve it fine -- which is the entire
+# point of the chain.
+_ROUTE_DEAD_STATUS = {400, 401, 402, 403, 404, 405, 410, 413, 422}
+
+
+def _is_route_dead(exc: BaseException) -> bool:
+    """True when the current route should be skipped without further retries."""
+    from openai import APIStatusError
+
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status in _ROUTE_DEAD_STATUS:
+            return True
+    text = str(exc).lower()
+    if "model_not_found" in text or "does not exist" in text:
+        return True
+    return ("not found" in text) and ("model" in text)
 
 def _retry_after(exc: BaseException) -> Optional[float]:
     """Seconds the server asked us to wait, if it said so."""
@@ -125,6 +145,7 @@ def assemble_stream(chunks, emit=None) -> SimpleNamespace:
 
 class Agent:
     def __init__(self, verbose: bool = True, on_token=None,
+                 on_event=None,
                  provider: Optional[str] = None,
                  model: Optional[str] = None):
         # max_retries=0 because _complete() does its own backoff. The SDK's
@@ -132,8 +153,15 @@ class Agent:
         # many minutes of silence with nothing in the transcript to explain it.
         # The endpoint is resolved per task from the provider catalogue
         # (llm.py): explicit choice > providers.json default > environment.
-        self.resolved = llm.resolve(provider, model)
+        # ROUTING: the task carries an ordered chain of (provider, model)
+        # fallbacks (llm.route_chain). Non-primary routes resolve lazily, per
+        # turn, so one half-configured route degrades the chain instead of
+        # killing the task. The primary resolves now: a configuration error
+        # there must fail loudly and early, as before.
+        self.route_pairs = llm.route_chain(provider, model)
+        self.resolved = llm.resolve(*self.route_pairs[0])
         self.client = llm.client_for(self.resolved)
+        self._route_clients: Dict[Any, Any] = {}
         # The system prompt is built per task, once the session and its memory
         # scope exist -- so this starts empty and run() fills it in.
         self.messages: List[Dict[str, Any]] = []
@@ -141,6 +169,12 @@ class Agent:
         # Optional sink for streamed tokens (the web UI appends them to the
         # live transcript; the CLI prints them as they arrive).
         self.on_token = on_token
+        # Optional sink for structured lifecycle events (tool calls, route
+        # switches, retries) so a UI can render agent activity as it happens.
+        self.on_event = on_event
+        # Cooperative cancellation: the web UI's Stop button sets this and the
+        # step loop exits before the next model call. Set, never kill.
+        self.stop_requested = False
         self.steps = 0
         self.session: Optional[SessionLog] = None
         self._transcript = None
@@ -172,6 +206,11 @@ class Agent:
         if self._transcript:
             self._transcript.write(json.dumps(record, default=str) + "\n")
             self._transcript.flush()
+        if self.on_event is not None:
+            try:
+                self.on_event(dict(record))
+            except Exception:  # noqa: BLE001
+                pass
 
     # --------------------------------------------------------------- tools
 
@@ -218,26 +257,53 @@ class Agent:
 
     # ----------------------------------------------------------------- api
 
-    def _complete(self, use_tools: bool = True):
-        """One model turn, ridden through transient failure.
+    def _client_for(self, resolved):
+        """The (cached) client for one resolved route endpoint."""
+        key = (resolved.base_url, resolved.provider, resolved.model_id)
+        client = self._route_clients.get(key)
+        if client is None:
+            client = llm.client_for(resolved)
+            self._route_clients[key] = client
+        return client
 
-        The endpoint that answers a check call can still be busy when a real
-        task lands. Retry the primary model, then (if configured) the fallback,
-        and only give up once both are exhausted -- so a busy engine costs time,
-        not the whole monitoring pass.
+    def _complete(self, use_tools: bool = True):
+        """One model turn, ridden through transient failure and dead routes.
+
+        Two tiers of resilience, learned from overnight runs:
+
+        * TRANSIENT (429, 5xx, timeouts, empty completions) -- retry the SAME
+          route with exponential backoff; the engine is briefly busy and will
+          answer shortly.
+        * ROUTE DEAD (unknown model, wrong key, refused payload) or retries
+          exhausted -- move to the NEXT (provider, model) route. A whole
+          gateway flapping is a provider-level disease, and stepping across
+          providers is exactly what the chain is for.
+
+        Only when every route has spoken do we give up -- and the raised error
+        lists every route's verdict, so the log says which door was tried.
         """
-        chain = [self.resolved.model_id]
-        if config.FALLBACK_MODEL:
-            chain.append(config.FALLBACK_MODEL)
+        chain = self.route_pairs
         problems: List[str] = []
 
-        for model in chain:
+        for ridx, (prov, alias) in enumerate(chain):
+            label = f"{prov}/{alias}"
+            try:
+                resolved = llm.resolve(prov, alias)
+            except llm.ProviderError as exc:
+                problems.append(f"{label}: config: {exc}")
+                self._say(f"\n\033[33m[route] {label} unusable "
+                          f"({str(exc)[:160]}) -- trying next route\033[0m")
+                self._log({"event": "route_dead", "route": label,
+                           "reason": str(exc)[:500]})
+                continue
+            client = self._client_for(resolved)
+            model = resolved.model_id
             for attempt in range(config.API_RETRIES):
                 # Recorded BEFORE the request so that a hung call leaves a
                 # trail: the last event in the session says which model we
                 # were waiting on, instead of the log simply stopping.
                 self._log({"event": "model_call", "model": model,
-                           "attempt": attempt + 1,
+                           "route": label, "attempt": attempt + 1,
                            "timeout_sec": config.API_TIMEOUT_SEC})
                 if self.session:
                     self.session.model_call(model, attempt + 1)
@@ -258,26 +324,36 @@ class Agent:
                         # UI shows the answer forming. assemble_stream folds
                         # the chunks back into the same message shape the
                         # batched path returns, so nothing downstream differs.
-                        stream = self.client.chat.completions.create(
+                        stream = client.chat.completions.create(
                             **request, stream=True)
                         message = assemble_stream(stream, self._emit_token)
                         if self.verbose:
                             print(flush=True)
                         return SimpleNamespace(
                             choices=[SimpleNamespace(message=message)])
-                    response = self.client.chat.completions.create(**request)
+                    response = client.chat.completions.create(**request)
                 except Exception as exc:  # noqa: BLE001
+                    if _is_route_dead(exc):
+                        problems.append(f"{label}: {type(exc).__name__}: "
+                                        f"{str(exc)[:200]}")
+                        self._say(f"\n\033[33m[route] {label} refused "
+                                  f"({type(exc).__name__}: {str(exc)[:120]}) "
+                                  f"-- trying next route\033[0m")
+                        self._log({"event": "route_dead", "route": label,
+                                   "error": str(exc)[:500]})
+                        break
                     if not _is_transient(exc):
                         raise
                     if attempt == config.API_RETRIES - 1:
-                        problems.append(f"{model}: {type(exc).__name__}: {exc}")
+                        problems.append(
+                            f"{label}: {type(exc).__name__}: {exc}")
                         break
                     delay = _backoff(attempt, _retry_after(exc))
                     self._say(f"\n\033[33m[{type(exc).__name__}] "
                               f"{str(exc)[:160]} -- retry {attempt + 1}/"
                               f"{config.API_RETRIES} in {delay:.1f}s\033[0m")
                     self._log({"event": "api_retry", "model": model,
-                               "attempt": attempt + 1,
+                               "route": label, "attempt": attempt + 1,
                                "error": str(exc)[:500],
                                "sleep_sec": round(delay, 2)})
                     if self.session:
@@ -291,18 +367,20 @@ class Agent:
                 if getattr(response, "choices", None):
                     return response
                 if attempt == config.API_RETRIES - 1:
-                    problems.append(f"{model}: empty completion")
+                    problems.append(f"{label}: empty completion")
                     break
                 delay = _backoff(attempt, None)
                 self._say(f"\n\033[33m[empty completion] retry {attempt + 1}/"
                           f"{config.API_RETRIES} in {delay:.1f}s\033[0m")
                 time.sleep(delay)
 
-            if model != chain[-1]:
-                self._say(f"\n\033[33m[{model}] exhausted, falling back to "
-                          f"{chain[chain.index(model) + 1]}\033[0m")
+            if ridx < len(chain) - 1:
+                nxt = f"{chain[ridx + 1][0]}/{chain[ridx + 1][1]}"
+                self._say(f"\n\033[33m[route] {label} exhausted -- falling "
+                          f"back to {nxt}\033[0m")
+                self._log({"event": "route_switch", "from": label, "to": nxt})
 
-        raise RuntimeError("; ".join(problems) or "no model available")
+        raise RuntimeError("; ".join(problems) or "no route available")
 
     def _final_answer(self) -> str:
         """One last request, with tools disabled, to salvage an answer.
@@ -377,6 +455,15 @@ class Agent:
 
         for step in range(1, config.MAX_STEPS + 1):
             self.steps = step
+            if self.stop_requested:
+                # Cooperative stop: bail between turns, never mid-tool, so a
+                # half-applied write can't be left behind by a cancel.
+                self._say("\n\033[33m[stopped] cancelled by user\033[0m")
+                self._log({"event": "stopped", "step": step})
+                if self.session:
+                    self.session.finish("stopped")
+                self._close()
+                return "STOPPED by user request."
             remaining = config.MAX_STEPS - step
             if remaining == max(1, config.ANSWER_WARN_STEPS):
                 # Told before it runs out, not after. A model that knows the
