@@ -474,15 +474,43 @@ def restore_backup(made: List[Dict[str, str]]) -> None:
 
 
 def write_payloads(targets: List[Path], pairs: List[Tuple[str, Any]]) -> None:
-    """Atomic tmp+rename so a crash cannot leave a half-written module."""
+    """Atomic tmp+rename so a crash cannot leave a half-written module.
+
+    Mode AND owner are preserved. Without the owner half, a root-run applier
+    -- root being the default for a systemd unit, which is what this kind of
+    host uses, since it has no cron at all -- flips deployed code from its
+    normal owner to root:root. The mixed ownership that leaves behind is the
+    same failure mode that made an outbox readable-but-unwritable to its next
+    non-root caller. New files inherit their parent directory's owner, so a
+    deploy never introduces a lone root-owned file into an otherwise
+    user-owned tree.
+
+    Best-effort by design: the write has already succeeded, so a chown the
+    platform refuses (Windows, or an unprivileged uid) must not be reported as
+    a failed deploy.
+    """
     for target, (_name, payload) in zip(targets, pairs):
         target.parent.mkdir(parents=True, exist_ok=True)
-        mode = target.stat().st_mode if target.exists() else None
+        stat_before = target.stat() if target.exists() else None
         tmp = target.with_name(target.name + ".deploy-tmp")
         tmp.write_bytes(payload)
-        if mode is not None:
+
+        owner: Optional[Tuple[int, int]] = None
+        if stat_before is not None:
+            owner = (stat_before.st_uid, stat_before.st_gid)
             try:
-                os.chmod(tmp, mode & 0o7777)
+                os.chmod(tmp, stat_before.st_mode & 0o7777)
+            except OSError:
+                pass
+        else:
+            try:
+                parent = target.parent.stat()
+                owner = (parent.st_uid, parent.st_gid)
+            except OSError:
+                pass
+        if owner is not None and hasattr(os, "chown"):
+            try:
+                os.chown(tmp, *owner)
             except OSError:
                 pass
         os.replace(tmp, target)
