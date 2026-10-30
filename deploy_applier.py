@@ -690,12 +690,55 @@ def pending_requests(outbox: Path) -> List[Path]:
                   if p.is_file() and not p.name.startswith("."))
 
 
+def check_outbox_writable(outbox: Path) -> None:
+    """Refuse to run at all if receipts cannot be written.
+
+    The receipt IS the audit trail: it is the only record of what was applied,
+    which gate saw what, and where the backups went. An outbox that exists but
+    is not writable by this user therefore fails the worst possible way -- the
+    change lands and the evidence does not. So the whole applier refuses up
+    front rather than discovering it mid-apply.
+
+    Found by the live host prep on 2026-10-30: the outbox was created as an
+    intermediate of ``install -d .../outbox/applied``, which GNU install leaves
+    at root:root 755, so the ubuntu-run applier could read it but not write it.
+    Nothing caught it because a dry run against a separate writable directory
+    passed, and an empty outbox returns before any write is attempted.
+    """
+    try:
+        outbox.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DeployError(
+            f"outbox is not usable: cannot create {outbox} "
+            f"({type(exc).__name__}: {exc})") from exc
+    probe = outbox / ".write-probe"
+    try:
+        probe.write_text("probe\n", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        raise DeployError(
+            f"outbox {outbox} is not writable by uid {os.getuid() if hasattr(os, 'getuid') else '?'} "
+            f"({type(exc).__name__}: {exc}). Refusing to run: without a "
+            f"writable outbox there is no receipt, so an applied change would "
+            f"leave no audit trail and no rollback record. Fix ownership, "
+            f"e.g. `sudo chown -R <run-user>:<run-group> {outbox}`.") from exc
+
+
 def run_once(outbox: Path, root: Path, **kwargs: Any) -> int:
     """Process every pending request. Returns the worst exit code."""
     requests = pending_requests(outbox)
     if not requests:
         print(f"[applier] no pending requests in {outbox}")
         return 0
+    # Before ANY payload is written: see check_outbox_writable. Reported as
+    # rc=3 (installation fault) rather than propagated, so `--watch` logs one
+    # clear line per pass and a library caller gets an exit code, not a
+    # traceback, for a misconfiguration that is identical every time.
+    try:
+        check_outbox_writable(outbox)
+    except DeployError as exc:
+        print(f"[applier] {exc}", file=sys.stderr)
+        return 3
     worst = 0
     with ApplierLock(outbox):
         for path in requests:
@@ -755,7 +798,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     outbox = Path(args.outbox).expanduser() if args.outbox \
         else root / ".deploy" / "outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
+    try:
+        check_outbox_writable(outbox)
+    except DeployError as exc:
+        # Fail CLOSED and loudly on a broken installation. An unwritable
+        # outbox discovered only at first use means the first real request
+        # would be applied with no receipt and no rollback record.
+        print(f"[applier] {exc}", file=sys.stderr)
+        return 3
 
     try:
         policy = Policy.load(args.policy)

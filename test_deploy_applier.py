@@ -23,15 +23,18 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deploy_applier import (  # noqa: E402
     REQUEST_SUFFIX,
     ApplierLock,
+    DeployError,
     Policy,
     Refused,
     _receipt_name,
+    check_outbox_writable,
     gate_paths,
     gate_schema,
     handle_request,
@@ -686,6 +689,90 @@ class LockAndCliTest(ApplierTestBase):
         rc = main(["--root", str(self.root), "--outbox", str(self.outbox),
                    "--once", "--status-path", str(self.status)])
         self.assertEqual(rc, 0)
+
+
+class OutboxWritabilityTest(ApplierTestBase):
+    """The receipt IS the audit trail, so an unwritable outbox must stop
+    everything before a payload is written.
+
+    Live host prep 2026-10-30: the outbox was created as an intermediate of
+    ``install -d .../outbox/applied`` and GNU install leaves intermediates at
+    root:root 755, so the ubuntu-run applier could read requests but not write
+    receipts. Nothing caught it: a dry run used a separate writable directory,
+    and an empty outbox returns before any write. The first real request would
+    have been applied with no receipt and no rollback record.
+    """
+
+    def test_a_writable_outbox_passes_and_leaves_no_probe_behind(self):
+        check_outbox_writable(self.outbox)
+        self.assertEqual(list(self.outbox.glob(".write-probe")), [],
+                         "the probe file must be removed")
+
+    def test_an_outbox_that_cannot_be_created_refuses(self):
+        """Portable failure: the parent is a FILE, so mkdir cannot succeed.
+
+        Raises DeployError, NOT Refused: a misconfigured installation is a
+        different thing from a gate rejecting one request, and the CLI encodes
+        that as rc=3 rather than rc=2.
+        """
+        blocker = self.root / "i-am-a-file"
+        blocker.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(DeployError) as ctx:
+            check_outbox_writable(blocker / "outbox")
+        self.assertNotIsInstance(ctx.exception, Refused,
+                                 "an installation fault is not a gate verdict")
+        self.assertIn("not usable", str(ctx.exception))
+
+    @unittest.skipIf(os.name == "nt",
+                     "Windows ignores POSIX permission bits")
+    def test_an_existing_but_unwritable_outbox_refuses(self):
+        outbox = self.root / "readonly-outbox"
+        outbox.mkdir()
+        os.chmod(outbox, 0o500)
+        self.addCleanup(lambda: os.chmod(outbox, 0o700))
+        with self.assertRaises(DeployError) as ctx:
+            check_outbox_writable(outbox)
+        msg = str(ctx.exception)
+        self.assertIn("not writable by uid", msg)
+        self.assertIn("receipt", msg, "the reason must say WHY this matters")
+        self.assertIn("chown", msg, "the reason must name the fix")
+
+    def test_the_cli_exits_3_on_an_unwritable_outbox(self):
+        blocker = self.root / "file2"
+        blocker.write_text("x", encoding="utf-8")
+        rc = main(["--root", str(self.root), "--outbox",
+                   str(blocker / "outbox"), "--once",
+                   "--status-path", str(self.status)])
+        self.assertEqual(rc, 3, "a broken installation must not look clean")
+
+    def test_a_unwritable_outbox_blocks_before_any_payload_is_written(self):
+        """The ordering guarantee that makes the preflight worth having.
+
+        Writing the file first and discovering the receipt cannot be written
+        would leave an applied change with no audit trail -- strictly worse
+        than refusing.
+        """
+        target = self.root / "driver" / "must_not_appear.py"
+        target.parent.mkdir()
+        path, _ = self.stage([{"target": "driver/must_not_appear.py",
+                               "payload": "x"}], id="req-unwritable")
+        with mock.patch("deploy_applier.check_outbox_writable",
+                        side_effect=DeployError(
+                            "outbox is not writable by uid 1")):
+            rc = main(["--root", str(self.root), "--outbox",
+                       str(self.outbox), "--once",
+                       "--status-path", str(self.status)])
+        self.assertEqual(rc, 3)
+        self.assertFalse(target.exists(),
+                         "no payload may be written when no receipt can be")
+        self.assertTrue(path.exists(), "the request must stay pending")
+
+    def test_refusal_is_a_deploy_error_not_a_bare_oserror(self):
+        """Callers catch DeployError; an escaped OSError would crash the pass."""
+        blocker = self.root / "file3"
+        blocker.write_text("x", encoding="utf-8")
+        with self.assertRaises(DeployError):
+            check_outbox_writable(blocker / "outbox")
 
 
 if __name__ == "__main__":
