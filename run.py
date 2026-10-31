@@ -239,11 +239,16 @@ def main() -> int:
                         help="Attach an image (png/jpg/jpeg/gif/webp) to the "
                              "task. Repeatable.")
     parser.add_argument("--schedule", action="store_true",
-                        help="Run the cron-lite scheduler daemon.")
+                        help="Run the cron-lite scheduler daemon. With "
+                             "--serve it runs as a thread beside the console.")
     parser.add_argument("--schedule-once", action="store_true",
                         help="Run due scheduled jobs once, then exit.")
+    parser.add_argument("--schedule-dry-run", action="store_true",
+                        help="Print what is due now, running nothing and "
+                             "spending no tokens.")
     parser.add_argument("--schedule-list", action="store_true",
-                        help="Print schedule.json and exit.")
+                        help="Print the schedule, its runtime state and "
+                             "whether that state is writable, then exit.")
     args = parser.parse_args()
 
     if args.model:
@@ -277,11 +282,27 @@ def main() -> int:
         return memory_transfer(args.memory_export, args.memory_import)
 
     if args.serve:
+        if args.schedule:
+            # ONE container, two surfaces. The alternative -- a second service
+            # running the daemon alone -- mounts the same /agent-data, and
+            # memory appends are a read-modify-write with no cross-process
+            # lock, so a mission and a console task finishing together could
+            # each drop the other's note. A daemon thread shares the process,
+            # so they share the same (thread-safe) path into memory.
+            import threading
+            import scheduler as _sched_mod
+            threading.Thread(target=_sched_mod.daemon,
+                             name="agent-scheduler", daemon=True).start()
+            print("[run] scheduler thread started beside the console "
+                  f"(state: {_sched_mod._state_path()})", flush=True)
         import webui
         return webui.main()
-    if args.schedule or args.schedule_once or args.schedule_list:
+    if args.schedule or args.schedule_once or args.schedule_list \
+            or args.schedule_dry_run:
         if args.schedule_list:
             return _sched(["--list"])
+        if args.schedule_dry_run:
+            return _sched(["--dry-run"])
         if args.schedule_once:
             return _sched(["--once"])
         return _sched([])

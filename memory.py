@@ -19,9 +19,27 @@ Two properties make this "agentic" rather than a scratch file:
 
 Writes PREPEND a section rather than appending to the end: the file is read
 from the top, so the newest, most relevant material is what loads first.
+
+CONCURRENCY: every mutation is a read-modify-write of one shared file, and one
+process legitimately has several writers -- the web console runs each task in a
+thread, and the mission scheduler runs beside it. Unserialised, a console note
+and a scheduled-mission note that land together leave one of them silently
+missing, with nothing in either transcript to show it. So all three mutators
+hold a process-wide lock, and every write goes to a temporary file and is
+``os.replace``d into place: a crash or a full disk mid-write then leaves the
+previous memory intact rather than truncating the agent's entire knowledge base
+to the first few hundred bytes.
+
+The lock covers ONE process. Two containers mounting the same memory root have
+no lock to share, and a lost note between them is undetectable afterwards --
+the file looks fine and the note is simply gone. That is why a deployment runs
+the console and the scheduler as ONE container with a daemon thread, not as two
+services.
 """
 
+import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -33,6 +51,24 @@ from config import (
     MEMORY_SESSION_DIR,
     MEMORY_USER_FILE,
 )
+
+#: Serialises every memory mutation in this process. See the module docstring:
+#: a lock is what makes "one container, two surfaces" safe.
+_LOCK = threading.RLock()
+
+
+def _atomic_write(p: Path, text: str) -> None:
+    """Write ``text`` to ``p`` so a failure leaves the old content intact.
+
+    ``Path.write_text`` truncates first, so an error halfway through -- disk
+    full, container killed, OOM -- leaves a PARTIAL file. For code that is an
+    obvious breakage; for memory it is silent data loss with the file still
+    readable and trusted. ``os.replace`` is atomic on the same filesystem, so
+    the reader sees either the old file or the new one.
+    """
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 class MemoryStore:
@@ -189,17 +225,21 @@ class MemoryStore:
             title = f"NOTE {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         block = f"# {title}\n\n{body}\n"
 
-        existing = ""
-        if p.exists():
-            try:
-                existing = p.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                return f"ERROR reading {p} before writing: {exc}"
+        # Read-modify-write under the lock: a scheduled mission and a console
+        # task share this file, and the loser of an unlocked race disappears
+        # without a trace in either transcript.
+        with _LOCK:
+            existing = ""
+            if p.exists():
+                try:
+                    existing = p.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    return f"ERROR reading {p} before writing: {exc}"
 
-        try:
-            p.write_text(block + "\n" + existing, encoding="utf-8")
-        except OSError as exc:
-            return f"ERROR writing {p}: {exc}"
+            try:
+                _atomic_write(p, block + "\n" + existing)
+            except OSError as exc:
+                return f"ERROR writing {p}: {exc}"
         return (f"RECORDED to {scope} memory: {p}\n"
                 f"({len(body.splitlines())} lines prepended as '{title}'; "
                 f"file is now {len((block + existing).splitlines())} lines)")
@@ -259,12 +299,13 @@ class MemoryStore:
                     f"memory. Include enough surrounding lines to make it "
                     f"unique, then try again. Nothing was changed.")
 
-        updated = text.replace(old, new or "", 1)
-        bak = self._backup(p)
-        try:
-            p.write_text(updated, encoding="utf-8")
-        except OSError as exc:
-            return f"ERROR writing {p}: {exc}"
+        with _LOCK:
+            updated = text.replace(old, new or "", 1)
+            bak = self._backup(p)
+            try:
+                _atomic_write(p, updated)
+            except OSError as exc:
+                return f"ERROR writing {p}: {exc}"
         before, after = len(text.splitlines()), len(updated.splitlines())
         return (f"REVISED {scope} memory: {p}\n"
                 f"Replaced {len(old)} chars with {len(new or '')} chars; "
@@ -313,11 +354,12 @@ class MemoryStore:
                 break
         removed = "".join(lines[begin:end])
         updated = "".join(lines[:begin] + lines[end:])
-        bak = self._backup(p)
-        try:
-            p.write_text(updated, encoding="utf-8")
-        except OSError as exc:
-            return f"ERROR writing {p}: {exc}"
+        with _LOCK:
+            bak = self._backup(p)
+            try:
+                _atomic_write(p, updated)
+            except OSError as exc:
+                return f"ERROR writing {p}: {exc}"
         return (f"RETIRED '{title}' from {scope} memory: {p}\n"
                 f"Removed {end - begin} lines; file is now "
                 f"{len(updated.splitlines())} lines."
