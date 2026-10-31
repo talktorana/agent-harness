@@ -213,10 +213,19 @@ class RouteFallbackLoopTest(unittest.TestCase):
     """_complete must step across providers when a route is dead."""
 
     def _status_error(self, status, msg):
-        import httpx
         cls = _api_status_error_cls()
-        return cls(msg, response=httpx.Response(
-            status, request=httpx.Request("POST", "http://x")), body=None)
+        #: A stub response, never a vendor one. The SDK reads ``status_code``
+        #: off it (and ``headers`` for Retry-After) -- nothing else -- and
+        #: writing ``import httpx`` here tied the suite to one transport: the
+        #: moment the SDK moved to its successor package the tests errored with
+        #: ModuleNotFoundError INSIDE the deployment image, where the routing
+        #: code under test was working correctly. A test that names a
+        #: dependency the production code does not need is testing the
+        #: environment.
+        response = SimpleNamespace(
+            status_code=status, headers={},
+            request=SimpleNamespace(method="POST", url="http://x"))
+        return cls(msg, response=response, body=None)
 
     def test_dead_route_skips_to_next_provider(self):
         dead = self._status_error(404, "model_not_found: x")

@@ -114,6 +114,16 @@ class Policy:
             str(s) for s in states if isinstance(s, str) and s.strip())
         self.max_status_age_sec = float(
             readiness.get("max_age_sec") or DEFAULT_MAX_STATUS_AGE_SEC)
+        #: The status document's OWN timestamp field, e.g. ``checked_at``.
+        #:
+        #: Optional. When declared, freshness is judged by BOTH the file's
+        #: mtime and this stamp and the STRICTER one decides. mtime alone is not
+        #: proof: it is reset by a copy, a restore, an rsync or a plain
+        #: ``touch``, all routine on a deploy host, so a freshly-touched file
+        #: carrying a verdict from an hour ago passes a gate whose entire job is
+        #: to demand recent evidence. Found on a live rehearsal 2026-10-31.
+        self.timestamp_field = str(
+            readiness.get("timestamp_field") or "").strip()
 
         limits = doc.get("limits")
         limits = limits if isinstance(limits, dict) else {}
@@ -162,6 +172,7 @@ class Policy:
                 "label": self.status_label,
                 "safe_states": list(self.safe_states),
                 "max_status_age_sec": self.max_status_age_sec,
+                "timestamp_field": self.timestamp_field or None,
             },
             "max_age_sec": self.max_age_sec,
             "forbidden_names": sorted(self.forbidden_names),
@@ -295,7 +306,17 @@ def gate_paths(pairs: List[Tuple[str, Any]], root: Path,
                 f"target must be relative to the deploy root, not an absolute "
                 f"path: {target!r}")
         raw = target.strip().replace("\\", "/")
-        candidate = (base / raw.lstrip("/")).resolve()
+        unresolved = base / raw.lstrip("/")
+        # Symlink FIRST, on the path as written. Containment resolves the link,
+        # so a target pointing outside the root would otherwise be reported as
+        # an escape -- a true statement that hides the actual mechanism, and a
+        # receipt is what an operator reads to decide whether to trust the
+        # agent again. Refusing a link is also refusing to write through a name
+        # that does not say where the bytes land.
+        if unresolved.is_symlink():
+            raise Refused(f"target is a symlink, refusing to write through it: "
+                          f"{target!r}")
+        candidate = unresolved.resolve()
         if base != candidate and base not in candidate.parents:
             raise Refused(
                 f"target escapes the deploy root: {target!r} -> {candidate}")
@@ -306,10 +327,6 @@ def gate_paths(pairs: List[Tuple[str, Any]], root: Path,
             raise Refused(
                 f"target is on the refuse list and may never be written by an "
                 f"agent: {candidate.name}")
-        # A symlink could point outside the root; refuse rather than follow.
-        if candidate.is_symlink():
-            raise Refused(f"target is a symlink, refusing to write through it: "
-                          f"{target!r}")
         resolved.append(candidate)
     duplicates = {str(p) for p in resolved if resolved.count(p) > 1}
     if duplicates:
@@ -395,13 +412,80 @@ def gate_broker(root: Path, policy: Policy,
             f"{label} status is {age / 60:.1f} min old (limit "
             f"{policy.max_status_age_sec / 60:.0f} min): the state is unknown, "
             f"so a deploy is refused")
+    #: The verdict's OWN timestamp, when the policy names one. File mtime
+    #: alone can be reset by a copy, a restore or a touch, leaving a stale
+    #: verdict looking current -- which is exactly the evidence this gate
+    #: exists to demand. Both must be inside the limit; a stamp that cannot be
+    #: read is a refusal rather than a pass, and one from the future means the
+    #: writer's clock is wrong, so nothing about the state can be trusted.
+    verdict_age = _verdict_age(data, policy.timestamp_field, label,
+                               policy.max_status_age_sec)
     if state not in policy.safe_states:
         raise Refused(
             f"{label} state is {state!r}; only {list(policy.safe_states)} may "
             f"be disturbed by a deploy")
     return {"gate": label, "state": state, "age_sec": round(age, 1),
+            "verdict_age_sec": (round(verdict_age, 1)
+                                if verdict_age is not None else None),
             "field": policy.status_field,
-            "checked_at": data.get("checked_at")}
+            "stamp_field": policy.timestamp_field or None,
+            "checked_at": data.get(policy.timestamp_field)
+            if policy.timestamp_field else data.get("checked_at")}
+
+
+#: A status stamp this far ahead of the host clock means the writer's clock is
+#: wrong, so the age cannot be trusted in either direction.
+MAX_CLOCK_SKEW_SEC = 300.0
+
+
+def _parse_stamp(raw: Any) -> Optional[float]:
+    """Epoch seconds from an ISO-8601 string or a number, or None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _verdict_age(data: Dict[str, Any], stamp_field: str, label: str,
+                 limit_sec: float) -> Optional[float]:
+    """Age in seconds of the verdict's own timestamp, or None if undeclared.
+
+    Refuses rather than passing when a declared field is missing, blank or
+    unparsable: a status document that cannot date its own verdict is not
+    evidence of anything, and the receipt would otherwise claim a freshness
+    check that never happened.
+    """
+    if not stamp_field:
+        return None
+    stamp = _parse_stamp(data.get(stamp_field))
+    if stamp is None:
+        raise Refused(
+            f"{label} status carries no parsable {stamp_field!r} "
+            f"(got {data.get(stamp_field)!r}); the verdict cannot be dated, "
+            f"so the state is unknown and a deploy is refused")
+    verdict_age = time.time() - stamp
+    if verdict_age < -MAX_CLOCK_SKEW_SEC:
+        raise Refused(
+            f"{label} status is stamped {-verdict_age / 60:.1f} min in the "
+            f"FUTURE ({data.get(stamp_field)!r}): the writer's clock disagrees "
+            f"with this host, so its age proves nothing")
+    if verdict_age > limit_sec:
+        raise Refused(
+            f"{label} verdict is {verdict_age / 60:.1f} min old (limit "
+            f"{limit_sec / 60:.0f} min) even though the status FILE was "
+            f"written recently -- a copied, restored or touched file does not "
+            f"make a stale verdict current, so a deploy is refused")
+    return verdict_age
 
 
 def _resolve_status(root: Path, status_file: str) -> Path:

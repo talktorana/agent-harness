@@ -79,6 +79,20 @@ class ApplierTestBase(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "data").mkdir()
         (self.root / "engine").mkdir()
+        #: Scrub the ambient deploy environment. The CLI defaults to it, so
+        #: inside a sidecar -- where AGENT_DEPLOY_POLICY points at the REAL
+        #: trading policy -- these tests judged a sandbox against production
+        #: requirements and failed on "no broker status file" while passing
+        #: everywhere else. A test whose verdict depends on the machine it
+        #: happens to run on cannot tell a regression from its surroundings.
+        ambient = {k: v for k, v in os.environ.items()
+                   if k.startswith("AGENT_DEPLOY_") or k == "AGENT_ROOT"}
+        if ambient:
+            patcher = mock.patch.dict(os.environ, {})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            for key in ambient:
+                os.environ.pop(key, None)
         self.policy = make_policy()
         # A real policy file on disk, so the CLI path is tested end to end --
         # main() must load it, and a missing/unreadable one must fail CLOSED.
@@ -320,6 +334,35 @@ class PathGateTest(ApplierTestBase):
             link.unlink(missing_ok=True)
             outside.unlink(missing_ok=True)
 
+    def test_a_symlink_inside_the_root_is_also_refused(self):
+        """The case the containment check cannot see, and nearly did not.
+
+        A link pointing at another file INSIDE the root resolves to a path that
+        is perfectly well contained, so it sails through every gate the
+        containment check owns -- and the write lands on a file the request
+        never named. Found running the suite on Linux: the old code resolved the
+        path FIRST and then asked ``is_symlink()`` of the result, which resolve()
+        had already dereferenced, so that guard could never fire. The refusal
+        now happens on the path as written.
+        """
+        real = self.root / "engine" / "collector.py"
+        real.write_text("# the real file\n", encoding="utf-8")
+        link = self.root / "engine" / "rename_me.py"
+        try:
+            os.symlink(str(real), str(link))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable here: {exc}")
+        try:
+            with self.assertRaises(Refused) as ctx:
+                gate_paths([("engine/rename_me.py", b"# payload\n")], self.root)
+            self.assertIn("symlink", str(ctx.exception))
+            self.assertEqual(real.read_text(encoding="utf-8"),
+                             "# the real file\n",
+                             "a payload written through a link rewrote a file "
+                             "the request did not name")
+        finally:
+            link.unlink(missing_ok=True)
+
     def test_duplicate_targets_are_refused(self):
         with self.assertRaises(Refused) as ctx:
             gate_paths([("engine/a.py", b"x"), ("engine/a.py", b"y")],
@@ -440,6 +483,129 @@ class ReadinessGateTest(ApplierTestBase):
                        "max_age_sec": 900})
         receipt = self.handle(path, policy=permissive)
         self.assertEqual(receipt["status"], "applied")
+
+
+class VerdictStampTest(ApplierTestBase):
+    """Freshness measured from the VERDICT, not only from the file's mtime.
+
+    Found on a live rehearsal against the trading host (2026-10-31): a status
+    file written seconds ago, declaring a verdict from 90 minutes earlier,
+    sailed through the gate as "all gates passed". mtime is reset by a copy, a
+    restore, an rsync or a plain ``touch`` -- all routine on a deploy host -- so
+    on its own it measures when the FILE arrived, not how old the evidence
+    inside it is. A policy can now name the document's own timestamp field, and
+    then BOTH ages have to be inside the limit.
+
+    A declared field that is missing or unparsable REFUSES rather than falling
+    back to mtime. That is the whole point: a policy asking for dated verdicts
+    and getting an undatable one has no evidence, and quietly passing would
+    leave a freshness line in the receipt that never actually ran.
+    """
+
+    def _policy(self, **readiness):
+        base = {"status_file": "data/readiness.json", "field": "state",
+                "label": "readiness", "safe_states": list(SAFE_STATES),
+                "max_age_sec": 900}
+        base.update(readiness)
+        return make_policy(readiness=base)
+
+    def test_a_fresh_file_carrying_a_stale_verdict_is_refused(self):
+        policy = self._policy(timestamp_field="checked_at")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+        self.write_status(_status_doc(state="ready", checked_at=old))
+        path, _ = self.stage([{"target": "engine/stale_verdict.py",
+                               "payload": "x"}], id="req-stale-verdict")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("verdict is 90", receipt["reason"])
+        self.assertIn("copied, restored or touched", receipt["reason"],
+                      "the reason must explain why a fresh file was not enough")
+        self.assertFalse((self.root / "engine" / "stale_verdict.py").exists())
+
+    def test_a_declared_but_missing_stamp_refuses_instead_of_falling_back(self):
+        """No stamp is not 'not stale'; it is 'cannot be dated'."""
+        policy = self._policy(timestamp_field="checked_at")
+        self.write_status(_status_doc(state="ready"))
+        path, _ = self.stage([{"target": "engine/no_stamp.py",
+                               "payload": "x"}], id="req-no-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("no parsable 'checked_at'", receipt["reason"])
+        self.assertFalse((self.root / "engine" / "no_stamp.py").exists())
+
+    def test_an_unparsable_stamp_refuses(self):
+        policy = self._policy(timestamp_field="checked_at")
+        self.write_status(_status_doc(state="ready", checked_at="an hour ago"))
+        path, _ = self.stage([{"target": "engine/bad_stamp.py",
+                               "payload": "x"}], id="req-bad-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("an hour ago", receipt["reason"])
+
+    def test_a_stamp_from_the_future_refuses(self):
+        """Two clocks disagreeing means the age proves nothing."""
+        policy = self._policy(timestamp_field="checked_at")
+        ahead = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        self.write_status(_status_doc(state="ready", checked_at=ahead))
+        path, _ = self.stage([{"target": "engine/future_stamp.py",
+                               "payload": "x"}], id="req-future-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("FUTURE", receipt["reason"])
+
+    def test_a_current_stamp_and_a_current_file_pass_and_report_both(self):
+        policy = self._policy(timestamp_field="checked_at")
+        now = datetime.now(timezone.utc).isoformat()
+        self.write_status(_status_doc(state="ready", checked_at=now))
+        path, _ = self.stage([{"target": "engine/fresh.py", "payload": "x"}],
+                             id="req-fresh-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        broker = receipt["broker"]
+        self.assertEqual(broker["stamp_field"], "checked_at")
+        self.assertIsNotNone(broker["verdict_age_sec"],
+                             "the receipt must show the age it measured")
+        self.assertLess(broker["verdict_age_sec"], 60)
+
+    def test_mtime_semantics_are_unchanged_when_no_stamp_field_is_declared(self):
+        """Back-compat: an undeclared stamp is not enforced, and says so."""
+        policy = self._policy()          # no timestamp_field
+        old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+        self.write_status(_status_doc(state="ready", checked_at=old))
+        path, _ = self.stage([{"target": "engine/undeclared.py",
+                               "payload": "x"}], id="req-undeclared-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertIsNone(receipt["broker"]["stamp_field"])
+        self.assertIsNone(receipt["broker"]["verdict_age_sec"],
+                          "claiming an age it never measured would be a lie in "
+                          "the receipt")
+
+    def test_a_naive_stamp_is_read_as_utc_not_as_host_local(self):
+        """Guessing local time could turn a stale verdict into a fresh one."""
+        policy = self._policy(timestamp_field="checked_at")
+        naive_old = (datetime.now(timezone.utc)
+                     - timedelta(minutes=90)).replace(tzinfo=None).isoformat()
+        self.write_status(_status_doc(state="ready", checked_at=naive_old))
+        path, _ = self.stage([{"target": "engine/naive_stamp.py",
+                               "payload": "x"}], id="req-naive-stamp")
+
+        receipt = self.handle(path, policy=policy)
+
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("verdict is", receipt["reason"])
 
 
 class AgeGateTest(ApplierTestBase):

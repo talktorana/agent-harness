@@ -27,6 +27,7 @@ import os
 import stat
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
@@ -76,7 +77,17 @@ class SchedulerPaths(unittest.TestCase):
         self._tmp.cleanup()
 
     def stub_task(self, *, raises: Exception = None, spy=None):
-        """Replace agent.run_task, optionally inspecting state mid-run."""
+        """Replace agent.run_task, optionally inspecting state mid-run.
+
+        The stub goes in through ``sys.modules`` rather than
+        ``mock.patch("agent.run_task")``. The real ``agent`` module imports the
+        provider SDK, so patching it by name fails on any machine that has the
+        harness source but not its dependencies -- which is exactly the host
+        that runs the applier, where these tests were then reporting 13 ERRORS
+        that looked like scheduler defects and were a missing ``openai``.
+        ``run_due_jobs`` imports lazily, so a pre-registered module satisfies it
+        without touching the real one.
+        """
         outer = self
 
         def fake_run_task(message, verbose=True, **kwargs):
@@ -87,7 +98,9 @@ class SchedulerPaths(unittest.TestCase):
                 raise raises
             return f"answered: {message}"
 
-        patcher = mock.patch("agent.run_task", side_effect=fake_run_task)
+        fake = types.ModuleType("agent")
+        fake.run_task = fake_run_task
+        patcher = mock.patch.dict(sys.modules, {"agent": fake})
         patcher.start()
         self.addCleanup(patcher.stop)
 
