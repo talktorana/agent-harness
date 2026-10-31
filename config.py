@@ -170,6 +170,34 @@ STREAM = os.environ.get("AGENT_STREAM", "1") == "1"
 # Web chat UI (optional dependency group: requirements-web.txt).
 WEBUI_HOST = os.environ.get("AGENT_WEBUI_HOST", "127.0.0.1")
 WEBUI_PORT = int(os.environ.get("AGENT_WEBUI_PORT", "8787"))
+
+
+def _normalise_base_path(raw: str) -> str:
+    """A URL prefix like ``/agent``, or ``""`` for the root.
+
+    Accepts the shapes people actually write (``agent``, ``/agent/``, ``/``)
+    and returns exactly one of two things: an empty string, or a single leading
+    slash with no trailing one. Normalising here rather than at each use site is
+    what keeps ``/agent/`` and ``/agent//models`` apart -- a doubled slash still
+    resolves in a browser, so a mismatch looks like a caching mystery rather
+    than a bad prefix.
+    """
+    value = (raw or "").strip()
+    if value in ("", "/"):
+        return ""
+    if not value.startswith("/"):
+        value = "/" + value
+    return value.rstrip("/")
+
+
+#: The prefix the console is mounted under, e.g. ``/agent`` when a reverse
+#: proxy serves it as one path on an existing domain alongside other apps.
+#: Empty (the default) keeps it at the root, which is what a dedicated port or
+#: subdomain wants. When set, EVERY URL the pages fetch is emitted with the
+#: prefix and the router only answers under it -- a request to ``/models`` on a
+#: console configured for ``/agent`` is a 404, not a second, unproxied way in.
+WEBUI_BASE_PATH = _normalise_base_path(
+    os.environ.get("AGENT_WEBUI_BASE_PATH", ""))
 # Scheduler: cron-lite job file so unattended missions run in the cloud.
 SCHEDULE_FILE = Path(os.environ.get(
     "AGENT_SCHEDULE_FILE",

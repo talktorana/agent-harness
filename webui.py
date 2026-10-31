@@ -26,6 +26,22 @@ import config
 _TASKS: Dict[str, Dict[str, Any]] = {}
 _LOCK = threading.Lock()
 
+#: Placeholder the two pages use for their URL prefix. Substituted at serve
+#: time from ``config.WEBUI_BASE_PATH`` rather than baked into the constant, so
+#: one image can be mounted at the root on a laptop and under ``/agent`` on a
+#: shared domain with no rebuild.
+_BASE_TOKEN = "__AGENT_BASE__"
+
+
+def _render(html: str) -> str:
+    """Substitute the configured prefix into every URL the page fetches.
+
+    Read from config on each call (not captured at import) so a deployment can
+    set it late and a test can vary it.
+    """
+    base = getattr(config, "WEBUI_BASE_PATH", "")
+    return html.replace(_BASE_TOKEN, base or "")
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>agent-harness</title>
 <style>
@@ -44,7 +60,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  button:disabled{opacity:.4;cursor:default}
 </style></head><body><div id="wrap">
 <h3>agent-harness <span class="m" id="state"></span>
-  <a href="/live" style="color:#7fd1ff;font-size:12px">live view -></a></h3>
+  <a href="__AGENT_BASE__/live" style="color:#7fd1ff;font-size:12px">live view -></a></h3>
 <div id="pick" class="m">
  <select id="prov"></select><select id="mod"></select>
  <span id="routes" style="font-size:11px"></span>
@@ -67,7 +83,7 @@ function fillModels(){
     mod.value=CAT.default[1];}
 }
 async function loadCatalog(){
-  try{const r=await fetch('/models');CAT=await r.json();}catch(e){CAT=null;}
+  try{const r=await fetch('__AGENT_BASE__/models');CAT=await r.json();}catch(e){CAT=null;}
   if(!CAT)return;
   prov.innerHTML='';
   Object.keys(CAT.providers).forEach(name=>{
@@ -85,7 +101,7 @@ function add(cls,text){const d=document.createElement('div');d.className=cls;
   d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;}
 async function poll(){
   if(!cur)return;
-  const r=await fetch('/task/'+cur);const j=await r.json();
+  const r=await fetch('__AGENT_BASE__/task/'+cur);const j=await r.json();
   log.innerHTML='';(j.lines||[]).forEach(l=>add(l.role,l.text));
   if(j.stream){add('a',j.stream+'\u258c');}
   state.textContent=j.status;
@@ -95,7 +111,7 @@ async function poll(){
 document.getElementById('f').onsubmit=async e=>{
   e.preventDefault();const text=q.value.trim();if(!text||cur)return;
   q.value='';add('u','> '+text);go.disabled=true;state.textContent='queued';
-  const r=await fetch('/chat',{method:'POST',
+  const r=await fetch('__AGENT_BASE__/chat',{method:'POST',
     headers:{'content-type':'application/json'},
     body:JSON.stringify({text, provider:prov.value||null,
                          model:mod.value||null})});
@@ -151,7 +167,7 @@ LIVE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <span id="badge"></span>
  <span class="m" id="state"></span>
  <span id="chain"></span>
- <a href="/" class="m">simple view</a>
+ <a href="__AGENT_BASE__/" class="m">simple view</a>
 </header>
 <div id="msgs"></div>
 <form id="f"><textarea id="q" placeholder="task... (Ctrl+Enter to send)"></textarea>
@@ -180,7 +196,7 @@ function fillModels(){
   mod.value=CAT.default[1];
 }
 async function loadCatalog(){
- try{const r=await fetch('/models');CAT=await r.json();}catch(e){CAT=null;}
+ try{const r=await fetch('__AGENT_BASE__/models');CAT=await r.json();}catch(e){CAT=null;}
  if(!CAT)return;
  prov.innerHTML='';
  Object.keys(CAT.providers).forEach(name=>{
@@ -231,7 +247,7 @@ function renderEvents(evs){
 async function poll(){
  if(!cur)return;
  try{
-  const r=await fetch('/task/'+cur);const j=await r.json();
+  const r=await fetch('__AGENT_BASE__/task/'+cur);const j=await r.json();
   renderEvents(j.events);
   if(j.stream){
    if(!liveBub)liveBub=row('a');
@@ -271,7 +287,7 @@ async function send(text){
  row('u').textContent=text;
  go.disabled=true;stopB.disabled=false;state.textContent='queued';
  lastAnswer='';
- const r=await fetch('/chat',{method:'POST',
+ const r=await fetch('__AGENT_BASE__/chat',{method:'POST',
   headers:{'content-type':'application/json'},
   body:JSON.stringify({text,provider:prov.value||null,model:mod.value||null})});
  const j=await r.json();cur=j.id;
@@ -284,7 +300,7 @@ q.addEventListener('keydown',e=>{
  if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();
   send(q.value.trim());}});
 stopB.onclick=async()=>{if(!cur)return;
- await fetch('/stop/'+cur,{method:'POST'});state.textContent='stopping...';};
+ await fetch('__AGENT_BASE__/stop/'+cur,{method:'POST'});state.textContent='stopping...';};
 document.getElementById('copy').onclick=()=>{
  if(!lastAnswer)return;
  (navigator.clipboard?navigator.clipboard.writeText(lastAnswer)
@@ -370,13 +386,36 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_page(self, html: str):
+        self._send(200, _render(html).encode(), "text/html; charset=utf-8")
+
+    def _route(self) -> str:
+        """The request path with the configured prefix removed.
+
+        Returns ``""`` for anything OUTSIDE the prefix, which is how a console
+        mounted at ``/agent`` refuses to also answer at ``/models``. Answering
+        both would mean two paths to the same shell-capable agent, only one of
+        which the reverse proxy authenticates -- and the one that is not the
+        documented path is the one nobody reviews.
+        """
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        base = getattr(config, "WEBUI_BASE_PATH", "")
+        if not base:
+            return path
+        if path == base:
+            return "/"                       # "/agent" means the console root
+        if path.startswith(base + "/"):
+            return path[len(base):] or "/"
+        return ""
+
     def do_GET(self):  # noqa: N802
-        if self.path in ("/", "/index.html"):
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
-        elif self.path in ("/live", "/live/"):
-            self._send(200, LIVE_PAGE.encode(), "text/html; charset=utf-8")
-        elif self.path.startswith("/task/"):
-            task_id = self.path.split("/task/", 1)[1]
+        route = self._route()
+        if route in ("/", "/index.html"):
+            self._send_page(PAGE)
+        elif route in ("/live", "/live/"):
+            self._send_page(LIVE_PAGE)
+        elif route.startswith("/task/"):
+            task_id = route.split("/task/", 1)[1]
             with _LOCK:
                 record = _TASKS.get(task_id)
                 payload = dict(record) if record else None
@@ -387,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload.pop("agent", None)
                 self._send(200, json.dumps(payload, default=str).encode(),
                            "application/json")
-        elif self.path == "/models":
+        elif route == "/models":
             import llm
             try:
                 payload = llm.catalog()
@@ -396,7 +435,7 @@ class Handler(BaseHTTPRequestHandler):
                            "error": str(exc)[:300]}
             self._send(200, json.dumps(payload).encode(),
                        "application/json")
-        elif self.path == "/health":
+        elif route == "/health":
             self._send(200, json.dumps({"ok": True,
                                         "tasks": len(_TASKS)}).encode(),
                        "application/json")
@@ -404,13 +443,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):  # noqa: N802
-        if self.path.startswith("/stop/"):
-            task_id = self.path.split("/stop/", 1)[1]
+        route = self._route()
+        if route.startswith("/stop/"):
+            task_id = route.split("/stop/", 1)[1]
             ok = _stop_task(task_id)
             self._send(200, json.dumps({"stopped": ok}).encode(),
                        "application/json")
             return
-        if self.path != "/chat":
+        if route != "/chat":
             self._send(404, b"not found", "text/plain")
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -434,8 +474,19 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     server = ThreadingHTTPServer((config.WEBUI_HOST, config.WEBUI_PORT),
                                  Handler)
-    print(f"[webui] http://{config.WEBUI_HOST}:{config.WEBUI_PORT}",
+    base = getattr(config, "WEBUI_BASE_PATH", "")
+    #: base is "" or "/agent", so this prints the streaming page's real URL
+    #: either way -- the one line worth having when you are checking whether a
+    #: proxy is pointed at the right path.
+    print(f"[webui] http://{config.WEBUI_HOST}:{config.WEBUI_PORT}{base}/live",
           flush=True)
+    if base:
+        # Say it plainly: with a prefix set, the root of this port is a dead
+        # end, and a reader who curls "/" and gets a 404 would otherwise spend
+        # the next few minutes wondering whether the console died.
+        print(f"[webui] mounted under {base!r}; unprefixed paths are refused "
+              f"by design, so a proxy must forward the prefix unchanged.",
+              flush=True)
     server.serve_forever()
     return 0
 
