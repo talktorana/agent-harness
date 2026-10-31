@@ -22,6 +22,9 @@ python run.py --check         # proves the key with a real completion
 python run.py "explain how the retry policy works"
 python run.py --serve         # browser chat UI on http://127.0.0.1:8787
 python run.py --schedule      # cron-lite daemon over schedule.json
+python run.py --serve --schedule   # console AND missions in ONE process
+python run.py --schedule-list      # schedule + state + is the state writable?
+python run.py --schedule-dry-run   # what is due right now; runs nothing
 ```
 
 `--check` matters. Listing models is **not** an auth gate on at least one
@@ -279,7 +282,7 @@ the surfaces that make it feel like one from the outside:
 | History recall | `session_list`, `session_read`, `session_search` | chat history search |
 | Subagents | `run_subagent` | delegated research with a bounded child session |
 | Chat UI | `python run.py --serve` | the editor chat pane (stdlib HTTP, streaming tokens) |
-| Scheduler | `python run.py --schedule`, `schedule.json` | cron for unattended missions |
+| Scheduler | `python run.py --schedule` (+ `--schedule-list`, `--schedule-dry-run`) | cron for unattended missions. The declaration (`schedule.json`) is read-only configuration; when each job last ran is written to `AGENT_SCHEDULE_STATE_FILE` beside the session log, because a deployment that mounts its own config read-only is the normal case and used to make every mission fail as a generic "loop error" |
 | Browser | `browser_*` tools (Playwright, optional) | the editor's browser preview: snapshot refs, click/type, screenshots the model can SEE |
 | Images | `view_image`, `run.py --image PATH` | multimodal input: charts, mocks, screenshots as evidence |
 | Streaming | on by default (`AGENT_STREAM=1`) | tokens print as they arrive; the web UI shows the answer forming |
@@ -290,6 +293,31 @@ needs the model's explicit `approve=true` **and** an approval path
 (`AGENT_AUTO_APPROVE=1` or a TTY). In an unattended run there is usually no
 approval path, so the refusal text tells the model to hand the exact command
 to a human -- which is what you want a robot to do at 3am.
+
+### Running missions unattended
+
+Two rules that are only obvious after they have failed once:
+
+1. **Keep the declaration read-only, and put the state somewhere else.**
+   `schedule.json` says *what* runs; `AGENT_SCHEDULE_STATE_FILE` records *when
+   it last ran*. Deployments normally mount their own config read-only (it is
+   reviewed, and an agent that can rewrite its own mission text owns its own
+   guardrails). An earlier version stamped `last_run` back into the schedule
+   file, which raised inside the poll loop and printed `[scheduler] loop error`
+   -- a line that reads as transient while the truth is that no mission ever
+   ran. `--schedule-list` reports `state_writable`, so this is checkable in one
+   command before arming anything.
+
+2. **One process, not two.** A memory append is a read-modify-write of a shared
+   file. Locking makes that safe *within* one process -- which is why
+   `--serve --schedule` runs the daemon as a thread beside the console. Two
+   containers mounting the same memory root have no lock to share, and a lost
+   note between them is undetectable afterwards: the file looks fine and the
+   note is simply gone.
+
+If the state file cannot be written, the scheduler refuses to run jobs and says
+why, rather than running a mission it cannot remember starting -- the next poll
+would start the same 40-step mission again, every 30 seconds.
 
 Browser automation is an optional dependency:
 

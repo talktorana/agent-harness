@@ -174,6 +174,18 @@ WEBUI_PORT = int(os.environ.get("AGENT_WEBUI_PORT", "8787"))
 SCHEDULE_FILE = Path(os.environ.get(
     "AGENT_SCHEDULE_FILE",
     str(Path(__file__).resolve().parent / "schedule.json")))
+#: Where the scheduler persists per-job runtime state (last_run, last_error).
+#:
+#: NOT the schedule file. A deployment usually mounts the schedule read-only --
+#: it is reviewed configuration, and in a gated deploy it is on the applier's
+#: forbidden list, because an agent that can rewrite its own mission text owns
+#: its own guardrails. Writing `last_run` back into that same file therefore
+#: fails on a read-only mount, and the failure surfaced as a generic
+#: "[scheduler] loop error" that looked transient while no mission ever ran.
+#: Defaults to a sibling of the session log, which is agent-writable by design.
+SCHEDULE_STATE_FILE = Path(os.environ.get(
+    "AGENT_SCHEDULE_STATE_FILE",
+    str(SESSIONS_DIR / "schedule_state.json")))
 
 # --- browser automation (optional: requirements-browser.txt) -----------------
 # Headless chromium via Playwright. The tools degrade to a clear
