@@ -18,11 +18,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import tools_browser  # noqa: E402
 import tools_media  # noqa: E402
-from agent import assemble_stream  # noqa: E402
+from agent import Agent, assemble_stream  # noqa: E402
 
 
 def _chunk(content=None, tool_calls=None):
     delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta,
+                                                    finish_reason=None)])
+
+
+def _rchunk(reasoning=None, content=None):
+    """A chunk from a REASONING model, which has one more field."""
+    delta = SimpleNamespace(content=content, tool_calls=None,
+                            reasoning_content=reasoning)
     return SimpleNamespace(choices=[SimpleNamespace(delta=delta,
                                                     finish_reason=None)])
 
@@ -70,6 +78,212 @@ class AssembleStreamTest(unittest.TestCase):
         msg = assemble_stream(iter([]))
         self.assertIsNone(msg.content)
         self.assertIsNone(msg.tool_calls)
+
+
+def _rchunk(reasoning=None, content=None):
+    """A chunk from a reasoning model: one extra field, content often absent."""
+    delta = SimpleNamespace(content=content, tool_calls=None,
+                            reasoning_content=reasoning)
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta,
+                                                    finish_reason=None)])
+
+
+class ThinkingLivenessTest(unittest.TestCase):
+    """A reasoning model's silent phase must still look alive."""
+
+    def test_reasoning_is_counted_and_not_mixed_into_the_answer(self):
+        chunks = [_rchunk(reasoning="let me think"),
+                  _rchunk(reasoning=" about this"),
+                  _rchunk(content="the answer")]
+        seen, thought = [], []
+        msg = assemble_stream(chunks, emit=seen.append,
+                              on_think=thought.append)
+        self.assertEqual(msg.content, "the answer")
+        self.assertEqual("".join(seen), "the answer")
+        self.assertEqual(msg.reasoning_chars, len("let me think about this"))
+        self.assertEqual(sum(thought), msg.reasoning_chars)
+
+    def test_pure_reasoning_stream_still_reports_activity(self):
+        msg = assemble_stream([_rchunk(reasoning="x" * 10)])
+        self.assertIsNone(msg.content)
+        self.assertEqual(msg.reasoning_chars, 10)
+
+    def test_chunks_without_reasoning_field_are_unaffected(self):
+        msg = assemble_stream([_chunk("hi")])
+        self.assertEqual(msg.content, "hi")
+        self.assertEqual(msg.reasoning_chars, 0)
+
+    def test_a_broken_think_sink_cannot_break_the_stream(self):
+        def boom(_n):
+            raise RuntimeError("sink exploded")
+        msg = assemble_stream([_rchunk(reasoning="x"), _chunk("ok")],
+                              on_think=boom)
+        self.assertEqual(msg.content, "ok")
+        self.assertEqual(msg.reasoning_chars, 1)
+
+
+class ThinkingEventWiringTest(unittest.TestCase):
+    """``_complete`` must actually reach the event feed, throttled.
+
+    A liveness signal that is computed but never emitted is worse than having
+    none: every ``assemble_stream`` test above would still pass while the
+    browser stayed blank, which is the exact failure being guarded against. So
+    the wiring is asserted through ``_complete`` itself.
+    """
+
+    def _agent(self, chunks, think_sec):
+        import llm
+        resolved = llm.Resolved(provider="alpha", model="fast",
+                                model_id="alpha-id",
+                                base_url="https://alpha.example/v1",
+                                api_key="k")
+
+        class Client:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=self)
+
+            def create(self, **kw):
+                # A fresh iterator per call: retrying a consumed one is empty.
+                return iter(list(chunks))
+
+        for target, kw in (
+                ("route_chain", {"return_value": [("alpha", "fast")]}),
+                ("resolve", {"return_value": resolved}),
+                ("client_for", {"return_value": Client()})):
+            p = mock.patch.object(llm, target, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        # No transcript file: these are unit runs, not a session. And the
+        # throttle is per-test, so a slow test cannot depend on wall-clock.
+        for obj, attr, value in ((config, "TRANSCRIPT", ""),
+                                 (Agent, "_THINK_EVENT_SEC", think_sec)):
+            p = mock.patch.object(obj, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.events = []
+        return Agent(verbose=False, on_token=lambda t: None,
+                     on_event=self.events.append)
+
+    def _thinking(self):
+        return [e for e in self.events if e.get("event") == "thinking"]
+
+    def test_silent_reasoning_emits_thinking_events(self):
+        chunks = [_rchunk(reasoning="abcdefghij"),
+                  _rchunk(reasoning="klmnopqrst"),
+                  _rchunk(content="done")]
+        agent = self._agent(chunks, think_sec=0.0)
+        with mock.patch.object(config, "STREAM", True):
+            resp = agent._complete(use_tools=False)
+        self.assertEqual(resp.choices[0].message.content, "done")
+        thought = self._thinking()
+        self.assertTrue(thought, "no liveness event reached the UI feed")
+        self.assertEqual(thought[-1]["reasoning_chars"], 20)
+        self.assertEqual(thought[-1]["route"], "alpha/fast")
+
+    def test_thinking_events_are_throttled(self):
+        chunks = [_rchunk(reasoning="x") for _ in range(50)]
+        chunks.append(_rchunk(content="done"))
+        agent = self._agent(chunks, think_sec=60.0)
+        with mock.patch.object(config, "STREAM", True):
+            agent._complete(use_tools=False)
+        thought = self._thinking()
+        # Exactly one event for 50 chunks: a coarse heartbeat, not a flood of
+        # 50 into the feed and the poll payload. It carries the count at the
+        # moment it fired, and every later window would show it climbing --
+        # growth over time is the liveness proof, not any single number.
+        self.assertEqual(len(thought), 1)
+        self.assertEqual(thought[0]["reasoning_chars"], 1)
+
+    def test_counters_reset_per_model_call(self):
+        """A stale route must not be blamed for a new turn's thinking."""
+        chunks = [_rchunk(reasoning="xyz"), _rchunk(content="done")]
+        agent = self._agent(chunks, think_sec=0.0)
+        with mock.patch.object(config, "STREAM", True):
+            agent._complete(use_tools=False)
+            agent._complete(use_tools=False)
+        # Two independent calls of 3 reasoning chars each. Without the reset
+        # in _complete these would read 3 then 6, accumulating across turns.
+        counts = [e["reasoning_chars"] for e in self._thinking()]
+        self.assertEqual(counts, [3, 3])
+
+
+class _LivenessSink:
+    """``Agent._on_think`` exercised without building a real Agent.
+
+    Constructing an Agent resolves the route chain and builds API clients; the
+    throttling below needs none of that, so bind just the method onto a stand-in
+    that captures what would have been logged.
+    """
+
+    _on_think = Agent._on_think
+    _THINK_EVENT_SEC = Agent._THINK_EVENT_SEC
+
+    def __init__(self):
+        self.events = []
+        self._thinking_route = "prov/alias"
+        self._thinking_chars = 0
+        self._last_think_event = 0.0
+
+    def _log(self, record):
+        self.events.append(record)
+
+
+class ThinkingLivenessTest(unittest.TestCase):
+    """A reasoning model's silent phase must still look alive.
+
+    Live 2026-10-31: one model call ran 5m22s emitting only
+    ``reasoning_content``. ``assemble_stream`` discarded those chunks, so the
+    web UI rendered a blank bubble for the whole stretch and an operator
+    watching it could not tell a busy model from a dead process.
+    """
+
+    def test_reasoning_is_counted_and_never_leaks_into_the_answer(self):
+        seen, thought = [], []
+        chunks = [_rchunk(reasoning="hmm "), _rchunk(reasoning="let me think"),
+                  _chunk("the answer")]
+        msg = assemble_stream(chunks, emit=seen.append,
+                              on_think=thought.append)
+        self.assertEqual(msg.content, "the answer")
+        self.assertEqual("".join(seen), "the answer")
+        self.assertEqual(msg.reasoning_chars, len("hmm let me think"))
+        self.assertEqual(sum(thought), msg.reasoning_chars)
+        self.assertNotIn("hmm", msg.content)
+
+    def test_reasoning_only_stream_reports_chars_and_no_content(self):
+        msg = assemble_stream([_rchunk(reasoning="abc")])
+        self.assertIsNone(msg.content)
+        self.assertEqual(msg.reasoning_chars, 3)
+
+    def test_chunk_without_a_reasoning_field_is_still_handled(self):
+        msg = assemble_stream([_chunk("hi")])
+        self.assertEqual(msg.content, "hi")
+        self.assertEqual(msg.reasoning_chars, 0)
+
+    def test_thinking_events_are_throttled_but_growing(self):
+        sink = _LivenessSink()
+        sink._on_think(100)
+        # The first chunk reports at once: that is the point, a long think
+        # cannot go unannounced until the throttle expires.
+        self.assertEqual(len(sink.events), 1)
+        evt = sink.events[0]
+        self.assertEqual(evt["event"], "thinking")
+        self.assertEqual(evt["route"], "prov/alias")
+        self.assertEqual(evt["reasoning_chars"], 100)
+        sink._on_think(100)          # same instant: no event, but still counted
+        self.assertEqual(len(sink.events), 1)
+        self.assertEqual(sink._thinking_chars, 200)
+        sink._last_think_event -= sink._THINK_EVENT_SEC + 1.0
+        sink._on_think(50)
+        self.assertEqual([e["reasoning_chars"] for e in sink.events],
+                         [100, 250])
+
+    def test_an_on_think_that_raises_cannot_break_the_stream(self):
+        def boom(_n):
+            raise RuntimeError("sink is broken")
+        msg = assemble_stream([_rchunk(reasoning="x"), _chunk("ok")],
+                              on_think=boom)
+        self.assertEqual(msg.content, "ok")
+        self.assertEqual(msg.reasoning_chars, 1)
 
 
 class MediaTest(unittest.TestCase):

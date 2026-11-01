@@ -90,7 +90,7 @@ def _backoff(attempt: int, retry_after: Optional[float]) -> float:
     return min(delay, 60.0)
 
 
-def assemble_stream(chunks, emit=None) -> SimpleNamespace:
+def assemble_stream(chunks, emit=None, on_think=None) -> SimpleNamespace:
     """Fold SSE chunks into one message-shaped object.
 
     Streaming tool calls arrive FRAGMENTED: one chunk may carry the id, the
@@ -98,9 +98,18 @@ def assemble_stream(chunks, emit=None) -> SimpleNamespace:
     reassembled per ``delta.tool_calls[].index`` so the caller sees exactly
     the shape the non-streaming path returns -- the loop below cannot tell
     the difference, which is the point.
+
+    Reasoning models spend their opening minutes emitting
+    ``delta.reasoning_content`` and NO ``delta.content`` at all. Discarding
+    those chunks silently left the web UI showing a blank bubble for 5m22s of a
+    real run -- indistinguishable, to the operator watching it, from a dead
+    process. They are now counted and reported through ``on_think`` so a
+    liveness signal exists: the reasoning text is never mixed into the answer
+    and never printed.
     """
     content: List[str] = []
     calls: Dict[int, Dict[str, Any]] = {}
+    thinking_chars = 0
     for chunk in chunks:
         choices = getattr(chunk, "choices", None) or []
         if not choices:
@@ -108,6 +117,14 @@ def assemble_stream(chunks, emit=None) -> SimpleNamespace:
         delta = getattr(choices[0], "delta", None)
         if delta is None:
             continue
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            thinking_chars += len(reasoning)
+            if on_think is not None:
+                try:
+                    on_think(len(reasoning))
+                except Exception:  # noqa: BLE001
+                    pass
         text = getattr(delta, "content", None)
         if text:
             content.append(text)
@@ -140,10 +157,16 @@ def assemble_stream(chunks, emit=None) -> SimpleNamespace:
             for i, slot in sorted(calls.items())
         ]
     return SimpleNamespace(content="".join(content) or None,
-                           tool_calls=tool_calls)
+                           tool_calls=tool_calls,
+                           reasoning_chars=thinking_chars)
 
 
 class Agent:
+    #: Minimum seconds between two liveness events from a silently-reasoning
+    #: model. Frequent enough that a 5-minute think still proves it is alive;
+    #: coarse enough that a fast stream cannot flood the event feed.
+    _THINK_EVENT_SEC = 3.0
+
     def __init__(self, verbose: bool = True, on_token=None,
                  on_event=None,
                  provider: Optional[str] = None,
@@ -176,6 +199,11 @@ class Agent:
         # step loop exits before the next model call. Set, never kill.
         self.stop_requested = False
         self.steps = 0
+        # Liveness during a reasoning model's silent phase. `_on_think` reports
+        # progress from the chunk loop; the counters reset per model call.
+        self._thinking_route: Optional[str] = None
+        self._thinking_chars = 0
+        self._last_think_event = 0.0
         self.session: Optional[SessionLog] = None
         self._transcript = None
         if config.TRANSCRIPT:
@@ -201,6 +229,24 @@ class Agent:
                 self.on_token(text)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _on_think(self, n_chars: int) -> None:
+        """Liveness signal from a model that is still reasoning.
+
+        A reasoning model emits ``reasoning_content`` for minutes before the
+        first ``content`` token. With nothing to show, the web UI sat on a
+        blank bubble and the operator could not tell a busy model from a dead
+        process -- which is exactly the confusion that cost an evening here.
+        This emits a throttled ``thinking`` event carrying how much reasoning
+        has streamed so far; it never touches the answer.
+        """
+        self._thinking_chars += n_chars
+        now = time.monotonic()
+        if now - self._last_think_event < self._THINK_EVENT_SEC:
+            return
+        self._last_think_event = now
+        self._log({"event": "thinking", "route": self._thinking_route,
+                   "reasoning_chars": self._thinking_chars})
 
     def _log(self, record: Dict[str, Any]) -> None:
         if self._transcript:
@@ -324,9 +370,15 @@ class Agent:
                         # UI shows the answer forming. assemble_stream folds
                         # the chunks back into the same message shape the
                         # batched path returns, so nothing downstream differs.
+                        # Reset per call: the counters belong to THIS turn, and
+                        # a stale route would be blamed for a new one's silence.
+                        self._thinking_route = label
+                        self._thinking_chars = 0
+                        self._last_think_event = 0.0
                         stream = client.chat.completions.create(
                             **request, stream=True)
-                        message = assemble_stream(stream, self._emit_token)
+                        message = assemble_stream(stream, self._emit_token,
+                                                  on_think=self._on_think)
                         if self.verbose:
                             print(flush=True)
                         return SimpleNamespace(

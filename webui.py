@@ -219,6 +219,7 @@ function evLine(evt){
  if(evt.route)s+=' ['+evt.route+']';
  if(evt.tool)s+=' '+evt.tool;
  if(evt.to)s+=' \\u2192 '+evt.to;
+ if(evt.reasoning_chars)s+=' '+evt.reasoning_chars+' reasoning chars';
  if(evt.error)s+=' :: '+String(evt.error).slice(0,140);
  return s;
 }
@@ -254,6 +255,16 @@ async function poll(){
    liveBub.className='bub caret';liveBub.textContent=j.stream;scroll();
   }
   state.textContent=j.status;
+  // A reasoning model streams reasoning_content for minutes before the first
+  // answer token. Nothing to render then used to leave the page showing the
+  // question and a silent "running" -- read, correctly, as a dead process.
+  // Say what it is actually doing, with a number that keeps moving.
+  if(!j.stream&&(j.status==='running'||j.status==='queued')){
+   const ev=((j.events||[]).filter(e=>e.event==='thinking'
+    ||e.event==='model_call')).pop();
+   if(ev)state.textContent='thinking'+(ev.reasoning_chars?
+    ' ('+ev.reasoning_chars+' reasoning chars)':'')+'...';
+  }
   stopB.disabled=(j.status!=='running'&&j.status!=='stopping');
   go.disabled=(j.status==='running'||j.status==='stopping'||j.status==='queued');
   if(j.status==='done'||j.status==='error'||j.status==='stopped'){
@@ -339,10 +350,16 @@ def _start_task(text: str, provider=None, model=None) -> str:
                 if len(feed) > 400:
                     del feed[:len(feed) - 400]
 
-        agent = Agent(verbose=False, on_token=on_token, on_event=on_event,
-                      provider=provider, model=model)
-        record["agent"] = agent
+        # Construction is INSIDE the try. Agent() resolves the route chain and
+        # raises ProviderError for a missing key or an unknown alias; outside
+        # the try that exception killed the worker thread and left the record
+        # at "running" forever -- the page polled a spinner that never resolved
+        # and never said what was misconfigured.
+        agent = None
         try:
+            agent = Agent(verbose=False, on_token=on_token, on_event=on_event,
+                          provider=provider, model=model)
+            record["agent"] = agent
             answer = agent.run(text)
             record["answer"] = answer
             record["stream"] = ""

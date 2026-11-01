@@ -185,6 +185,26 @@ class WebuiServerTest(unittest.TestCase):
         self.assertEqual(rec["status"], "error")
         self.assertIn("gateway exploded", rec["lines"][-1]["text"])
 
+    def test_construction_error_surfaces_instead_of_hanging(self):
+        """A bad provider config must be reported, not left spinning.
+
+        Agent() resolves the route chain, so a missing key or an unknown alias
+        raises there rather than inside run(). Construction used to sit OUTSIDE
+        the worker's try/except: the exception killed the thread, the record
+        stayed "running" for ever, and the page polled a spinner that never
+        resolved and never named the misconfiguration.
+        """
+        class Boom:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("provider 'x': key missing")
+
+        with mock.patch("agent.Agent", Boom):
+            task_id = self.post_task()
+        rec = self.wait_for(task_id, lambda r: r["status"] != "running",
+                            timeout=3.0)
+        self.assertEqual(rec["status"], "error", rec)
+        self.assertIn("key missing", rec["lines"][-1]["text"])
+
     # -- cancellation ----------------------------------------------------
 
     def test_stop_requests_a_cooperative_cancel(self):
