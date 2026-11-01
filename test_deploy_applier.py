@@ -75,6 +75,35 @@ def make_policy(**over):
     return Policy(doc, name="test-policy")
 
 
+#: Fake "deployment" for the typed-action tests: a JSON file of instance rows
+#: plus three tiny scripts standing in for the deployment's own read, upsert and
+#: validate commands. Kept as argv + ``python -c`` on purpose -- that is exactly
+#: how a real policy names a command, so the test exercises the same substitution
+#: path (and would catch a template that only works with a shell).
+_READ_SRC = (
+    "import sys;"
+    "print(open(sys.argv[1], encoding='utf-8').read())"
+)
+_UPSERT_SRC = (
+    "import sys, json;"
+    "p, row = sys.argv[1], json.loads(sys.argv[2]);"
+    "doc = json.load(open(p, encoding='utf-8'));"
+    "doc['instances'] = [row if i.get('instance_id') == row.get('instance_id')"
+    " else i for i in doc['instances']];"
+    "open(p, 'w', encoding='utf-8').write(json.dumps(doc));"
+    "print('upserted')"
+)
+#: Succeeds and writes NOTHING -- the shape of a write path that reports success
+#: without changing anything, which the re-read check must catch.
+_UPSERT_NOOP_SRC = "print('pretended to upsert')"
+_VALIDATE_SRC = (
+    "import sys;"
+    "ok = sys.argv[1] in ('', 'aggressive', 'balanced', 'safe');"
+    "print('profile' + (' accepted' if ok else ' rejected'));"
+    "sys.exit(0 if ok else 1)"
+)
+
+
 class ApplierTestBase(unittest.TestCase):
     """A throwaway deployment root with a fresh, safe readiness status."""
 
@@ -172,6 +201,240 @@ class ApplierTestBase(unittest.TestCase):
         opts.update(kw)
         return handle_request(path, self.outbox, self.root, **opts)
 
+
+class TypedActionTest(ApplierTestBase):
+    """A request may ask for a TYPED ACTION instead of a file deploy.
+
+    Why this exists at all: runtime state (an instance's selected risk profile)
+    lives in a file that belongs to the RUNNING service, which caches it. The
+    applier is forbidden to write ``data/`` -- correctly -- so the only safe way
+    to change that state is to ask the service to change it, which is what an
+    action is.
+
+    What these tests are really pinning is BOUNDEDNESS. An action must not
+    become a general remote-exec: it can only run a command the policy named, on
+    one existing instance, setting one of the fields the policy exposed. And it
+    must REFUSE when no policy declares any action at all, so shipping this
+    machinery changes nothing until a deployment opts in.
+    """
+
+    ROW = {"instance_id": "bei-spx", "strategy_key": "s", "instrument": "SPX",
+           "params": {}, "risk_profile": None, "contracts": 3, "paused": False}
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.root / "state.json"
+        self.state.write_text(json.dumps({"instances": [dict(self.ROW)]}),
+                              encoding="utf-8")
+        self.policy = self.action_policy()
+
+    def action_policy(self, **over):
+        actions = {
+            "container": "",
+            "set_instance_field": {
+                "allowed_fields": ["risk_profile"],
+                "read_argv": [sys.executable, "-c", _READ_SRC, str(self.state)],
+                "apply_argv": [sys.executable, "-c", _UPSERT_SRC,
+                               str(self.state), "{json}"],
+                "validate_argv": [sys.executable, "-c", _VALIDATE_SRC,
+                                  "{profile}"],
+                "run_timeout_sec": 30,
+            },
+        }
+        actions.update(over.pop("actions", {}) or {})
+        return make_policy(actions=actions, **over)
+
+    def stage_action(self, action, **over):
+        req = {
+            "schema_version": 1,
+            "id": over.get("id", "req-act"),
+            "purpose": over.get("purpose", "test action"),
+            "created_at": over.get("created_at",
+                                   datetime.now(timezone.utc).isoformat()),
+            "action": action,
+        }
+        path = self.outbox / f"{req['id']}{REQUEST_SUFFIX}"
+        path.write_text(json.dumps(req), encoding="utf-8")
+        return path
+
+    def rows(self):
+        return json.loads(self.state.read_text(encoding="utf-8"))["instances"]
+
+    # ---- the safe default ---------------------------------------------------
+    def test_with_no_actions_declared_an_action_request_is_refused(self):
+        """Shipping the machinery must not grant anything by itself."""
+        self.policy = make_policy()          # the base policy: no actions block
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("not permitted by this deployment's policy",
+                      receipt["reason"])
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+
+    # ---- boundedness --------------------------------------------------------
+    def test_an_unknown_action_kind_is_refused(self):
+        path = self.stage_action({"kind": "run_anything",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("not permitted", receipt["reason"])
+
+    def test_a_field_the_policy_does_not_expose_is_refused(self):
+        """The allow-list is the difference between a field and a shell."""
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"contracts": 99}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("does not expose", receipt["reason"])
+        self.assertEqual(self.rows()[0]["contracts"], 3)
+
+    def test_a_nested_value_is_refused(self):
+        """One field must mean one scalar, not a whole sub-structure."""
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": {"x": 1}}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("must be a scalar", receipt["reason"])
+
+    def test_an_injection_style_instance_id_is_refused(self):
+        for bogus in ("../../etc", "bei spx", "a;rm -rf /", ""):
+            with self.subTest(instance_id=bogus):
+                path = self.stage_action(
+                    {"kind": "set_instance_field", "instance_id": bogus,
+                     "set": {"risk_profile": "balanced"}},
+                    id=f"req-inj-{abs(hash(bogus)) % 10000}")
+                receipt = self.handle(path)
+                self.assertEqual(receipt["status"], "refused", bogus)
+
+    def test_the_identifier_check_is_what_refuses_it_not_the_lookup(self):
+        """Isolate the guard: the id must EXIST and still be refused.
+
+        The obvious version of this test proves nothing, and the mutation run
+        showed it: an id like ``../../etc`` is refused anyway because no such
+        instance exists, so removing the identifier check left the suite green.
+        Seeding a deployment whose own row carries a hostile id removes that
+        alibi -- now only the check can refuse it.
+        """
+        self.state.write_text(json.dumps({"instances": [
+            {"instance_id": "../../evil", "risk_profile": None,
+             "contracts": 1, "params": {}, "paused": False},
+        ]}), encoding="utf-8")
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "../../evil",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("plain identifier", receipt["reason"],
+                      "refused for the wrong reason: the identifier check "
+                      "must reject it, not the existence lookup")
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+
+    def test_an_instance_that_does_not_exist_is_refused_not_created(self):
+        """Changing a book is a smaller decision than opening one."""
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "ghost-book",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("does not exist", receipt["reason"])
+        self.assertEqual(len(self.rows()), 1,
+                         "the action created an instance")
+
+    def test_a_value_the_deployment_rejects_is_refused(self):
+        """'balance' is a typo, and must not be installed."""
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balance"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("rejected risk_profile", receipt["reason"])
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+
+    # ---- the happy path, and what it must preserve --------------------------
+    def test_a_valid_action_is_applied_and_verified_by_re_read(self):
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual(receipt["before"], {"risk_profile": None})
+        self.assertEqual(receipt["after"], {"risk_profile": "balanced"})
+        self.assertEqual(self.rows()[0]["risk_profile"], "balanced")
+        self.assertIn("verified", receipt["verification"])
+
+    def test_the_merge_preserves_every_field_the_request_did_not_name(self):
+        """The deployment's write path REPLACES the whole row.
+
+        Sending only the changed field would reset contracts/params/paused to
+        their defaults -- the most likely way this feature could lose an
+        operator's configuration. Read-modify-write is the fix, and this is the
+        assertion that keeps it.
+        """
+        self.handle(self.stage_action(
+            {"kind": "set_instance_field", "instance_id": "bei-spx",
+             "set": {"risk_profile": "safe"}}))
+        row = self.rows()[0]
+        self.assertEqual(row["risk_profile"], "safe")
+        for field, value in (("contracts", 3), ("paused", False),
+                             ("params", {}), ("instrument", "SPX"),
+                             ("strategy_key", "s")):
+            self.assertEqual(row[field], value,
+                             f"{field} was reset by the upsert")
+
+    def test_a_write_that_did_not_take_is_reported_not_believed(self):
+        """An exit code is not evidence; the re-read is."""
+        self.policy = self.action_policy(actions={"set_instance_field": {
+            "allowed_fields": ["risk_profile"],
+            "read_argv": [sys.executable, "-c", _READ_SRC, str(self.state)],
+            "apply_argv": [sys.executable, "-c", _UPSERT_NOOP_SRC],
+            "validate_argv": [sys.executable, "-c", _VALIDATE_SRC,
+                              "{profile}"],
+            "run_timeout_sec": 30,
+        }})
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertIn("DID NOT TAKE", receipt["verification"])
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+
+    # ---- gates shared with a file deploy ------------------------------------
+    def test_a_dry_run_changes_nothing(self):
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path, dry_run=True)
+        self.assertEqual(receipt["status"], "dry_run")
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+        self.assertTrue(path.exists(), "a dry run consumed the request")
+
+    def test_the_readiness_gate_still_applies_to_an_action(self):
+        """An action changes a live book's sizing; it must not land mid-session."""
+        self.write_status(_status_doc(state="blocked"))
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertTrue(receipt.get("pending_window"),
+                        "a busy book must DEFER the action, not discard it")
+        self.assertIsNone(self.rows()[0]["risk_profile"])
+
+    def test_an_applied_action_is_consumed_and_receipted(self):
+        path = self.stage_action({"kind": "set_instance_field",
+                                  "instance_id": "bei-spx",
+                                  "set": {"risk_profile": "balanced"}})
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertFalse(path.exists(), "the request is still pending")
+        self.assertTrue((self.outbox / "applied" / path.name).exists())
+        self.assertTrue((self.outbox / _receipt_name(path)).exists(),
+                        "the verdict must stay where the dashboard reads it")
 
 class SchemaGateTest(ApplierTestBase):
     def test_well_formed_request_passes_every_gate(self):

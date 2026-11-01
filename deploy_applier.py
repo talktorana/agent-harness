@@ -56,6 +56,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,6 +79,19 @@ GENERIC_FORBIDDEN_DIRS = (".git",)
 
 #: A request this old is stale intent, not a pending task.
 DEFAULT_MAX_AGE_SEC = 900.0
+
+
+def _argv_list(raw: Any) -> Tuple[str, ...]:
+    """A policy-supplied command as an ARGV tuple, or empty.
+
+    Argv, never a shell string. The substituted values (an instance id, a
+    filename, a JSON document) are operator-adjacent data, and joining them into
+    a shell command would make every one of them a quoting problem and a
+    potential injection. With a list there is no shell to inject into.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(part) for part in raw if isinstance(part, str) and part)
 
 #: How fresh the readiness status file must be to believe it. A stale status
 #: means we do not actually know the state the system is in, which is a reason
@@ -131,6 +145,49 @@ class Policy:
         limits = limits if isinstance(limits, dict) else {}
         self.max_age_sec = float(limits.get("max_age_sec")
                                  or DEFAULT_MAX_AGE_SEC)
+
+        #: Which container a typed action's commands run against. Named by the
+        #: policy because only the deployment knows its own service topology --
+        #: the applier would otherwise have to guess a container name, and a
+        #: guess that is wrong runs the command against nothing (or, worse,
+        #: against another product's container on the same host).
+        actions_doc = doc.get("actions")
+        actions_doc = actions_doc if isinstance(actions_doc, dict) else {}
+        self.container = str(actions_doc.get("container") or "").strip()
+
+        #: TYPED ACTIONS the gate will perform on the deployment's behalf.
+        #:
+        #: A request that names an action is not a file deploy: it asks the host
+        #: to run one of the deployment's OWN sanctioned commands. That is the
+        #: only shape that can change runtime state safely -- state lives in
+        #: files this applier is forbidden to write (and should be: they are
+        #: owned by the running service, which caches them), so the write must
+        #: go THROUGH that service, not around it.
+        #:
+        #: Declared in the policy, never hardcoded here: the applier must stay
+        #: free of any product's vocabulary. Each entry is
+        #:   {allowed_fields: [...], read_argv: [...], apply_argv: [...],
+        #:    validate_argv: [...], run_timeout_sec: n}
+        #: where ``argv`` templates may use {container}, {instance_id},
+        #: {profile} and {json}. ARGV LISTS, not shell strings, so nothing is
+        #: re-quoted and a value can never become a command.
+        actions = doc.get("actions")
+        actions = actions if isinstance(actions, dict) else {}
+        self.actions: Dict[str, Dict[str, Any]] = {}
+        for kind, spec in actions.items():
+            if isinstance(kind, str) and kind.startswith("_"):
+                continue  # _comment and friends
+            if not isinstance(spec, dict):
+                continue
+            self.actions[str(kind)] = {
+                "allowed_fields": tuple(
+                    str(f) for f in (spec.get("allowed_fields") or [])
+                    if isinstance(f, str) and f.strip()),
+                "read_argv": _argv_list(spec.get("read_argv")),
+                "apply_argv": _argv_list(spec.get("apply_argv")),
+                "validate_argv": _argv_list(spec.get("validate_argv")),
+                "run_timeout_sec": float(spec.get("run_timeout_sec") or 120.0),
+            }
 
         forbid = doc.get("forbid")
         forbid = forbid if isinstance(forbid, dict) else {}
@@ -839,6 +896,202 @@ def restart_services(services: List[str], root: Path,
     return out
 
 
+# ============================================================== typed actions
+
+#: Characters allowed in an instance identifier a request may name.
+#: Deliberately conservative: the value is substituted into an argv, echoed into
+#: a receipt and compared against ids read from the deployment, so there is no
+#: reason to accept anything that is not a plain slug.
+_INSTANCE_ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def _fmt_argv(template: Tuple[str, ...], **values: str) -> List[str]:
+    """Substitute {name} placeholders in each element. No shell, no re-quoting."""
+    out: List[str] = []
+    for part in template:
+        for key, value in values.items():
+            part = part.replace("{" + key + "}", value)
+        out.append(part)
+    return out
+
+
+def _run_argv(argv: List[str], timeout: float,
+              stdin_text: Optional[str] = None) -> Tuple[int, str]:
+    """Run a policy command and return (rc, combined output tail).
+
+    Never raises on a failing command -- the caller turns rc into a verdict.
+    A missing executable is rc 127, which is distinguishable from a refusal in
+    the same way the verify gate distinguishes it: the command never ran, so its
+    output is not evidence about the deployment.
+    """
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            input=stdin_text, encoding="utf-8", errors="replace")
+    except FileNotFoundError as exc:
+        return 127, f"{argv[0]}: {exc}"
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s: {' '.join(argv[:4])} ..."
+    except OSError as exc:
+        return 126, f"{type(exc).__name__}: {exc}"
+    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def gate_action(action: Dict[str, Any],
+                policy: "Policy") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Validate a TYPED action and resolve the row it would change.
+
+    Returns ``(kind, spec, current_row)``. Raises :class:`Refused` for anything
+    permanent -- a bad kind, a field the policy does not expose, an instance
+    that does not exist, or a value the deployment's OWN validator rejects.
+
+    The instance must ALREADY EXIST. Allowing creation would turn "set a field
+    on this book" into "start a new trading book", which is a materially larger
+    decision than the one the operator was asked about.
+
+    Values are validated by ASKING THE DEPLOYMENT (``validate_argv``), not by
+    this module: profile names, allowed ranges and every other domain rule live
+    with the code that enforces them at run time. A second copy here would be
+    the one that goes out of date, and it would do so silently.
+    """
+    kind = str(action.get("kind") or "").strip()
+    if not kind:
+        raise Refused("action.kind is required")
+    spec = policy.actions.get(kind)
+    if spec is None:
+        known = ", ".join(sorted(policy.actions)) or "(none configured)"
+        raise Refused(
+            f"action kind {kind!r} is not permitted by this deployment's "
+            f"policy; permitted: {known}")
+
+    instance_id = str(action.get("instance_id") or "").strip()
+    if not _INSTANCE_ID_OK.match(instance_id):
+        raise Refused(
+            f"action.instance_id must be a plain identifier, got "
+            f"{instance_id!r}")
+
+    changes = action.get("set")
+    if not isinstance(changes, dict) or not changes:
+        raise Refused("action.set must be a non-empty object")
+    allowed = spec["allowed_fields"]
+    if not allowed:
+        raise Refused(f"action kind {kind!r} exposes no fields to set")
+    extra = sorted(set(changes) - set(allowed))
+    if extra:
+        raise Refused(
+            f"action.set names field(s) {extra} that {kind!r} does not expose; "
+            f"settable: {sorted(allowed)}")
+
+    for field, value in changes.items():
+        #: Scalars only. A nested object would let a request replace a whole
+        #: sub-structure by naming one field, which is the opposite of the
+        #: bounded change this exists to make.
+        if isinstance(value, (dict, list)):
+            raise Refused(
+                f"action.set[{field!r}] must be a scalar, not "
+                f"{type(value).__name__}")
+
+    if not spec["read_argv"] or not spec["apply_argv"]:
+        raise Refused(f"action kind {kind!r} is not fully configured "
+                      f"(read_argv / apply_argv missing)")
+
+    rc, out = _run_argv(
+        _fmt_argv(spec["read_argv"], container=policy.container,
+                  instance_id=instance_id),
+        spec["run_timeout_sec"])
+    if rc != 0:
+        raise Refused(
+            f"could not read the deployment's current configuration "
+            f"(rc={rc}): {out[:300]}")
+    try:
+        doc = json.loads(out[out.index("{"):]) if "{" in out else {}
+    except (ValueError, TypeError):
+        raise Refused(f"deployment returned unreadable configuration: "
+                      f"{out[:300]}") from None
+    rows = doc.get("instances") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        raise Refused("deployment returned no instance list")
+    current = next((r for r in rows
+                    if isinstance(r, dict)
+                    and str(r.get("instance_id")) == instance_id), None)
+    if current is None:
+        known = sorted(str(r.get("instance_id")) for r in rows
+                       if isinstance(r, dict))[:10]
+        raise Refused(
+            f"instance {instance_id!r} does not exist on this deployment "
+            f"(known: {known}); this action changes existing instances and "
+            f"never creates one")
+
+    if "risk_profile" in changes and spec["validate_argv"]:
+        profile = "" if changes["risk_profile"] is None else str(
+            changes["risk_profile"])
+        rc, out = _run_argv(
+            _fmt_argv(spec["validate_argv"], container=policy.container,
+                      instance_id=instance_id, profile=profile),
+            spec["run_timeout_sec"])
+        if rc != 0:
+            raise Refused(
+                f"the deployment rejected risk_profile={profile!r} "
+                f"(rc={rc}): {out[:300]}")
+
+    return kind, spec, current
+
+
+def apply_action(kind: str, spec: Dict[str, Any], current: Dict[str, Any],
+                 changes: Dict[str, Any], policy: "Policy",
+                 instance_id: str) -> Tuple[Dict[str, Any], str]:
+    """Merge the allowed fields into the CURRENT row and write it back.
+
+    Read-modify-write, not "send what you want": the deployment's write path is
+    an UPSERT that REPLACES the whole row, so a request carrying only the field
+    it means to change would silently reset every other field to its default.
+    That is the single most likely way this feature could lose an operator's
+    configuration, and doing the merge here means the caller never has to
+    reproduce a row it cannot see.
+
+    Only ``allowed_fields`` are copied, so the row read back cannot smuggle in
+    anything the policy does not expose.
+    """
+    merged = dict(current)
+    merged.update({k: v for k, v in changes.items()
+                   if k in spec["allowed_fields"]})
+    argv = _fmt_argv(spec["apply_argv"], container=policy.container,
+                     instance_id=instance_id, json=json.dumps(merged),
+                     profile=str(changes.get("risk_profile") or ""))
+    rc, out = _run_argv(argv, spec["run_timeout_sec"])
+    if rc != 0:
+        raise Refused(f"the deployment refused the change (rc={rc}): "
+                      f"{out[:400]}")
+
+    #: Verify by READING BACK, not by trusting the exit code. The write path
+    #: reports success for an upsert even when nothing changed, and a change
+    #: that silently did not take is exactly the failure this whole feature
+    #: exists to make impossible.
+    rc, after = _run_argv(
+        _fmt_argv(spec["read_argv"], container=policy.container,
+                  instance_id=instance_id),
+        spec["run_timeout_sec"])
+    if rc != 0:
+        return merged, (f"written, direction unverified: re-read failed "
+                        f"(rc={rc}): {after[:200]}")
+    try:
+        doc = json.loads(after[after.index("{"):]) if "{" in after else {}
+        rows = doc.get("instances") if isinstance(doc, dict) else None
+        row = next((r for r in (rows or [])
+                    if isinstance(r, dict)
+                    and str(r.get("instance_id")) == instance_id), None)
+    except (ValueError, TypeError):
+        return merged, "written, direction unverified: re-read unparseable"
+    if row is None:
+        return merged, "written, but the instance is gone on re-read"
+    for field, wanted in changes.items():
+        got = row.get(field)
+        if str(got) != str(wanted):
+            return merged, (f"WRITE DID NOT TAKE: {field} reads {got!r}, "
+                            f"expected {wanted!r}")
+    return merged, "verified by re-read"
+
+
 # ============================================================== receipts
 
 def _receipt_name(request_path: Path) -> str:
@@ -877,6 +1130,91 @@ def write_receipt(outbox: Path, request_path: Path, status: str,
     return dest
 
 
+def _handle_action(path: Path, outbox: Path, root: Path, *,
+                   req: Dict[str, Any], action: Dict[str, Any],
+                   policy: "Policy", dry_run: bool, rid: str,
+                   status_path: Optional[Path]) -> Dict[str, Any]:
+    """Gate, then apply, one typed action. Always returns a receipt dict.
+
+    Same shape as a file deploy -- permanent gates first (quarantined on refusal,
+    because they will fail identically forever), then the readiness window
+    (defers, because the world changes) -- so an operator reads one receipt
+    format regardless of which kind of change was asked for.
+    """
+    try:
+        if int(req.get("schema_version") or 0) != SCHEMA_VERSION:
+            raise Refused(
+                f"schema_version must be {SCHEMA_VERSION}, got "
+                f"{req.get('schema_version')!r}")
+        purpose = req.get("purpose")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise Refused("'purpose' is required: receipts must say why")
+        gate_age(req, path, policy.max_age_sec)
+        kind, spec, current = gate_action(action, policy)
+    except Refused as exc:
+        receipt = write_receipt(outbox, path, "refused", str(exc),
+                                {"id": rid, "action": action, "dry_run": dry_run},
+                                dry_run=dry_run)
+        if not dry_run:
+            _quarantine_refused(path, outbox)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
+    try:
+        readiness = gate_readiness(root, policy, status_path=status_path)
+    except PendingWindow as exc:
+        receipt = write_receipt(outbox, path, "refused", str(exc),
+                                {"id": rid, "action": action,
+                                 "dry_run": dry_run, "pending_window": True},
+                                dry_run=dry_run)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+    except Refused as exc:
+        receipt = write_receipt(outbox, path, "refused", str(exc),
+                                {"id": rid, "action": action,
+                                 "dry_run": dry_run},
+                                dry_run=dry_run)
+        if not dry_run:
+            _quarantine_refused(path, outbox)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
+    changes = dict(action.get("set") or {})
+    before = {k: current.get(k) for k in changes}
+    plan = {
+        "id": rid,
+        "purpose": req.get("purpose"),
+        "readiness": readiness,
+        "action": {"kind": kind, "instance_id": action.get("instance_id"),
+                   "set": changes},
+        #: Before/after in the receipt, because a runtime-state change has no
+        #: diff to review afterwards: the file it touched is rewritten in place
+        #: and the previous value is gone.
+        "before": before,
+    }
+
+    if dry_run:
+        receipt = write_receipt(outbox, path, "dry_run",
+                                "all gates passed; nothing changed", plan,
+                                dry_run=True)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
+    try:
+        _merged, note = apply_action(
+            kind, spec, current, changes, policy,
+            str(action.get("instance_id")))
+    except Refused as exc:
+        receipt = write_receipt(outbox, path, "failed", str(exc),
+                                {**plan, "purpose": req.get("purpose")})
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
+    done_dir = outbox / "applied"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(done_dir / path.name))
+    _move_staged_siblings(path, outbox, done_dir)
+    receipt = write_receipt(outbox, path, "applied",
+                            "all gates passed and the change was applied",
+                            {**plan, "after": changes, "verification": note})
+    return json.loads(receipt.read_text(encoding="utf-8"))
+
+
 def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
                    policy: Optional[Policy] = None,
                    allow_restart: bool = False,
@@ -895,6 +1233,18 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         return json.loads(receipt.read_text(encoding="utf-8"))
 
     rid = str(req.get("id") or path.stem)
+
+    #: A TYPED ACTION is a different kind of request: it asks the host to run one
+    #: of the deployment's own commands, and carries no files at all. Branching
+    #: here (rather than inside gate_schema) keeps the file gates honest -- they
+    #: require a non-empty ``files`` list and must keep doing so, because
+    #: "a deploy that writes nothing" is not a deploy.
+    action = req.get("action")
+    if isinstance(action, dict):
+        return _handle_action(path, outbox, root, req=req, action=action,
+                              policy=policy, dry_run=dry_run, rid=rid,
+                              status_path=status_path)
+
     #: The permanent gates are separated from the readiness gate because their
     #: refusals mean different things about the FUTURE. A wrong checksum will be
     #: wrong on every pass; "the system is busy" will not be. Only the second
