@@ -24,12 +24,14 @@ Two ways that separation leaks, and they fail very differently:
   invisible until a second consumer reads this repo and finds it half-written
   about somebody else's deployment.
 
-The scan matches NAMES, not concepts, and says so rather than implying more:
-prose like "an open book is the normal state of a trading system" passes,
-because no consumer name appears in it. That prose rides on the published
-``gate_broker`` vocabulary, whose extent is pinned by
-``published_vocabulary_is_not_extended`` so it stays a known artifact instead
-of a growing one.
+The scan matches NAMES, not concepts, and says so rather than implying more.
+So there is a second line of defence for vocabulary that is not a product name
+but is still somebody else's language -- ``gate_broker``, a receipt filed under
+``"broker"`` -- which ``RetiredVocabularyTest`` asserts is gone from the public
+API and survives only as schema history. Contrastive prose is allowed and in
+fact wanted: "the same gate can front a trading system, a web app or a batch
+pipeline" states the property, and a scan that banned the word would ban the
+sentence that explains why the mechanism is generic.
 
 Ignored paths are out of scope by definition (``sessions/``, ``memories/session/``,
 ``.env``, the live ``providers.json``/``routes.json``): they cannot reach
@@ -50,6 +52,7 @@ from unittest import mock
 from typing import Dict, List, Tuple
 
 import deploy_applier
+import tools_deploy
 
 REPO = Path(__file__).resolve().parent
 
@@ -232,25 +235,38 @@ class GenericityTest(unittest.TestCase):
               "to DEPLOYMENT_NAMES so this guard protects it too.")
 
 
-class PublishedVocabularyTest(unittest.TestCase):
-    """The readiness gate's trading-flavoured names: acknowledged, and bounded.
+class RetiredVocabularyTest(unittest.TestCase):
+    """The readiness gate's names: retired, and readable for history.
 
-    ``deploy_applier.gate_broker`` / the receipt's ``"broker"`` key predate the
-    genericity scan and are PUBLISHED: a consumer's suite calls ``gate_broker``
-    and asserts on ``receipt["broker"]``. Renaming them is a coordinated
-    cross-repo change, not a cleanup to slip in beside one, so this file
-    instead keeps them from MULTIPLYING -- one gate name, one receipt key, and
-    no consumer's own artefact filenames anywhere in the mechanism.
+    ``deploy_applier.gate_broker`` and the receipt's ``"broker"`` key were
+    borrowed from one consumer's domain. They are GONE: the gate is
+    ``gate_readiness``, the receipt field is ``readiness``, and the verdict's
+    own timestamp is reported as ``stamp`` rather than under a field name the
+    applier used to guess at.
 
-    Behaviourally the gate is already fully policy-driven (status file, field,
-    label, safe states and stamp field all come from ``Policy``).
-    ``test_deploy_applier.ReadinessGateTest`` pins that end to end with
-    non-trading vocabulary; the two tests below re-prove it where a name scan
-    cannot reach -- in the gate's OWN source (a hardcoded field would sit
-    beside a policy read elsewhere in the same file) and against a
-    queue-shaped deployment whose vocabulary shares nothing with a trading
-    one.
+    Retiring a PUBLISHED name has one hazard that looks like success: receipts
+    are a persisted audit trail, so a host's outbox still holds verdicts filed
+    under the old key. The rename is only correct if those stay legible, which
+    is why ``READINESS_KEYS`` records the field's history (newest first) and
+    both readers accept either name. That is a fact about THIS repo's own
+    previous schema -- not knowledge about any consumer -- and it is pinned
+    here so it cannot quietly grow back into "we speak trading".
+
+    Behaviourally the gate was already fully policy-driven (status file, field,
+    label, safe states and stamp field all come from ``Policy``);
+    ``test_deploy_applier.ReadinessGateTest`` pins that end to end, and the two
+    tests below re-prove it where a name scan cannot reach -- in the gate's OWN
+    source (a hardcoded field would sit beside a policy read elsewhere in the
+    same file) and against a queue-shaped deployment whose vocabulary shares
+    nothing with a trading one.
     """
+
+    #: Words belonging to a consumer's domain. A PUBLIC NAME in the generic
+    #: mechanism containing one means this repo has started speaking somebody
+    #: else's language. Prose is scanned by GenericityTest for consumer product
+    #: names; the retired key survives only as DATA inside READINESS_KEYS, and
+    #: that is asserted explicitly rather than exempted by silence.
+    DOMAIN_WORDS = ("broker", "trading", "condor", "strangle", "ibkr", "book")
 
     def setUp(self):
         self.applier = (REPO / "deploy_applier.py").read_text(encoding="utf-8")
@@ -268,11 +284,47 @@ class PublishedVocabularyTest(unittest.TestCase):
             for key in ambient:
                 os.environ.pop(key, None)
 
-    def test_the_gate_name_and_receipt_key_exist_exactly_once_each(self):
-        self.assertEqual(self.applier.count("def gate_broker"), 1)
-        self.assertEqual(self.applier.count('"broker":'), 1,
-                         "a second trading-named receipt key would extend the "
-                         "published vocabulary instead of leaving it alone")
+    def _public_names(self, module) -> List[str]:
+        """Names another module could import -- the API surface, not its guts."""
+        return [name for name in dir(module) if not name.startswith("_")]
+
+    def test_the_retired_names_are_gone_from_the_public_api(self):
+        self.assertFalse(
+            hasattr(deploy_applier, "gate_broker"),
+            "the retired gate name is back: a consumer must not be able to "
+            "depend on a domain-flavoured symbol again")
+        self.assertTrue(hasattr(deploy_applier, "gate_readiness"))
+        offending = {module.__name__: sorted(
+                        n for n in self._public_names(module)
+                        if any(w in n.lower() for w in self.DOMAIN_WORDS))
+                     for module in (deploy_applier, tools_deploy)}
+        self.assertEqual(
+            {k: v for k, v in offending.items() if v}, {},
+            "a public name in the generic mechanism is written in a "
+            "consumer's vocabulary")
+
+    def test_the_retired_key_survives_only_as_schema_history(self):
+        """Both readers accept it, no writer emits it, and the list is one list.
+
+        ``tools_deploy`` cannot import ``deploy_applier`` -- the applier is the
+        host's side of the seam, invoked as a program -- so it carries its own
+        copy of the field history. Two copies of a compat list is exactly the
+        shape that drifts, so the pair is compared here rather than trusted.
+        """
+        self.assertEqual(deploy_applier.READINESS_KEYS[0], "readiness",
+                         "the tuple must stay newest-first or history outvotes "
+                         "the current schema on every receipt")
+        self.assertEqual(deploy_applier.READINESS_KEYS,
+                         tools_deploy.READINESS_KEYS,
+                         "the two readers disagree about what a receipt can "
+                         "say, so one of them silently drops verdicts")
+        self.assertEqual(self.applier.count("def gate_readiness"), 1,
+                         "two readiness gates means a second, unreviewed "
+                         "schema for the same verdict")
+        self.assertNotIn('"broker":', self.applier,
+                         "the writer must not emit the retired key: `plan` is "
+                         "spread into every receipt shape, so one leftover "
+                         "re-publishes it on all of them")
 
     def test_no_consumer_artefact_filename_is_known_to_the_mechanism(self):
         """The policy names these; the applier must never spell one."""
@@ -298,7 +350,7 @@ class PublishedVocabularyTest(unittest.TestCase):
         written as exactly that, and mutating the gate proved it: the assertion
         stayed green against a hardcoded field.)
         """
-        source = inspect.getsource(deploy_applier.gate_broker)
+        source = inspect.getsource(deploy_applier.gate_readiness)
         for attr in ("status_label", "status_field", "safe_states",
                      "max_status_age_sec"):
             self.assertIn(f"policy.{attr}", source,
@@ -330,14 +382,15 @@ class PublishedVocabularyTest(unittest.TestCase):
                 name="consumer-policy")
             status.write_text(json.dumps({"phase": "drained"}),
                               encoding="utf-8")
-            verdict = deploy_applier.gate_broker(root, policy,
-                                                status_path=status)
+            verdict = deploy_applier.gate_readiness(root, policy,
+                                                   status_path=status)
             self.assertEqual(verdict["gate"], "queue")
             self.assertEqual(verdict["state"], "drained")
             self.assertEqual(verdict["field"], "phase")
             status.write_text(json.dumps({"phase": "busy"}), encoding="utf-8")
             with self.assertRaises(deploy_applier.PendingWindow) as refused:
-                deploy_applier.gate_broker(root, policy, status_path=status)
+                deploy_applier.gate_readiness(root, policy,
+                                              status_path=status)
             message = str(refused.exception)
             self.assertIn("busy", message)
             self.assertIn("queue", message,

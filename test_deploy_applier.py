@@ -42,8 +42,10 @@ from deploy_applier import (  # noqa: E402
     handle_request,
     main,
     pending_requests,
+    readiness_of,
     run_once,
     sha256_bytes,
+    READINESS_KEYS,
 )
 
 #: A generic readiness vocabulary. Nothing here implies a broker or a book.
@@ -572,7 +574,8 @@ class ReadinessGateTest(ApplierTestBase):
                                "payload": "n"}], id="req-nogate")
         receipt = self.handle(path, policy=bare)
         self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
-        self.assertTrue(receipt["broker"].get("skipped"), receipt["broker"])
+        self.assertTrue(receipt["readiness"].get("skipped"),
+                        receipt["readiness"])
 
     def test_safe_states_are_configurable_per_request_handling(self):
         self.write_status(_status_doc(state="draining"))
@@ -672,11 +675,11 @@ class VerdictStampTest(ApplierTestBase):
         receipt = self.handle(path, policy=policy)
 
         self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
-        broker = receipt["broker"]
-        self.assertEqual(broker["stamp_field"], "checked_at")
-        self.assertIsNotNone(broker["verdict_age_sec"],
+        readiness = receipt["readiness"]
+        self.assertEqual(readiness["stamp_field"], "checked_at")
+        self.assertIsNotNone(readiness["verdict_age_sec"],
                              "the receipt must show the age it measured")
-        self.assertLess(broker["verdict_age_sec"], 60)
+        self.assertLess(readiness["verdict_age_sec"], 60)
 
     def test_mtime_semantics_are_unchanged_when_no_stamp_field_is_declared(self):
         """Back-compat: an undeclared stamp is not enforced, and says so."""
@@ -689,10 +692,18 @@ class VerdictStampTest(ApplierTestBase):
         receipt = self.handle(path, policy=policy)
 
         self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
-        self.assertIsNone(receipt["broker"]["stamp_field"])
-        self.assertIsNone(receipt["broker"]["verdict_age_sec"],
+        self.assertIsNone(receipt["readiness"]["stamp_field"])
+        self.assertIsNone(receipt["readiness"]["verdict_age_sec"],
                           "claiming an age it never measured would be a lie in "
                           "the receipt")
+        #: The status document above DOES carry a stamp, but the policy never
+        #: named a field to read, so reporting its value would mean the applier
+        #: guessed one consumer's field name and then looked like it had
+        #: dated the verdict. ``stamp_field: None`` beside ``stamp: None`` says
+        #: plainly that freshness was judged by mtime alone.
+        self.assertIsNone(receipt["readiness"]["stamp"],
+                          "a stamp the policy never asked for must not be "
+                          "reported as the verdict's date")
 
     def test_a_naive_stamp_is_read_as_utc_not_as_host_local(self):
         """Guessing local time could turn a stale verdict into a fresh one."""
@@ -707,6 +718,55 @@ class VerdictStampTest(ApplierTestBase):
 
         self.assertEqual(receipt["status"], "refused")
         self.assertIn("verdict is", receipt["reason"])
+
+
+class ReceiptSchemaTest(ApplierTestBase):
+    """The receipt is an audit trail, so its field names are a contract.
+
+    One name here used to be borrowed from a consumer's domain; renaming it was
+    only safe because historical receipts stay readable. Both halves are pinned,
+    because each fails in a way that looks like success: a writer still emitting
+    the old key keeps every consumer unchanged (silent non-migration), and a
+    reader that forgets the old key blanks an audit trail at the upgrade.
+    """
+
+    def test_a_new_receipt_uses_the_generic_key_only(self):
+        self.write_status(_status_doc())
+        path, _ = self.stage([{"target": "engine/schema.py",
+                               "payload": "s"}], id="req-schema")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertIn("readiness", receipt)
+        self.assertNotIn("broker", receipt,
+                         "a writer still emitting the retired key would leave "
+                         "consumers reading two schemas forever")
+        self.assertEqual(receipt["readiness"]["state"], "ready")
+
+    def test_legacy_receipts_are_still_readable(self):
+        """A host's outbox holds verdicts from every applier it has run."""
+        legacy = {"status": "refused", "reason": "state is 'busy'",
+                  "broker": {"gate": "queue", "state": "busy",
+                             "age_sec": 3.0}}
+        self.assertEqual(readiness_of(legacy), legacy["broker"])
+        current = {"status": "applied", "readiness": {"state": "drained"}}
+        self.assertEqual(readiness_of(current), {"state": "drained"})
+        #: And the three-valued discipline: no verdict is {}, never a guess that
+        #: reads as "fine", and one corrupt row cannot break a reader listing
+        #: many.
+        self.assertEqual(readiness_of({"status": "applied"}), {})
+        self.assertEqual(readiness_of(None), {})
+        self.assertEqual(readiness_of("not a receipt"), {})
+        self.assertEqual(readiness_of({"readiness": "not a dict"}), {})
+
+    def test_the_current_key_wins_when_both_are_present(self):
+        """A hand-edited or twice-written receipt must not resurrect the old
+        verdict: newest schema decides."""
+        both = {"readiness": {"state": "drained"},
+                "broker": {"state": "busy"}}
+        self.assertEqual(readiness_of(both), {"state": "drained"})
+        self.assertEqual(READINESS_KEYS[0], "readiness",
+                         "the tuple must stay newest-first or the retired name "
+                         "decides every receipt")
 
 
 class AgeGateTest(ApplierTestBase):
@@ -955,8 +1015,8 @@ class QuarantineTest(ApplierTestBase):
 
     The distinction is by TYPE, not by matching refusal text: a request whose
     payload, checksum, path or age is wrong is wrong forever, while the readiness
-    gate describes a world that changes -- an open book is the normal state of a
-    trading system most of the day, and a change proposed during it is deferred,
+    gate describes a world that changes -- a busy system is the normal state of
+    a live one most of the day, and a change proposed during it is deferred,
     not rejected. Getting that backwards in the safe direction would DROP a
     legitimate request with only a receipt to show for it.
     """
@@ -980,7 +1040,7 @@ class QuarantineTest(ApplierTestBase):
     def test_a_readiness_refusal_stays_pending_until_the_window_opens(self):
         """The asymmetric case: deferring is not rejecting.
 
-        Dropping this one would mean a change proposed while the book is open
+        Dropping this one would mean a change proposed while the system is busy
         silently disappears, and the agent that proposed it has no way to learn
         that it must be re-staged.
         """
@@ -1063,10 +1123,10 @@ class QuarantineTest(ApplierTestBase):
     def test_waiting_for_the_window_is_not_a_failure(self):
         """A deferred request must leave the unit GREEN.
 
-        The readiness window is closed because the book is open, which on a
-        trading system is the normal state most of the day -- and the request
+        The readiness window is closed because the system is busy, which on a
+        live one is the normal state most of the day -- and the request
         stays queued. Counting that as a failure kept the applier's unit red every
-        two minutes for as long as the book was open, which is the alarm fatigue
+        two minutes for as long as the system stayed busy, which is the alarm fatigue
         the quarantine work was meant to remove, reintroduced from the other side:
         the pass that refuses a REAL deploy then looks exactly like the noise.
 
@@ -1138,7 +1198,7 @@ class LockAndCliTest(ApplierTestBase):
         """rc 2 is for a refusal the request can never outgrow.
 
         A readiness window is deliberately NOT this case: it is closed because
-        the book is open, the request stays queued, and the unit must stay green
+        the system is busy, the request stays queued, and the unit must stay green
         or the alarm means nothing by the time a real refusal arrives. So the
         rc-2 path is exercised with a permanent refusal -- a target that escapes
         the deployment root -- which is refused, quarantined, and reported once.

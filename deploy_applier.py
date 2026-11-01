@@ -114,7 +114,9 @@ class Policy:
             str(s) for s in states if isinstance(s, str) and s.strip())
         self.max_status_age_sec = float(
             readiness.get("max_age_sec") or DEFAULT_MAX_STATUS_AGE_SEC)
-        #: The status document's OWN timestamp field, e.g. ``checked_at``.
+        #: The status document's OWN timestamp field -- whatever the writer
+        #: calls it (``checked_at``, ``updated_utc``, ``as_of``); the policy
+        #: names it, the applier never guesses one.
         #:
         #: Optional. When declared, freshness is judged by BOTH the file's
         #: mtime and this stamp and the STRICTER one decides. mtime alone is not
@@ -234,11 +236,11 @@ class Refused(DeployError):
 class PendingWindow(Refused):
     """A refusal about the WORLD, not about the request.
 
-    The book being open, or the status file being stale, changes on its own: the
-    same request may well be appliable in an hour, so it must stay pending. Every
-    other refusal is about the request itself -- its checksums, its paths, its
-    age -- and re-reading it a thousand times gives the same answer, so leaving it
-    in the outbox means re-refusing it on every pass FOREVER.
+    The system being busy, or the status file being stale, changes on its own:
+    the same request may well be appliable in an hour, so it must stay pending.
+    Every other refusal is about the request itself -- its checksums, its paths,
+    its age -- and re-reading it a thousand times gives the same answer, so
+    leaving it in the outbox means re-refusing it on every pass FOREVER.
 
     That was not hypothetical. Ten such requests sat in the live outbox for a
     day, which kept the applier's systemd unit permanently FAILED (exit 2 on
@@ -491,8 +493,8 @@ def gate_age(req: Dict[str, Any], path: Path, max_age: float) -> None:
             f"a stale intent")
 
 
-def gate_broker(root: Path, policy: Policy,
-                status_path: Optional[Path] = None) -> Dict[str, Any]:
+def gate_readiness(root: Path, policy: Policy,
+                   status_path: Optional[Path] = None) -> Dict[str, Any]:
     """The readiness gate: only deploy from a KNOWN, safe state.
 
     What "safe" means belongs to the deployment, so the state list, the status
@@ -543,20 +545,59 @@ def gate_broker(root: Path, policy: Policy,
     verdict_age = _verdict_age(data, policy.timestamp_field, label,
                                policy.max_status_age_sec)
     if state not in policy.safe_states:
-        #: PendingWindow, not Refused: an open book is the NORMAL state of a
-        #: trading system most of the day, and a change proposed during it is
-        #: deferred rather than rejected. This is the one refusal that a later
-        #: pass can legitimately overturn.
+        #: PendingWindow, not Refused: a busy system is the NORMAL state of a
+        #: live one most of the day, and a change proposed during it is deferred
+        #: rather than rejected. This is the one refusal that a later pass can
+        #: legitimately overturn.
         raise PendingWindow(
             f"{label} state is {state!r}; only {list(policy.safe_states)} may "
             f"be disturbed by a deploy")
+    #: ``stamp`` is the verdict's own timestamp AS THE POLICY'S FIELD supplied
+    #: it, and None when the policy names no such field. An earlier version
+    #: guessed a field name here when none was declared, which made the receipt
+    #: look like it had dated the verdict while silently reading whatever one
+    #: consumer happened to call it. ``stamp_field: None`` alongside ``stamp:
+    #: None`` is the honest shape: freshness was judged by mtime alone.
     return {"gate": label, "state": state, "age_sec": round(age, 1),
             "verdict_age_sec": (round(verdict_age, 1)
                                 if verdict_age is not None else None),
             "field": policy.status_field,
             "stamp_field": policy.timestamp_field or None,
-            "checked_at": data.get(policy.timestamp_field)
-            if policy.timestamp_field else data.get("checked_at")}
+            "stamp": (data.get(policy.timestamp_field)
+                      if policy.timestamp_field else None)}
+
+
+#: The field-name HISTORY of one receipt key, newest first.
+#:
+#: Receipts outlive the code that writes them: they are the audit trail, kept
+#: beside the request they describe, so a host's outbox holds verdicts from every
+#: applier version it has ever run. The readiness verdict used to be filed under
+#: a name borrowed from one consumer's domain (this repo is generic -- see
+#: test_genericity.py), and every receipt written before that rename still says
+#: so.
+#:
+#: A reader that knew only the current name would print "no verdict" for all of
+#: them, i.e. an audit trail that goes blank at the upgrade. That silence is the
+#: exact thing a receipt exists to prevent, so the old name stays readable here
+#: and ONLY here: a writer never emits it.
+READINESS_KEYS: Tuple[str, ...] = ("readiness", "broker")
+
+
+def readiness_of(doc: Any) -> Dict[str, Any]:
+    """The readiness verdict out of a receipt, whichever schema wrote it.
+
+    Returns ``{}`` when there is none, so a caller cannot mistake "not recorded"
+    for "recorded as fine" -- the same three-valued discipline as a skipped
+    gate. Non-dict input is treated as no verdict rather than raised on, so one
+    corrupt receipt in an outbox cannot break a reader listing many.
+    """
+    if not isinstance(doc, dict):
+        return {}
+    for key in READINESS_KEYS:
+        found = doc.get(key)
+        if isinstance(found, dict):
+            return found
+    return {}
 
 
 #: A status stamp this far ahead of the host clock means the writer's clock is
@@ -821,8 +862,8 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
     rid = str(req.get("id") or path.stem)
     #: The permanent gates are separated from the readiness gate because their
     #: refusals mean different things about the FUTURE. A wrong checksum will be
-    #: wrong on every pass; "the book is open" will not be. Only the second one
-    #: is worth keeping in the pending set -- see PendingWindow.
+    #: wrong on every pass; "the system is busy" will not be. Only the second
+    #: one is worth keeping in the pending set -- see PendingWindow.
     try:
         pairs = gate_schema(req, outbox)
         targets = gate_paths(pairs, root, policy)
@@ -838,7 +879,7 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         return json.loads(receipt.read_text(encoding="utf-8"))
 
     try:
-        broker = gate_broker(root, policy, status_path=status_path)
+        readiness = gate_readiness(root, policy, status_path=status_path)
     except PendingWindow as exc:
         #: Transient BY TYPE, not by matching the refusal text: a message rewrite
         #: would otherwise silently turn "wait for the window" into "drop the
@@ -862,7 +903,7 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
     plan = {
         "id": rid,
         "purpose": req.get("purpose"),
-        "broker": broker,
+        "readiness": readiness,
         "files": [{"target": str(t), "bytes": len(payload),
                    "sha256": sha256_bytes(payload)[:16]}
                   for t, (_n, payload) in zip(targets, pairs)],
@@ -1022,17 +1063,18 @@ def run_once(outbox: Path, root: Path, **kwargs: Any) -> int:
                 continue
             if receipt.get("pending_window"):
                 #: DEFERRED is not FAILED. The readiness window is closed (the
-                #: book is open, or the verdict is stale) and the request stays
-                #: queued for a later pass -- which is the normal state of a
-                #: trading system most of the day.
+                #: system is busy, or the verdict is stale) and the request
+                #: stays queued for a later pass -- which is the normal state of
+                #: a live system most of the day.
                 #:
                 #: Counting it as a failure made the applier's unit red every two
-                #: minutes for as long as the book was open. A unit that is always
-                #: red is an alarm nobody reads, and the pass that refuses a REAL
-                #: deploy then looks exactly like the noise -- which is the very
-                #: problem quarantining was meant to solve, reintroduced from the
-                #: other side. A permanent refusal still exits 2 exactly once,
-                #: because it is quarantined and never seen again.
+                #: minutes for as long as the system stayed busy. A unit that is
+                #: always red is an alarm nobody reads, and the pass that refuses
+                #: a REAL deploy then looks exactly like the noise -- which is
+                #: the very problem quarantining was meant to solve,
+                #: reintroduced from the other side. A permanent refusal still
+                #: exits 2 exactly once, because it is quarantined and never seen
+                #: again.
                 continue
             worst = max(worst, 2 if status in ("refused", "failed") else 0)
     return worst

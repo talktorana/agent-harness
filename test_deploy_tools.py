@@ -683,5 +683,49 @@ class PolicyForbidTest(DeployTestBase):
         self.assertFalse((self.root / "ops" / "deploy_policy.json").exists())
 
 
+class ReceiptCompatibilityTest(unittest.TestCase):
+    """The agent-facing summary must read a receipt of EITHER schema.
+
+    A receipt is a persisted audit trail written by whichever applier version
+    was installed at the time, and the readiness verdict used to be filed under
+    a domain-flavoured key. ``deploy_status`` is how an agent learns what the
+    host decided, so a summary that only knew the new name would report
+    "readiness gate absent" for every verdict written before the rename -- the
+    agent concluding the gate never ran, on a host where it did.
+    """
+
+    def test_both_schemas_report_the_same_thing(self):
+        retired = {"status": "refused", "reason": "state is 'busy'",
+                   "mode": "gated",
+                   "broker": {"gate": "queue", "state": "busy",
+                              "age_sec": 2.5}}
+        current = {"status": "refused", "reason": "state is 'busy'",
+                   "mode": "gated",
+                   "readiness": {"gate": "queue", "state": "busy",
+                                 "age_sec": 2.5}}
+        lines_old = tools_deploy._summarise_outcome(retired).splitlines()
+        lines_new = tools_deploy._summarise_outcome(current).splitlines()
+        self.assertEqual(lines_old, lines_new)
+        gate_line = [ln for ln in lines_new if ln.startswith("readiness gate")]
+        self.assertEqual(len(gate_line), 1, lines_new)
+        self.assertIn("queue", gate_line[0])
+        self.assertIn("'busy'", gate_line[0])
+
+    def test_a_receipt_with_no_verdict_says_nothing_about_one(self):
+        """Silence is correct; a fabricated line would claim a gate ran."""
+        self.assertNotIn(
+            "readiness gate",
+            tools_deploy._summarise_outcome({"status": "applied",
+                                            "reason": "ok"}))
+
+    def test_the_key_history_matches_the_schemas_owner(self):
+        """Two modules, one list: tools_deploy cannot import the applier, so
+        the duplicate is compared rather than trusted."""
+        import deploy_applier
+        self.assertEqual(tools_deploy.READINESS_KEYS,
+                         deploy_applier.READINESS_KEYS)
+        self.assertEqual(tools_deploy.READINESS_KEYS[0], "readiness")
+
+
 if __name__ == "__main__":
     unittest.main()

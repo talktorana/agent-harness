@@ -1,14 +1,14 @@
 """Deployment requests: how the agent proposes a change it cannot apply.
 
-An autonomous agent pointed at a live trading system must never apply its own
-edits directly. The split that makes that safe is proposal vs execution:
+An autonomous agent pointed at a live system must never apply its own edits
+directly. The split that makes that safe is proposal vs execution:
 
 * the agent COMPOSES a request -- a schema-versioned JSON document naming
   every target path, its intended bytes and their sha256, plus a purpose,
   optional compose services to restart and an optional verification command;
 * a HOST-side applier (``ops/deploy_applier.py`` in the deployment repo)
   decides whether it may be applied, re-verifying path containment,
-  checksums, request age, the broker-state gate and single-flight locking,
+  checksums, request age, the readiness gate and single-flight locking,
   and it backs up and can roll back.
 
 ``AGENT_DEPLOY_MODE`` only changes WHO invokes that applier, never whether one
@@ -441,9 +441,34 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
         "dry_run": dry_run,
         "applier_output": output[-1500:],
         "files": receipt.get("files") or [],
-        "broker": receipt.get("broker"),
+        #: Readiness verdict, accepting the key an OLDER applier filed it under:
+        #: a receipt is a persisted audit trail, so one written before a field
+        #: rename still has to be reportable. ``deploy_applier.READINESS_KEYS``
+        #: owns the same list; this module cannot import it (the applier is the
+        #: host's side of the seam, invoked as a program, not imported), so the
+        #: agreement is pinned by test instead of assumed -- see
+        #: test_deploy_tools.py.
+        "readiness": _readiness_of(receipt),
         "backups": receipt.get("backups") or [],
     }
+
+
+#: Field names a receipt may hold the readiness verdict under, newest first.
+#: Mirrors ``deploy_applier.READINESS_KEYS`` for the reason given at the call
+#: site; the two are compared by test, since nothing here can import the
+#: applier.
+READINESS_KEYS: Tuple[str, ...] = ("readiness", "broker")
+
+
+def _readiness_of(doc: Any) -> Optional[Dict[str, Any]]:
+    """The verdict from a receipt, whichever schema wrote it, or None."""
+    if not isinstance(doc, dict):
+        return None
+    for key in READINESS_KEYS:
+        found = doc.get(key)
+        if isinstance(found, dict):
+            return found
+    return None
 
 
 def pending_requests() -> List[Dict[str, Any]]:
@@ -519,14 +544,20 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
              f"reason: {outcome.get('reason') or '(none)'}"]
     if outcome.get("applier_rc") is not None:
         lines.append(f"applier exit code: {outcome['applier_rc']}")
-    broker = outcome.get("broker") or {}
-    if broker:
-        if broker.get("skipped"):
-            lines.append(f"readiness gate: SKIPPED ({broker.get('reason')})")
+    #: Accept EITHER schema, not just the one the outcome builder emits. This
+    #: function is the agent's only window into what the host decided, and a
+    #: receipt written before the readiness field was renamed is still a
+    #: receipt: reading only the new key printed nothing for those, which the
+    #: agent reads as "the readiness gate never ran" on a host where it did.
+    readiness = _readiness_of(outcome) or {}
+    if readiness:
+        if readiness.get("skipped"):
+            lines.append(
+                f"readiness gate: SKIPPED ({readiness.get('reason')})")
         else:
-            lines.append(f"readiness gate: {broker.get('gate')} state="
-                         f"{broker.get('state')!r} "
-                         f"age={broker.get('age_sec')}s")
+            lines.append(f"readiness gate: {readiness.get('gate')} state="
+                         f"{readiness.get('state')!r} "
+                         f"age={readiness.get('age_sec')}s")
     for row in outcome.get("files") or []:
         lines.append(f"  target {row.get('target')} "
                      f"({row.get('bytes')} bytes, sha256 {row.get('sha256')}...)")
