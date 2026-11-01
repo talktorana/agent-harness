@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
+import tools  # noqa: E402
 import tools_edit  # noqa: E402
 import tools_safety  # noqa: E402
 import tools_session  # noqa: E402
@@ -69,6 +71,103 @@ class SafetyTest(unittest.TestCase):
         with mock.patch.object(config, "ALLOW_DESTRUCTIVE_GIT", True):
             allowed, _ = tools_safety.git_guard("reset --hard")
         self.assertTrue(allowed)
+
+
+class OperatorPromptTest(unittest.TestCase):
+    """A prompt nobody can answer is a DEADLOCK, not a confirmation.
+
+    Live 2026-10-31: a web UI task hung for six minutes on an irreversible
+    ``run_command``. The worker thread was parked in ``input()``, the question
+    had been printed to the terminal running ``run.py --serve``, and the browser
+    polled a task that could never resolve -- the session log simply stopped
+    mid-run with nothing to explain it. That .env had already set
+    ``AGENT_CONFIRM_WRITES=0`` and ``AGENT_CONFIRM_PYTHON_MUTATIONS=0``, which
+    silence two of the three prompts; the irreversible-command gate is the
+    third, and it was reachable from a background thread.
+
+    The rule now is that prompting requires BOTH a terminal stdin AND the main
+    thread, so every background caller (web UI tasks, scheduler daemon) takes
+    the safe refusal path instead of blocking.
+    """
+
+    IRREVERSIBLE = "git reset --hard origin/main"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        # A real terminal, so the ONLY thing distinguishing the cases below is
+        # which thread is asking.
+        patcher = mock.patch.object(tools_safety, "sys_stdin_is_tty",
+                                    lambda: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        auto = mock.patch.object(config, "AUTO_APPROVE", False)
+        auto.start()
+        self.addCleanup(auto.stop)
+
+    def _on_worker_thread(self, fn):
+        box = {}
+
+        def wrap():
+            try:
+                box["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001
+                box["exc"] = exc
+
+        t = threading.Thread(target=wrap, daemon=True)
+        t.start()
+        t.join(30)
+        self.assertFalse(t.is_alive(),
+                         "worker thread blocked -- the deadlock is back")
+        self.assertNotIn("exc", box,
+                         f"input() was reached: {box.get('exc')!r}")
+        return box["value"]
+
+    def test_a_prompt_is_only_possible_on_the_main_thread(self):
+        self.assertTrue(tools_safety.operator_prompt_ok(),
+                        "tests run on the main thread with a tty stdin")
+        self.assertFalse(self._on_worker_thread(
+            tools_safety.operator_prompt_ok))
+
+    def test_worker_thread_refuses_instead_of_prompting(self):
+        allowed, why = self._on_worker_thread(
+            lambda: tools_safety.guard_command(self.IRREVERSIBLE, approve=True))
+        self.assertFalse(allowed)
+        self.assertIn("no approval path", why)
+
+    def test_main_thread_still_prompts_and_honours_the_answer(self):
+        for reply, expect_ok, expect_why in (
+                ("y", True, "approved interactively"),
+                ("n", False, "DECLINED")):
+            with mock.patch("builtins.input", return_value=reply + "\n"):
+                allowed, why = tools_safety.guard_command(
+                    self.IRREVERSIBLE, approve=True)
+            self.assertIs(allowed, expect_ok, reply)
+            self.assertIn(expect_why, why)
+
+    def test_write_file_refuses_off_the_main_thread(self):
+        target = self.root / "sub" / "out.txt"
+        with mock.patch.object(tools, "CONFIRM_WRITES", True), \
+                mock.patch.object(tools, "PROJECT_ROOT", self.root), \
+                mock.patch.object(tools, "operator_prompt_ok",
+                                  lambda: False):
+            out = self._on_worker_thread(
+                lambda: tools.write_file(str(target), "payload"))
+        self.assertIn("REFUSED", out)
+        self.assertIn("AGENT_CONFIRM_WRITES=0", out)
+        self.assertFalse(target.exists(), "a refused write must not land")
+
+    def test_run_python_refuses_off_the_main_thread(self):
+        marker = self.root / "side_effect.txt"
+        with mock.patch.object(tools, "CONFIRM_PYTHON_MUTATIONS", True), \
+                mock.patch.object(tools, "operator_prompt_ok",
+                                  lambda: False):
+            out = self._on_worker_thread(lambda: tools.run_python(
+                f"open(r'{marker}', 'w').write('x')"))
+        self.assertIn("REFUSED", out)
+        self.assertIn("AGENT_CONFIRM_PYTHON_MUTATIONS=0", out)
+        self.assertFalse(marker.exists(), "a refused block must not execute")
 
 
 class EditTest(unittest.TestCase):

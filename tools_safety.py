@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import threading
 from typing import Optional, Tuple
 
 import config
@@ -96,6 +98,34 @@ def classify_command(command: str) -> Tuple[str, str]:
     return "ok", ""
 
 
+def operator_prompt_ok() -> bool:
+    """True only when a prompt printed here can actually be ANSWERED.
+
+    ``input()`` is only a question where a human can see it and reply. There are
+    two independent ways that fails, and both turn a confirmation into a silent
+    DEADLOCK:
+
+    * **stdin is not a terminal** -- a run redirected to a log has nobody at the
+      other end.
+    * **we are not on the main thread.** The web UI runs every task in a worker
+      thread while the console thread owns the process stdin, so ``input()``
+      blocks forever: the question went to a terminal nobody is watching, the
+      browser polls a task that never resolves, and the session log simply stops
+      mid-run with nothing to say why.
+
+    The second case is what made a browser task hang for six minutes on an
+    irreversible ``run_command`` in a run that had already set
+    ``AGENT_CONFIRM_WRITES=0`` and ``AGENT_CONFIRM_PYTHON_MUTATIONS=0`` -- those
+    cover two of the three prompts, and this gate is the third.
+
+    Callers use it to take the SAFE path instead: refuse, say why, and hand the
+    model the exact command so a human can run it deliberately.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    return sys_stdin_is_tty()
+
+
 def guard_command(command: str, approve: bool = False,
                   interactive: Optional[bool] = None) -> Tuple[bool, str]:
     """May this command run? Returns (allowed, explanation).
@@ -119,7 +149,10 @@ def guard_command(command: str, approve: bool = False,
             f"approve=true and a one-line reason, or report the exact command "
             f"for a human to run manually.")
     if interactive is None:
-        interactive = not config.AUTO_APPROVE and sys_stdin_is_tty()
+        # Never prompt where no one could answer: see operator_prompt_ok(). A
+        # blocked worker thread is indistinguishable from a hung model to the
+        # operator waiting in a browser, so refuse instead.
+        interactive = not config.AUTO_APPROVE and operator_prompt_ok()
     if config.AUTO_APPROVE:
         return True, f"[auto-approved irreversible: {why}]"
     if interactive:
@@ -136,7 +169,6 @@ def guard_command(command: str, approve: bool = False,
 
 def sys_stdin_is_tty() -> bool:
     try:
-        import sys
         return bool(sys.stdin and sys.stdin.isatty())
     except Exception:  # noqa: BLE001
         return False

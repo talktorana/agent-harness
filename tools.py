@@ -30,7 +30,7 @@ from tools_git import (git_commit, git_diff, git_log, git_restore, git_show,
                        git_status)
 from tools_media import view_image
 from tools_repo_map import repo_map
-from tools_safety import guard_command
+from tools_safety import guard_command, operator_prompt_ok
 from tools_session import session_list, session_read, session_search
 import tools_todo  # module namespace: set_todo_session below
 from tools_todo import manage_todo_list, todo_show
@@ -225,6 +225,18 @@ def write_file(path: str, content: str) -> str:
     if refusal:
         return f"REFUSED: {refusal}"
     if CONFIRM_WRITES:
+        if not operator_prompt_ok():
+            # A prompt no one can answer is a deadlock, not a confirmation: in
+            # the web UI this ran on a worker thread while the browser sat at
+            # "running" forever. Refuse with the content reported instead.
+            return (
+                f"REFUSED: {p} needs operator confirmation before it is "
+                f"written, and no one can answer a prompt from this context "
+                f"(the task is off the main thread, or stdin is not a "
+                f"terminal). The file was NOT changed. Report the exact path "
+                f"and intended content so a human can apply it, or relaunch "
+                f"with AGENT_CONFIRM_WRITES=0 if unattended writes are "
+                f"acceptable.")
         preview = content if len(content) < 400 else content[:400] + "..."
         print(f"\n[write_file] {p}  ({len(content)} chars)")
         print("-" * 60)
@@ -312,6 +324,16 @@ def run_python(code: str, timeout_sec: int = None) -> str:
     if not (code or "").strip():
         return "EMPTY code block -- nothing to run."
     if CONFIRM_PYTHON_MUTATIONS and _looks_mutating(code):
+        if not operator_prompt_ok():
+            # Same deadlock as write_file: the prompt went to a terminal nobody
+            # was watching and the browser task never resolved.
+            return (
+                "REFUSED: this block looks like it CHANGES something and needs "
+                "operator confirmation, but no one can answer a prompt from "
+                "this context. Nothing was executed. Report the exact code so "
+                "a human can run it, or relaunch with "
+                "AGENT_CONFIRM_PYTHON_MUTATIONS=0 if unattended execution is "
+                "acceptable.")
         preview = code if len(code) < 700 else code[:700] + "\n..."
         print("\n[run_python] this block looks like it CHANGES something:")
         print("-" * 60)
