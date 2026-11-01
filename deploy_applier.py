@@ -231,10 +231,134 @@ class Refused(DeployError):
     """A gate refused the request BEFORE anything was written."""
 
 
+class PendingWindow(Refused):
+    """A refusal about the WORLD, not about the request.
+
+    The book being open, or the status file being stale, changes on its own: the
+    same request may well be appliable in an hour, so it must stay pending. Every
+    other refusal is about the request itself -- its checksums, its paths, its
+    age -- and re-reading it a thousand times gives the same answer, so leaving it
+    in the outbox means re-refusing it on every pass FOREVER.
+
+    That was not hypothetical. Ten such requests sat in the live outbox for a
+    day, which kept the applier's systemd unit permanently FAILED (exit 2 on
+    every pass) and its log full of the same ten lines every three minutes. A
+    unit that is always red is an alarm nobody reads, so the day a real deploy is
+    refused for a real reason it looks exactly like the noise. Quarantining what
+    cannot change makes red mean something again.
+    """
+
+
+def _quarantine_refused(path: Path, outbox: Path) -> Optional[Path]:
+    """Move a permanently-refused request out of the pending set.
+
+    The RECEIPT stays where ``write_receipt`` put it: it is the audit trail, and
+    the deployment's dashboard reads receipts from the outbox root to show what
+    the gate decided. Only the request and the payloads staged beside it move, so
+    nothing is deleted and moving a file back is how a request gets reconsidered.
+
+    Failures are swallowed by design. Quarantine is noise control: if it cannot
+    move the file, the request stays pending and is refused again next pass,
+    which is merely the inconvenience this function exists to remove. Aborting an
+    otherwise-complete pass over it would be worse.
+    """
+    try:
+        dest_dir = Path(outbox) / "refused"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        shutil.move(str(path), str(dest))
+        #: The staged payloads travel with their request. Left behind they are
+        #: files nothing will ever read again, accumulating in the directory the
+        #: gates scan on every pass.
+        receipt = _receipt_name(path)
+        base = (path.name[:-len(REQUEST_SUFFIX)]
+                if path.name.endswith(REQUEST_SUFFIX) else path.stem)
+        for sibling in sorted(Path(outbox).glob(f"{base}.*")):
+            if sibling.name == receipt or not sibling.is_file():
+                continue
+            shutil.move(str(sibling), str(dest_dir / sibling.name))
+        return dest
+    except OSError:
+        return None
+
+
 # =================================================================== gates
 
-def gate_schema(req: Dict[str, Any]) -> List[Tuple[str, Any]]:
-    """Validate shape. Returns the (target, payload) pairs to apply."""
+def _payload_name(raw: Any) -> str:
+    """The FILENAME of a staged payload, whatever path the requester recorded.
+
+    The sidecar stages a payload beside its request and records the path it sees
+    -- inside the container that is ``/project/stranglebot/data/deploy/outbox/
+    req-X.0.payload``, while the host applier reads the SAME directory as
+    ``/opt/stranglebot/data/deploy/outbox``. Two mount views of one directory,
+    deliberately (see the compose file: the outbox is the seam). Resolving the
+    recorded string as a path therefore looks for ``/project/...`` on a host
+    where no such path exists, and every request large enough to be staged as a
+    file was refused with "payload_path does not exist" -- live for a full day,
+    ten requests, zero appliable. The FILENAME is the only part that survives the
+    crossing, so that is the only part used.
+    """
+    text = str(raw or "").strip()
+    #: Both separators, because the two halves of the seam may not run the same
+    #: OS and a Windows-staged request must not smuggle its whole path into a
+    #: name (``Path("C:\\a\\b").name`` is ``b`` on Windows and the entire string
+    #: on POSIX).
+    return text.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _resolve_payload(raw: Any, outbox: Optional[Path], index: int) -> Path:
+    """Resolve a staged payload to a file INSIDE the outbox.
+
+    The name-only rule fixes the mount crossing above and closes a hole that was
+    open the whole time: a request could previously name ANY path the applier
+    process could read -- ``/etc/passwd``, a credential file, the host's ``.env``
+    -- and the applier would copy its bytes into the deployment. Targets are
+    contained to the deployment root by ``gate_paths``; the SOURCE was contained
+    to nothing at all. Readable-by-the-applier is a wide set: it runs as the
+    user that owns production.
+
+    Containment here is by CONSTRUCTION rather than by checking: the path is
+    built as ``outbox / name``, and a name with no separator in it cannot leave
+    the directory. There is no traversal to test for because there is no way to
+    express one.
+    """
+    name = _payload_name(raw)
+    if not name or name in (".", ".."):
+        raise Refused(
+            f"files[{index}] payload_path names no file: {str(raw)!r}")
+    outbox_dir = Path(outbox) if outbox is not None else Path(".")
+    try:
+        outbox_dir = outbox_dir.resolve()
+    except OSError:                                  # pragma: no cover
+        pass
+    payload = outbox_dir / name
+    if not payload.is_file():
+        raise Refused(
+            f"files[{index}] payload_path is not staged beside the request: "
+            f"{name} (looked in {payload})")
+    #: Defence in depth behind a construction that cannot escape: if resolve()
+    #: says the file is elsewhere (a symlink planted in the outbox), refuse
+    #: rather than follow it.
+    try:
+        real = payload.resolve()
+    except OSError:                                  # pragma: no cover
+        raise Refused(f"files[{index}] payload_path is unreadable: {name}")
+    if real != payload and not str(real).startswith(str(outbox_dir) + os.sep):
+        raise Refused(
+            f"files[{index}] payload_path {name} resolves outside the outbox "
+            f"({real}); refusing to read it")
+    return payload
+
+
+def gate_schema(req: Dict[str, Any],
+                outbox: Optional[Path] = None) -> List[Tuple[str, Any]]:
+    """Validate shape. Returns the (target, payload) pairs to apply.
+
+    ``outbox`` is where staged payloads are looked up by name; see
+    :func:`_resolve_payload`. It is optional so a direct caller can still use
+    this gate alone, in which case payloads are resolved relative to the
+    CURRENT directory -- never as the absolute path the request recorded.
+    """
     if int(req.get("schema_version") or 0) != SCHEMA_VERSION:
         raise Refused(
             f"schema_version must be {SCHEMA_VERSION}, got "
@@ -255,10 +379,7 @@ def gate_schema(req: Dict[str, Any]) -> List[Tuple[str, Any]]:
                 raise Refused(f"files[{i}].content must be a string")
             pairs.append((target, content.encode("utf-8")))
         elif entry.get("payload_path"):
-            payload = Path(str(entry["payload_path"]))
-            if not payload.is_file():
-                raise Refused(
-                    f"files[{i}] payload_path does not exist: {payload}")
+            payload = _resolve_payload(entry["payload_path"], outbox, i)
             pairs.append((target, payload.read_bytes()))
         else:
             raise Refused(
@@ -399,16 +520,16 @@ def gate_broker(root: Path, policy: Policy,
                           "gate cannot evaluate"}
     path = status_path or _resolve_status(root, policy.status_file)
     if not path.is_file():
-        raise Refused(
+        raise PendingWindow(
             f"no {label} status file at {path}; cannot prove the system is "
             f"safe to disturb")
     data, err = _read_json(path)
     if data is None:
-        raise Refused(f"{label} status unreadable: {err}")
+        raise PendingWindow(f"{label} status unreadable: {err}")
     state = str(data.get(policy.status_field) or "")
     age = time.time() - path.stat().st_mtime
     if age > policy.max_status_age_sec:
-        raise Refused(
+        raise PendingWindow(
             f"{label} status is {age / 60:.1f} min old (limit "
             f"{policy.max_status_age_sec / 60:.0f} min): the state is unknown, "
             f"so a deploy is refused")
@@ -421,7 +542,11 @@ def gate_broker(root: Path, policy: Policy,
     verdict_age = _verdict_age(data, policy.timestamp_field, label,
                                policy.max_status_age_sec)
     if state not in policy.safe_states:
-        raise Refused(
+        #: PendingWindow, not Refused: an open book is the NORMAL state of a
+        #: trading system most of the day, and a change proposed during it is
+        #: deferred rather than rejected. This is the one refusal that a later
+        #: pass can legitimately overturn.
+        raise PendingWindow(
             f"{label} state is {state!r}; only {list(policy.safe_states)} may "
             f"be disturbed by a deploy")
     return {"gate": label, "state": state, "age_sec": round(age, 1),
@@ -686,20 +811,51 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
     if req is None:
         receipt = write_receipt(outbox, path, "refused", err or "unreadable",
                                 dry_run=dry_run)
+        #: An unparseable request is a property of the FILE, so no later pass
+        #: will make it readable. Quarantine it rather than re-refusing forever.
+        if not dry_run:
+            _quarantine_refused(path, outbox)
         return json.loads(receipt.read_text(encoding="utf-8"))
 
     rid = str(req.get("id") or path.stem)
+    #: The permanent gates are separated from the readiness gate because their
+    #: refusals mean different things about the FUTURE. A wrong checksum will be
+    #: wrong on every pass; "the book is open" will not be. Only the second one
+    #: is worth keeping in the pending set -- see PendingWindow.
     try:
-        pairs = gate_schema(req)
+        pairs = gate_schema(req, outbox)
         targets = gate_paths(pairs, root, policy)
         gate_checksums(req, pairs)
         gate_age(req, path, policy.max_age_sec)
-        broker = gate_broker(root, policy, status_path=status_path)
     except Refused as exc:
         receipt = write_receipt(
             outbox, path, "refused", str(exc), {"id": rid,
                                                 "dry_run": dry_run},
             dry_run=dry_run)
+        if not dry_run:
+            _quarantine_refused(path, outbox)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
+    try:
+        broker = gate_broker(root, policy, status_path=status_path)
+    except PendingWindow as exc:
+        #: Transient BY TYPE, not by matching the refusal text: a message rewrite
+        #: would otherwise silently turn "wait for the window" into "drop the
+        #: request", which is the worst possible failure -- a legitimate change
+        #: vanishing with nothing but a receipt to show for it.
+        receipt = write_receipt(
+            outbox, path, "refused", str(exc), {"id": rid,
+                                                "dry_run": dry_run,
+                                                "pending_window": True},
+            dry_run=dry_run)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+    except Refused as exc:
+        receipt = write_receipt(
+            outbox, path, "refused", str(exc), {"id": rid,
+                                                "dry_run": dry_run},
+            dry_run=dry_run)
+        if not dry_run:
+            _quarantine_refused(path, outbox)
         return json.loads(receipt.read_text(encoding="utf-8"))
 
     plan = {

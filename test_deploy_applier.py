@@ -31,8 +31,10 @@ from deploy_applier import (  # noqa: E402
     REQUEST_SUFFIX,
     ApplierLock,
     DeployError,
+    PendingWindow,
     Policy,
     Refused,
+    _quarantine_refused,
     _receipt_name,
     check_outbox_writable,
     gate_paths,
@@ -40,6 +42,7 @@ from deploy_applier import (  # noqa: E402
     handle_request,
     main,
     pending_requests,
+    run_once,
     sha256_bytes,
 )
 
@@ -116,18 +119,31 @@ class ApplierTestBase(unittest.TestCase):
         os.utime(self.status, (mtime, mtime))
 
     def stage(self, files, **over):
-        """Write a request document and return its path."""
+        """Write a request document and return its path.
+
+        An entry may carry ``payload`` (contents are known here), or
+        ``payload_path`` (read to derive the checksum), or BOTH ``payload_path``
+        and ``sha256``/``as_recorded`` -- the last form exists because a real
+        request sometimes names a payload the TEST cannot read either: one staged
+        through another mount view, or a traversal string. Without it those
+        cases, which are the interesting ones, cannot be expressed.
+        """
         entries = []
         for entry in files:
             payload = entry.get("payload")
-            if payload is None:
+            if payload is None and "sha256" not in entry:
                 raw = Path(str(entry["payload_path"])).read_bytes()
+                digest = sha256_bytes(raw)
+            elif payload is None:
+                digest = entry["sha256"]
             else:
                 raw = (payload if isinstance(payload, bytes)
                        else payload.encode("utf-8"))
-            row = {"target": entry["target"], "sha256": sha256_bytes(raw)}
+                digest = sha256_bytes(raw)
+            row = {"target": entry["target"], "sha256": digest}
             if payload is None:
-                row["payload_path"] = str(entry["payload_path"])
+                row["payload_path"] = str(entry.get("as_recorded")
+                                          or entry["payload_path"])
             else:
                 row["content"] = (payload if isinstance(payload, str)
                                   else payload.decode("utf-8"))
@@ -194,7 +210,15 @@ class SchemaGateTest(ApplierTestBase):
         self.assertFalse((self.root / "engine" / "x.py").exists())
 
     def test_payload_is_read_from_payload_path_and_hashed(self):
-        payload = self.root / "staged.bin"
+        """A staged payload beside the request is applied and hashed.
+
+        Staged INSIDE the outbox, which is where the sidecar puts it and the only
+        place the applier will read from. The previous version of this test wrote
+        the payload to ``root/staged.bin`` and recorded that path, i.e. it pinned
+        the ability to hand the applier an arbitrary readable file on the host --
+        the hole the containment rule exists to close.
+        """
+        payload = self.outbox / "req-test.0.payload"
         payload.write_bytes(b"BINARY\x00PAYLOAD")
         path, _ = self.stage(
             [{"target": "engine/blob.bin", "payload_path": payload}])
@@ -202,6 +226,82 @@ class SchemaGateTest(ApplierTestBase):
         self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
         self.assertEqual((self.root / "engine" / "blob.bin").read_bytes(),
                          b"BINARY\x00PAYLOAD")
+
+    def test_a_payload_staged_outside_the_outbox_is_refused(self):
+        """The applier reads only what was staged beside the request.
+
+        Targets were always contained to the deployment root; the SOURCE was
+        contained to nothing, so a request could name any file the applier
+        process could read -- /etc/passwd, a credential, the host's .env -- and
+        the applier would copy its bytes into the deployment. Readable by the
+        applier is a wide set: it runs as the user that owns production.
+        """
+        outside = self.root / "host-secret.bin"
+        outside.write_bytes(b"NOT FOR DEPLOYMENT")
+        path, _ = self.stage(
+            [{"target": "engine/blob.bin", "payload_path": outside,
+              "sha256": sha256_bytes(b"NOT FOR DEPLOYMENT")}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertIn("not staged beside the request", receipt["reason"])
+        self.assertFalse((self.root / "engine" / "blob.bin").exists(),
+                         "the applier read a file nobody staged for it")
+
+    def test_a_traversal_in_payload_path_names_no_file_and_leaks_nothing(self):
+        """``../../etc/passwd`` is reduced to a NAME and looked up inside.
+
+        Containment is by construction rather than by checking: the resolved path
+        is ``outbox / name``, and a name containing no separator cannot leave the
+        directory, so there is no traversal left to defend against.
+        """
+        path, _ = self.stage(
+            [{"target": "engine/blob.bin",
+              "payload_path": self.outbox / "absent.0.payload",
+              "as_recorded": "../../../../../../etc/passwd",
+              "sha256": sha256_bytes(b"irrelevant")}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertFalse((self.root / "engine" / "blob.bin").exists())
+
+    def test_a_payload_recorded_through_another_mount_view_still_applies(self):
+        """THE LIVE BUG: the two halves of the seam see different paths.
+
+        The sidecar stages through its own mount (``/project/stranglebot/data/
+        deploy/outbox``) and records that string; the host applier reads the SAME
+        directory as ``/opt/stranglebot/data/deploy/outbox``. Resolving the
+        recorded string literally looked for ``/project/...`` on a host where no
+        such path exists, so every request large enough to be staged as a file was
+        refused -- ten of them over a day, zero appliable, and the applier's unit
+        permanently FAILED as a result.
+
+        Only the FILENAME survives the crossing, so only the filename is used.
+        """
+        payload = self.outbox / "req-test.0.payload"
+        payload.write_bytes(b"CROSS-MOUNT")
+        foreign = f"/project/stranglebot/data/deploy/outbox/{payload.name}"
+        path, req = self.stage([{"target": "engine/blob.bin",
+                                 "payload_path": payload,
+                                 "as_recorded": foreign,
+                                 "sha256": sha256_bytes(b"CROSS-MOUNT")}])
+        self.assertEqual(req["files"][0]["payload_path"], foreign,
+                         "the test must record a path the host cannot see")
+        self.assertFalse(Path(foreign).exists())
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual((self.root / "engine" / "blob.bin").read_bytes(),
+                         b"CROSS-MOUNT")
+
+    def test_a_windows_pathed_payload_is_reduced_to_its_name(self):
+        """``PurePath.name`` is platform-dependent, so splitting is explicit."""
+        payload = self.outbox / "req-test.0.payload"
+        payload.write_bytes(b"WINDOWS-STAGED")
+        foreign = f"C:\\proj\\data\\deploy\\outbox\\{payload.name}"
+        path, _ = self.stage([{"target": "engine/blob.bin",
+                               "payload_path": payload,
+                               "as_recorded": foreign,
+                               "sha256": sha256_bytes(b"WINDOWS-STAGED")}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
 
 
 class PathGateTest(ApplierTestBase):
@@ -839,6 +939,125 @@ class ApplySemanticsTest(ApplierTestBase):
         receipt = self.handle(path)
         self.assertEqual(receipt["status"], "refused")
         self.assertIn("not readable JSON", receipt["reason"])
+
+
+class QuarantineTest(ApplierTestBase):
+    """A refusal that cannot change must leave the pending set.
+
+    The failure this prevents is not a wrong deploy -- it is an ALARM THAT STOPS
+    BEING READ. Every refusal exits 2 (a contract the callers rely on), so a
+    request that can never succeed keeps the applier's systemd unit permanently
+    FAILED and writes the same lines to its log every pass. Ten such requests sat
+    in a live outbox for a day. When the unit is always red, the pass that
+    refuses a REAL deploy for a REAL reason is indistinguishable from the noise,
+    and the gate's only output channel is spent.
+
+    The distinction is by TYPE, not by matching refusal text: a request whose
+    payload, checksum, path or age is wrong is wrong forever, while the readiness
+    gate describes a world that changes -- an open book is the normal state of a
+    trading system most of the day, and a change proposed during it is deferred,
+    not rejected. Getting that backwards in the safe direction would DROP a
+    legitimate request with only a receipt to show for it.
+    """
+
+    def _pending(self):
+        return sorted(p.name for p in pending_requests(self.outbox))
+
+    def test_a_permanent_refusal_leaves_the_pending_set(self):
+        path, _ = self.stage([{"target": "engine/a.py", "payload": "x"},
+                              {"target": "../escape.py", "payload": "y"}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertNotIn(path.name, self._pending(),
+                         "it would be refused again on every pass, forever")
+        #: The receipt stays where the audit trail and the dashboard expect it.
+        self.assertTrue((self.outbox / _receipt_name(path)).is_file())
+        self.assertTrue((self.outbox / "refused" / path.name).is_file(),
+                        "quarantined, not deleted: moving it back is how a "
+                        "request gets reconsidered")
+
+    def test_a_readiness_refusal_stays_pending_until_the_window_opens(self):
+        """The asymmetric case: deferring is not rejecting.
+
+        Dropping this one would mean a change proposed while the book is open
+        silently disappears, and the agent that proposed it has no way to learn
+        that it must be re-staged.
+        """
+        self.write_status(_status_doc(state="busy"))
+        path, _ = self.stage([{"target": "engine/a.py", "payload": "x"}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertTrue(receipt.get("pending_window"),
+                        "the receipt must say WHY it is still pending")
+        self.assertIn(path.name, self._pending())
+        self.assertFalse((self.outbox / "refused" / path.name).exists(),
+                         "a window refusal must not be quarantined")
+        #: ...and once the world is ready, the SAME request applies.
+        self.write_status(_status_doc(state="ready"))
+        receipt = self.handle(path, policy=make_policy())
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+
+    def test_an_unreadable_request_is_quarantined_with_its_receipt(self):
+        path = self.outbox / f"broken{REQUEST_SUFFIX}"
+        path.write_text("{not json", encoding="utf-8")
+        self.handle(path)
+        self.assertNotIn(path.name, self._pending())
+        self.assertTrue((self.outbox / _receipt_name(path)).is_file())
+
+    def test_quarantine_takes_the_staged_payloads_with_it(self):
+        """Payloads left behind accumulate in the directory every pass scans.
+
+        The payload must share the request's id prefix, because that is how the
+        applier knows which staged files belong to which request -- and a
+        quarantine that left them behind would grow the scanned directory with
+        files no request will ever claim again.
+        """
+        rid = "req-q"
+        payload = self.outbox / f"{rid}.0.payload"
+        payload.write_bytes(b"STAGED")
+        path, _ = self.stage([{"target": "engine/a.py", "payload_path": payload,
+                               "sha256": sha256_bytes(b"WRONG-ON-PURPOSE")}],
+                             id=rid)
+        self.assertEqual(path.name, f"{rid}{REQUEST_SUFFIX}")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertIn("checksum", receipt["reason"])
+        self.assertTrue((self.outbox / "refused" / payload.name).is_file(),
+                        "the payload must travel with its request")
+        self.assertFalse(payload.exists())
+        self.assertTrue((self.outbox / _receipt_name(path)).is_file(),
+                        "the receipt stays at the outbox root, where the audit "
+                        "trail and the dashboard read it")
+
+    def test_a_dry_run_moves_nothing(self):
+        """A rehearsal that quarantines is not a rehearsal.
+
+        ``--dry-run`` exists to answer "what would happen" without consequences;
+        consuming the request would make the real run afterwards report "no
+        pending requests", which reads as nothing-was-proposed rather than
+        already-consumed. Note the STATUS is still ``refused`` -- a dry run must
+        report the gates it would fail, not invent a passing grade.
+        """
+        path, _ = self.stage([{"target": "../escape.py", "payload": "x"}])
+        receipt = self.handle(path, dry_run=True)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertTrue(receipt.get("dry_run"), "the receipt must say it was a "
+                                                "rehearsal")
+        self.assertTrue(path.exists())
+        self.assertFalse((self.outbox / "refused").exists())
+
+    def test_a_second_pass_over_a_quarantined_outbox_is_quiet(self):
+        """The whole point: run_once stops reporting the same refusal forever."""
+        path, _ = self.stage([{"target": "../escape.py", "payload": "x"}])
+        self.assertTrue(path.exists())
+        first = run_once(self.outbox, self.root, dry_run=False,
+                         policy=self.policy)
+        second = run_once(self.outbox, self.root, dry_run=False,
+                          policy=self.policy)
+        self.assertEqual(first, 2, "the refusing pass must still be loud")
+        self.assertEqual(second, 0,
+                         "the next pass has nothing pending, so it must be "
+                         "green rather than repeating yesterday's refusal")
 
 
 class LockAndCliTest(ApplierTestBase):
