@@ -645,6 +645,37 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _retire_rehearsal(request_path: Optional[str]) -> Optional[str]:
+    """Move a DRY-RUN request out of the pending set. Returns where it went.
+
+    A rehearsal must not become the change. ``apply_request(dry_run=True)``
+    evaluates every gate and leaves the request IN THE OUTBOX -- which is exactly
+    where the host applier looks, so on the next timer pass (three minutes here)
+    it would apply the very change the agent only meant to test. The receipt
+    would then read "applied" against a request the agent believed was inert.
+
+    That is the worst shape of failure this design has: the operator is told a
+    change was rehearsed, and it lands anyway. So the request is moved to
+    ``outbox/rehearsed/``, which no gate scans, keeping it for the audit trail.
+
+    Failures are swallowed: the rehearsal already produced its verdict, and
+    reporting a tidy-up error would obscure that.
+    """
+    if not request_path:
+        return None
+    try:
+        src = Path(str(request_path))
+        if not src.is_file():
+            return None
+        dest_dir = Path(outbox_dir()) / "rehearsed"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        os.replace(src, dest)
+        return str(dest)
+    except OSError:
+        return None
+
+
 def deploy_request(purpose: str,
                    files: Optional[List[Dict[str, Any]]] = None,
                    services: Optional[List[str]] = None,
@@ -703,11 +734,36 @@ def deploy_request(purpose: str,
                 "the HOST applier, which re-checks containment, checksums, "
                 "request age and the readiness gate, backs every target up "
                 "and can roll back. Read its verdict with deploy_status.")
+    #: A rehearsal must not outlive itself, whether or not the applier ran.
+    #: This deployment's sidecar cannot reach the host applier at all, so the
+    #: common case is that apply_request REFUSES -- and returning early on that
+    #: used to leave the staged request sitting in the outbox, where the host
+    #: timer would apply the very change the agent only meant to test. The
+    #: retirement is therefore in a finally, not on the success path.
+    outcome: Dict[str, Any] = {}
+    error = ""
     try:
         outcome = apply_request(request, dry_run=dry_run)
     except DeployError as exc:
-        return header + f"\n\nAPPLIER ERROR: {exc}"
-    return header + tail + "\n\n" + _summarise_outcome(outcome)
+        error = str(exc)
+    finally:
+        moved = _retire_rehearsal(
+            outcome.get("request_path") or request.get("_request_path")) \
+            if dry_run else None
+
+    if error:
+        return header + f"\n\nAPPLIER ERROR: {error}" + (
+            "\n\nREHEARSAL ONLY: the request was moved out of the pending set"
+            + (f" to {moved}" if moved else "")
+            + ", so the host will NOT apply it." if dry_run else "")
+    note = ""
+    if dry_run:
+        note = ("\n\nREHEARSAL ONLY: the request was moved out of the pending "
+                "set"
+                + (f" to {moved}" if moved else "")
+                + ", so the host will NOT apply it. Re-issue it without "
+                  "dry_run to actually make the change.")
+    return header + tail + "\n\n" + _summarise_outcome(outcome) + note
 
 
 def deploy_status() -> str:

@@ -222,6 +222,62 @@ class ComposeTest(DeployTestBase):
         self.assertEqual(doc["verify_command"], "true")
 
 
+    def test_a_rehearsal_through_the_tool_leaves_nothing_pending(self):
+        """The CALL SITE is what matters, not the helper.
+
+        An earlier version of this coverage called `_retire_rehearsal` directly
+        and passed with the call removed from `deploy_request` -- the same
+        "verified the helper, never the caller" shape this deployment has been
+        bitten by before. Worse, the caller returned early when the applier was
+        unavailable, which is the NORMAL case inside the sidecar, so the
+        rehearsal stayed pending exactly where it was most dangerous.
+
+        Here the applier is made to REFUSE (as it does in the sidecar) and the
+        request must STILL leave the pending set.
+        """
+        with mock.patch.object(tools_deploy, "apply_request",
+                               side_effect=tools_deploy.DeployError("no applier")):
+            text = tools_deploy.deploy_request(
+                purpose="rehearsal", dry_run=True,
+                action={"kind": "set_instance_field",
+                        "instance_id": "bei-spx",
+                        "set": {"risk_profile": "balanced"}})
+        self.assertIn("REHEARSAL ONLY", text)
+        self.assertEqual([r for r in tools_deploy.pending_requests()
+                          if r.get("pending")], [],
+                         "a rehearsal is still in the pending set, so the host "
+                         "timer would apply it for real")
+        self.assertEqual(len(list((self.outbox / "rehearsed").glob("*"))), 1,
+                         "the rehearsal was not kept for the audit trail")
+
+    def test_a_dry_run_cannot_be_applied_later_by_the_host(self):
+        """A rehearsal must not become the change.
+
+        ``apply_request(dry_run=True)`` writes a receipt and leaves the request
+        in the outbox -- which is exactly where the host applier looks, so on
+        the next timer pass (three minutes in this deployment) it would apply
+        the very change the agent only meant to test. The agent would report
+        "rehearsed, nothing changed" and the change would land anyway: the worst
+        shape of failure here, because the operator is told it is inert.
+        """
+        path = self.outbox / f"req-rehearse{tools_deploy.REQUEST_SUFFIX}"
+        path.write_text(json.dumps({
+            "schema_version": 1, "id": "req-rehearse",
+            "created_at": "2026-11-01T00:00:00+00:00",
+            "purpose": "rehearsal",
+            "action": {"kind": "set_instance_field",
+                       "instance_id": "bei-spx",
+                       "set": {"risk_profile": "balanced"}},
+        }), encoding="utf-8")
+        moved = tools_deploy._retire_rehearsal(str(path))
+        self.assertIsNotNone(moved, "the rehearsal stayed in the pending set")
+        self.assertFalse(path.exists(), "the request is still pending")
+        self.assertTrue((self.outbox / "rehearsed" / path.name).is_file(),
+                        "the rehearsal was deleted instead of kept for audit")
+        self.assertEqual(
+            [p.name for p in self.outbox.parent.glob(f"*outbox/*{tools_deploy.REQUEST_SUFFIX}")],
+            [], "a request the host would still apply")
+
 class GuardTest(DeployTestBase):
     def test_gated_mode_refuses_direct_edits_inside_the_root(self):
         self.mode("gated")
