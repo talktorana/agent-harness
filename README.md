@@ -38,17 +38,25 @@ between. `providers.json` (copy `providers.json.example`) names them:
 
 ```json
 {
-  "default": {"provider": "provider", "model": "provider-v4.1-flash"},
+  "default": {"provider": "openrouter", "model": "deepseek-v4.1-flash"},
   "providers": {
-    "provider": {
-      "base_url": "https://provider",
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
-      "models": {"provider-v4.1-flash": "provider"}
+      "models": {
+        "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash-1017",
+        "deepseek-v4-pro": "deepseek/deepseek-v4-pro-0813"
+      }
+    },
+    "gateway": {
+      "base_url": "https://gateway.example.com/v1",
+      "api_key_env": "GATEWAY_API_KEY",
+      "models": {"gateway-fast": "vendor-a/fast-model"}
     },
     "ollama-local": {
       "base_url": "http://localhost:11434/v1",
       "api_key": "ollama",
-      "models": {"provider3-coder": "qwen3-coder:latest"}
+      "models": {"llama3.1": "llama3.1:8b"}
     }
   }
 }
@@ -67,7 +75,7 @@ between. `providers.json` (copy `providers.json.example`) names them:
 
 ```bash
 python run.py --models                       # list the catalogue
-python run.py --provider provider --model provider-v4.1-flash "task..."
+python run.py --provider openrouter --model deepseek-v4.1-flash "task..."
 python run.py --serve                        # pick provider+model in the browser
 ```
 
@@ -82,15 +90,15 @@ A **route** is one `(provider, model)` pair. A task carries an ordered chain of
 them and `_complete` walks it:
 
 ```
-gateway/gateway-reasoning  ->  route 2  ->  route 3  ->  ...   (first success wins)
+openrouter/deepseek-v4.1-flash  ->  route 2  ->  route 3  ->  ...   (first success wins)
 ```
 
 **Where the chain comes from** (first non-empty wins after the primary):
 
-1. `AGENT_ROUTES` env — `"gateway/gateway-reasoning, otherprov/other-model"`. A bare
+1. `AGENT_ROUTES` env — `"openrouter/deepseek-v4.1-flash, gateway/fast"`. A bare
    model inherits the catalogue's default provider.
 2. `routes.json` beside the harness (copy `routes.json.example`) —
-   `{"routes": [{"provider": "gateway", "model": "gateway-reasoning"}, ...]}`.
+   `{"routes": [{"provider": "openrouter", "model": "deepseek-v4.1-flash"}, ...]}`.
 3. The legacy `FALLBACK_MODEL` knob, appended LAST so it never pre-empts the
    chain you just configured.
 
@@ -100,15 +108,17 @@ resolve **lazily, per turn**, so one half-configured entry degrades the chain
 instead of killing the task.
 
 ```bash
-export GATEWAY_API_KEY=...                          # the key, from your environment
+export OPENROUTER_API_KEY=...                           # the key, from your environment
 python run.py --models                                  # catalogue + chain
-python run.py --routes "gateway/alias-a, gateway/alias-b" "task..."
+python run.py --routes "openrouter/fast-alias, openrouter/big-alias" "task..."
 python run.py --routes-file routes.json "task..."
 ```
 
-With `providers.json.example` copied into place, the default chain is every
-alias of the `gateway` gateway in order, `gateway-reasoning` first — so a routing
-setup needs nothing beyond the key, and `--routes` is for one-off overrides.
+With `providers.json.example` copied into place, the example chain crosses
+providers — OpenRouter first, then the `gateway` template, then `ollama-local`
+as a last resort — because a gateway that is dark for one alias is usually dark
+for all of them. Point the chain at your own hosts and `--routes` is for one-off
+overrides.
 
 ## The three ideas
 

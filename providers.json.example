@@ -6,11 +6,15 @@
     "key material.",
     "Aliases on the left of 'models' are what you type and select in the UI;",
     "values on the right are the provider's real model ids on the wire.",
-    "Add any OpenAI-compatible endpoint the same way: base_url + models."
+    "Add any OpenAI-compatible endpoint the same way: base_url + models.",
+    "Nothing below names a real host or a real gateway: the `gateway` block is",
+    "a template to rename. Keep it that way -- this file is the one that gets",
+    "published, your providers.json is gitignored, so private endpoints and",
+    "aliases belong there and never here."
   ],
   "default": {
-    "provider": "gateway",
-    "model": "gateway-reasoning"
+    "provider": "openrouter",
+    "model": "deepseek-v4.1-flash"
   },
   "providers": {
     "openrouter": {
@@ -45,16 +49,14 @@
       }
     },
     "gateway": {
+      "_comment": "Shape for any third-party OpenAI-compatible host or aggregator: one base_url, one key, any number of aliased models. Rename it for the host you actually use and keep the aliases short -- they are what you type and what the UI shows, while the id on the right stays the host's real spelling.",
       "base_url": "https://gateway.example.com/v1",
       "api_key_env": "GATEWAY_API_KEY",
+      "api_key": "",
       "models": {
         "gateway-fast": "vendor-a/fast-model",
-        "gateway-mid": "vendor-a/mid-model",
-        "gateway-reasoning": "vendor-b/reasoning-model",
-        "gateway-alt": "vendor-c/alt-model",
-        "gateway-pro": "vendor-c/pro-model",
-        "gateway-large": "vendor-d/large-model",
-        "gateway-experimental": "vendor-e/experimental-model"
+        "gateway-smart": "vendor-a/large-model",
+        "gateway-reasoning": "vendor-b/reasoning-model"
       }
     }
   }
