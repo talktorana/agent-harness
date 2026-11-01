@@ -196,6 +196,53 @@ PYTHON_MAX_OUTPUT = int(os.environ.get("AGENT_PYTHON_MAX_OUTPUT", "6000"))
 SESSIONS_DIR = Path(os.environ.get(
     "AGENT_SESSIONS_DIR", str(Path(__file__).resolve().parent / "sessions")))
 
+# --- storage retention ----------------------------------------------------
+# A harness that runs on a schedule writes forever: two session files per run
+# and one transcript that is opened in append mode and never closed. On a
+# deployment this is not a theoretical problem -- the transcript reached 6.3 MB
+# in two days on a box whose entire system disk is 45 GB, and nothing in the
+# code would ever have removed a byte of it. The bounds live in storage.py;
+# these are the knobs.
+#
+# 0 or negative means "unlimited" for a budget, so an operator who wants no
+# retention can say so explicitly rather than by setting a huge number.
+
+
+def _non_negative_int(name: str, default: int) -> int:
+    """Read an integer setting, refusing a typo instead of ignoring it.
+
+    ``int("2O0")`` raises on its own; what this adds is the NAME in the error
+    and the explicit allowance of negatives -- a setting meant to bound disk
+    use must not silently become no bound at all because of one mistyped digit.
+    """
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer, got {raw!r}") from None
+
+
+#: How many runs' session pairs to keep (a pair is one .jsonl + one .md).
+SESSIONS_KEEP = _non_negative_int("AGENT_SESSIONS_KEEP", 50)
+#: Total byte budget across the sessions directory, applied after the count.
+SESSIONS_MAX_MB = _non_negative_int("AGENT_SESSIONS_MAX_MB", 200)
+#: Rotate the raw API transcript past this size, keeping N numbered backups.
+TRANSCRIPT_MAX_MB = _non_negative_int("AGENT_TRANSCRIPT_MAX_MB", 8)
+#: Floored at 1 inside storage.py: rotation must keep at least one generation.
+TRANSCRIPT_BACKUPS = _non_negative_int("AGENT_TRANSCRIPT_BACKUPS", 2)
+#: Memory is REPORTED against this budget, never trimmed. Notes are knowledge;
+#: a cleanup routine quietly dropping them would defeat the point of memory.
+MEMORY_SOFT_MAX_MB = _non_negative_int("AGENT_MEMORY_SOFT_MAX_MB", 20)
+
+#: Megabytes -> bytes, with 0 and negatives meaning "no bound".
+SESSIONS_MAX_BYTES = SESSIONS_MAX_MB << 20 if SESSIONS_MAX_MB > 0 else 0
+TRANSCRIPT_MAX_BYTES = TRANSCRIPT_MAX_MB << 20 if TRANSCRIPT_MAX_MB > 0 else 0
+MEMORY_SOFT_MAX_BYTES = (MEMORY_SOFT_MAX_MB << 20
+                         if MEMORY_SOFT_MAX_MB > 0 else 0)
+
 # --- copilot-parity layers --------------------------------------------------
 # Exact-string edits are the safe default; a whole-file write can silently
 # drop content the model never saw. replace_in_file refuses ambiguous matches.

@@ -15,6 +15,7 @@ eventually.
 import json
 import random
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,7 @@ from openai import OpenAI
 
 import config
 import llm
+import storage
 import tools_media
 from memory import MemoryStore
 from prompts import build_system
@@ -207,6 +209,13 @@ class Agent:
         self.session: Optional[SessionLog] = None
         self._transcript = None
         if config.TRANSCRIPT:
+            #: Rotation happens BEFORE the handle is opened. Renaming a file an
+            #: open descriptor still points at keeps writing into the renamed
+            #: inode, so the rotation would look correct while the live file
+            #: grew on -- the whole point of rotating would be silently lost.
+            storage.rotate_transcript(
+                config.TRANSCRIPT, config.TRANSCRIPT_MAX_BYTES,
+                config.TRANSCRIPT_BACKUPS, on_warn=self._warn)
             self._transcript = open(config.TRANSCRIPT, "a", encoding="utf-8")
 
     def _close(self) -> None:
@@ -257,6 +266,57 @@ class Agent:
                 self.on_event(dict(record))
             except Exception:  # noqa: BLE001
                 pass
+
+    def _warn(self, message: str) -> None:
+        """One channel for "a thing degraded but the run continues".
+
+        Housekeeping calls this. It goes to the transcript AND the session log
+        rather than stderr only, because on a scheduled mission there is no
+        terminal: a retention failure that printed to a console nobody watches
+        would leave the operator with an unexplained disk problem later and no
+        record of when it started.
+        """
+        self._log({"event": "storage_warning", "detail": str(message)[:400]})
+        if self.session is not None:
+            try:
+                self.session.event("storage_warning",
+                                   detail=str(message)[:400])
+            except Exception:  # noqa: BLE001 -- never let logging kill a run
+                pass
+
+    def _bound_storage(self) -> None:
+        """Retention for everything this harness writes, once per run.
+
+        Deliberately run AFTER the session log exists: that makes the newest
+        pair (this run's) the one retention never deletes, and any warning is
+        recorded in the very log the operator will read.
+
+        Failures are reported, never raised -- a mission must not die because
+        tidying an old log failed.
+        """
+        try:
+            pruned = storage.prune_sessions(
+                config.SESSIONS_DIR, config.SESSIONS_KEEP,
+                config.SESSIONS_MAX_BYTES, on_warn=self._warn)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"session retention failed: {exc}")
+            pruned = {}
+
+        root = (Path(config.MEMORY_ROOT).parent
+                if config.MEMORY_ROOT else config.SESSIONS_DIR.parent)
+        try:
+            summary = storage.report(
+                root, config.MEMORY_SOFT_MAX_BYTES, on_warn=self._warn)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"storage report failed: {exc}")
+            summary = {"sizes": {}, "total_bytes": 0, "warnings": []}
+
+        self._log({"event": "storage",
+                   "summary": storage.one_line(summary),
+                   "sessions_removed": pruned.get("removed", 0),
+                   "sessions_kept": pruned.get("kept", 0),
+                   "bytes_freed": pruned.get("freed_bytes", 0),
+                   "warnings": list(summary.get("warnings") or [])})
 
     # --------------------------------------------------------------- tools
 
@@ -467,6 +527,7 @@ class Agent:
         self.session = SessionLog(task=task, model=self.resolved.label(),
                                   base_url=self.resolved.base_url)
         set_memory_session(self.session.session_id)
+        self._bound_storage()
 
         memory = MemoryStore(session_id=self.session.session_id)
         # The structural map is built once per task, not per step: it is the
