@@ -841,7 +841,12 @@ TOOLS = [
         "gate, backs every target up and can roll back -- the agent never "
         "applies its own edits to a live system. Use dry_run to rehearse all "
         "gates without touching anything. Runtime-state files, secrets and "
-        ".git are refused outright.",
+        ".git are refused outright.\n\n"
+        "To change RUNTIME STATE (a setting the running service owns, such as "
+        "an instance's risk profile), pass `action` instead of `files`. The "
+        "host runs its own sanctioned command for that change and verifies by "
+        "re-reading; do not try to edit the underlying file, which the policy "
+        "refuses and the service would overwrite anyway.",
         {
             "purpose": {"type": "string",
                         "description": "Why this change is needed. Recorded in "
@@ -866,11 +871,33 @@ TOOLS = [
                                "description": "Shell command the host runs "
                                               "after writing. A non-zero exit "
                                               "restores the backups."},
+            "action": {"type": "object",
+                       "description": "Request a TYPED ACTION instead of a "
+                                      "file change: {kind, instance_id, set}. "
+                                      "Use this for runtime state the running "
+                                      "service owns. The deployment's policy "
+                                      "decides which kinds and which fields "
+                                      "are permitted, so an undeclared kind "
+                                      "is refused rather than attempted. "
+                                      "Supply action OR files, never both.",
+                       "properties": {
+                           "kind": {"type": "string",
+                                    "description": "Action kind, e.g. "
+                                                   "set_instance_field."},
+                           "instance_id": {"type": "string",
+                                           "description": "The EXISTING "
+                                                          "instance to change. "
+                                                          "An action never "
+                                                          "creates one."},
+                           "set": {"type": "object",
+                                   "description": "Field -> scalar value. "
+                                                  "Only fields the policy "
+                                                  "exposes are accepted."}}},
             "dry_run": {"type": "boolean",
                         "description": "Evaluate every gate and write a "
                                        "receipt, but change no file."},
         },
-        ["purpose", "files"],
+        ["purpose"],
     ),
     _fn(
         "deploy_status",

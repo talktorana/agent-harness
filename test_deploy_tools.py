@@ -451,15 +451,62 @@ class RegistrationTest(unittest.TestCase):
         schema = self._schema("deploy_request")
         self.assertIsNotNone(schema, "deploy_request missing from TOOLS")
         params = schema["parameters"]
-        self.assertEqual(sorted(params["required"]), ["files", "purpose"])
+        #: ``files`` is no longer REQUIRED, because an ACTION request carries no
+        #: files. What must stay true is that a request cannot omit BOTH -- and
+        #: that is enforced where it can be tested (compose refuses an empty
+        #: request), rather than by a schema that makes one of the two shapes
+        #: impossible to express.
+        self.assertEqual(sorted(params["required"]), ["purpose"])
         props = params["properties"]
         for key in ("purpose", "files", "services", "verify_command",
-                    "dry_run"):
+                    "dry_run", "action"):
             self.assertIn(key, props)
         self.assertEqual(props["files"]["type"], "array")
         self.assertEqual(
             sorted((props["files"]["items"]["properties"]).keys()),
             ["content", "source", "target"])
+        #: The action shape is what lets the agent change runtime state, so its
+        #: three parts must be declared or the model cannot form the call.
+        self.assertEqual(props["action"]["type"], "object")
+        self.assertEqual(sorted((props["action"]["properties"]).keys()),
+                         ["instance_id", "kind", "set"])
+
+    def test_a_request_cannot_be_both_a_deploy_and_an_action(self):
+        """Two kinds of change in one receipt cannot be reviewed as one unit."""
+        with self.assertRaises(tools_deploy.DeployError) as ctx:
+            tools_deploy.compose_deploy_request(
+                purpose="p",
+                files=[{"target": "engine/x.py", "content": "x"}],
+                action={"kind": "set_instance_field",
+                        "instance_id": "bei-spx",
+                        "set": {"risk_profile": "balanced"}})
+        self.assertIn("not both", str(ctx.exception))
+
+    def test_an_action_request_needs_a_kind_instance_and_a_scalar_value(self):
+        for bogus in (
+                {"instance_id": "bei-spx", "set": {"risk_profile": "safe"}},
+                {"kind": "set_instance_field", "set": {"risk_profile": "safe"}},
+                {"kind": "set_instance_field", "instance_id": "bei-spx"},
+                {"kind": "set_instance_field", "instance_id": "bei-spx",
+                 "set": {}},
+                {"kind": "set_instance_field", "instance_id": "bei-spx",
+                 "set": {"risk_profile": {"nested": 1}}}):
+            with self.subTest(action=bogus):
+                with self.assertRaises(tools_deploy.DeployError):
+                    tools_deploy.compose_deploy_request(
+                        purpose="p", action=bogus)
+
+    def test_an_action_field_name_must_be_an_identifier(self):
+        """A field name is a name, not a path into something else."""
+        for bogus in ("risk/profile", "../risk_profile", "risk profile",
+                      "risk_profile;rm"):
+            with self.subTest(field=bogus):
+                with self.assertRaises(tools_deploy.DeployError):
+                    tools_deploy.compose_deploy_request(
+                        purpose="p",
+                        action={"kind": "set_instance_field",
+                                "instance_id": "bei-spx",
+                                "set": {bogus: "safe"}})
 
     def test_the_status_tool_takes_no_arguments(self):
         schema = self._schema("deploy_status")

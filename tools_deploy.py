@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,11 @@ import config
 SCHEMA_VERSION = 1
 REQUEST_SUFFIX = ".deploy.json"
 RECEIPT_SUFFIX = ".receipt.json"
+
+#: A field name an ACTION may set. Plain identifiers only: the name is compared
+#: against the deployment's allow-list, and a name carrying punctuation or a
+#: path separator is not a field -- it is an attempt to reach something else.
+_SCALAR_ACTION_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 def _parse_forbidden(specs) -> tuple:
     """Split the configured refuse list into names, prefixes and suffixes."""
@@ -246,35 +252,99 @@ def _check_target(target: str) -> None:
 
 
 def compose_deploy_request(purpose: str,
-                           files: List[Dict[str, Any]],
+                           files: Optional[List[Dict[str, Any]]] = None,
                            services: Optional[List[str]] = None,
                            verify_command: Optional[str] = None,
-                           request_id: Optional[str] = None
+                           request_id: Optional[str] = None,
+                           action: Optional[Dict[str, Any]] = None
                            ) -> Dict[str, Any]:
     """Stage one deploy request in the outbox. Returns the request document.
 
-    ``files`` entries are ``{"target": "engine/x.py", "content": "..."}`` or
-    ``{"target": ..., "source": "/abs/or/project/path"}`` when the payload
-    already exists on disk (staged into a sibling .payload file so the host
-    sees bytes, not a path only meaningful inside this container).
+    Two shapes, and exactly one per request:
+
+    * FILES -- ``{"target": "engine/x.py", "content": "..."}``, or
+      ``{"target": ..., "source": "/abs/or/project/path"}`` when the payload
+      already exists on disk (staged into a sibling .payload file so the host
+      sees bytes, not a path only meaningful inside this container);
+    * ACTION -- ``{"kind": ..., "instance_id": ..., "set": {...}}``, asking the
+      host to run one of its OWN sanctioned commands. That is the only way to
+      change runtime state, which lives in files the running service owns and
+      caches: writing them behind its back is overwritten on the next save.
+
+    The kinds, the settable fields and the commands are all decided by the
+    DEPLOYMENT's policy; this module only carries the request. An action kind
+    the deployment has not declared is refused there, and a request that names
+    both is refused here -- a change should be one reviewable thing.
     """
     if not purpose or not purpose.strip():
         raise DeployError("'purpose' is required: receipts must say why")
-    if not files:
-        raise DeployError("a deploy request must name at least one file")
-    if len(files) > config.DEPLOY_MAX_FILES:
+    if action is not None and files:
         raise DeployError(
-            f"too many files in one request ({len(files)} > "
-            f"{config.DEPLOY_MAX_FILES}); split the change so each request is "
-            f"reviewable")
+            "a request is either a file deploy or an action, not both: two "
+            "kinds of change in one receipt cannot be reviewed or rolled back "
+            "as one unit")
+    if action is None and not files:
+        raise DeployError("a deploy request must name at least one file, or "
+                          "carry an 'action'")
 
     outbox = outbox_dir()
     outbox.mkdir(parents=True, exist_ok=True)
     rid = request_id or f"req-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
 
+    request: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "id": rid,
+        "created_at": _now(),
+        "purpose": purpose.strip(),
+        "mode": config.DEPLOY_MODE,
+    }
+
+    if action is not None:
+        if not isinstance(action, dict):
+            raise DeployError("'action' must be an object")
+        kind = str(action.get("kind") or "").strip()
+        if not kind:
+            raise DeployError("action.kind is required")
+        instance_id = str(action.get("instance_id") or "").strip()
+        if not instance_id:
+            raise DeployError("action.instance_id is required")
+        changes = action.get("set")
+        if not isinstance(changes, dict) or not changes:
+            raise DeployError("action.set must be a non-empty object")
+        #: Refuse a nested value HERE as well as at the gate. The host would
+        #: reject it too, but a request that cannot be valid should fail while
+        #: the agent still has budget to correct itself rather than costing a
+        #: round trip through the outbox and a quarantine.
+        for field, value in changes.items():
+            if isinstance(value, (dict, list)):
+                raise DeployError(
+                    f"action.set[{field!r}] must be a scalar")
+            if not _SCALAR_ACTION_FIELD.match(str(field)):
+                raise DeployError(
+                    f"action.set field name {field!r} is not a plain "
+                    f"identifier")
+        request["action"] = {"kind": kind, "instance_id": instance_id,
+                             "set": {str(k): v for k, v in changes.items()}}
+        path = outbox / f"{rid}{REQUEST_SUFFIX}"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(request, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        request["_request_path"] = str(path)
+        request["_outbox"] = str(outbox)
+        return request
+
     entries: List[Dict[str, Any]] = []
     total = 0
-    for i, entry in enumerate(files):
+    #: RESTORED, and it was briefly lost by this very change: restructuring the
+    #: function for the action branch dropped this ceiling, and the suite caught
+    #: it. A request is reviewable only while it is small enough to read, so the
+    #: limit belongs next to the thing it limits.
+    if len(files or []) > config.DEPLOY_MAX_FILES:
+        raise DeployError(
+            f"too many files in one request ({len(files or [])} > "
+            f"{config.DEPLOY_MAX_FILES}); split the change so each request is "
+            f"reviewable")
+    for i, entry in enumerate(files or []):
         if not isinstance(entry, dict):
             raise DeployError(f"files[{i}] must be an object")
         target = str(entry.get("target") or "")
@@ -575,33 +645,57 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def deploy_request(purpose: str, files: List[Dict[str, Any]],
+def deploy_request(purpose: str,
+                   files: Optional[List[Dict[str, Any]]] = None,
                    services: Optional[List[str]] = None,
                    verify_command: Optional[str] = None,
-                   dry_run: bool = False) -> str:
+                   dry_run: bool = False,
+                   action: Optional[Dict[str, Any]] = None) -> str:
     """Propose a change to the deployment; never apply it directly.
 
-    ``files`` entries are {"target": "engine/x.py", "content": "..."} or
-    {"target": ..., "source": "path/to/existing/file"}. In the default
-    ``gated`` mode this STAGES the request in the outbox and returns
-    immediately: a host-side applier decides later whether to apply it, and
-    reports its verdict in a receipt. In ``direct`` mode the same applier is
-    invoked here, with identical gates.
+    Two kinds of change, one tool:
+
+    * FILES -- ``{"target": "engine/x.py", "content": "..."}`` or
+      ``{"target": ..., "source": "path/to/existing/file"}``;
+    * ACTION -- ``{"kind": ..., "instance_id": ..., "set": {...}}``: ask the
+      host to run one of its OWN commands to change runtime state. Use this
+      when the value lives in a file the running service owns and caches (an
+      instance's selected risk profile, for example). Writing such a file as a
+      deploy TARGET is refused by policy, and would be overwritten anyway.
+
+    In the default ``gated`` mode this STAGES the request in the outbox and
+    returns immediately: a host-side applier decides later whether to apply it
+    and reports its verdict in a receipt. In ``direct`` mode the same applier
+    is invoked here, with identical gates.
 
     ``dry_run`` rehearses the whole thing -- every gate evaluated, a receipt
-    written, no target file touched. Use it to prove a deployment before
-    anything live is at risk.
+    written, nothing changed. Use it to prove a change before anything live is
+    at risk; for an action it also reveals whether the deployment accepts the
+    value.
     """
     try:
         request = compose_deploy_request(
             purpose=purpose, files=files, services=services,
-            verify_command=verify_command)
+            verify_command=verify_command, action=action)
     except DeployError as exc:
         return f"DEPLOY REQUEST REFUSED while composing: {exc}"
     staged = f"STAGED {request['_request_path']}"
-    targets = ", ".join(str(f.get("target")) for f in request["files"])
-    header = (f"{staged}\n  purpose: {request['purpose']}\n"
-              f"  targets: {targets}\n  mode: {config.DEPLOY_MODE}")
+    if request.get("action"):
+        act = request["action"]
+        detail = ", ".join(f"{k}={v!r}" for k, v in act["set"].items())
+        header = (f"{staged}\n  purpose: {request['purpose']}\n"
+                  f"  action: {act['kind']} on {act['instance_id']}\n"
+                  f"  set: {detail}\n  mode: {config.DEPLOY_MODE}")
+        tail = ("\n\nThe host applier re-checks that the action kind is "
+                "permitted, the field is one the policy exposes, the instance "
+                "already exists and the deployment accepts the value -- then "
+                "verifies by re-reading. An action is NOT a file write: do not "
+                "also try to edit the file it comes from.")
+    else:
+        targets = ", ".join(str(f.get("target")) for f in request["files"])
+        header = (f"{staged}\n  purpose: {request['purpose']}\n"
+                  f"  targets: {targets}\n  mode: {config.DEPLOY_MODE}")
+        tail = ""
     if services:
         header += f"\n  services to restart: {', '.join(services)}"
     if is_gated() and not dry_run:
@@ -613,7 +707,7 @@ def deploy_request(purpose: str, files: List[Dict[str, Any]],
         outcome = apply_request(request, dry_run=dry_run)
     except DeployError as exc:
         return header + f"\n\nAPPLIER ERROR: {exc}"
-    return header + "\n\n" + _summarise_outcome(outcome)
+    return header + tail + "\n\n" + _summarise_outcome(outcome)
 
 
 def deploy_status() -> str:
