@@ -1019,6 +1019,20 @@ def run_once(outbox: Path, root: Path, **kwargs: Any) -> int:
                       f"({row['bytes']} bytes, sha256 {row['sha256']}...)")
             if status == "applied":
                 continue
+            if receipt.get("pending_window"):
+                #: DEFERRED is not FAILED. The readiness window is closed (the
+                #: book is open, or the verdict is stale) and the request stays
+                #: queued for a later pass -- which is the normal state of a
+                #: trading system most of the day.
+                #:
+                #: Counting it as a failure made the applier's unit red every two
+                #: minutes for as long as the book was open. A unit that is always
+                #: red is an alarm nobody reads, and the pass that refuses a REAL
+                #: deploy then looks exactly like the noise -- which is the very
+                #: problem quarantining was meant to solve, reintroduced from the
+                #: other side. A permanent refusal still exits 2 exactly once,
+                #: because it is quarantined and never seen again.
+                continue
             worst = max(worst, 2 if status in ("refused", "failed") else 0)
     return worst
 

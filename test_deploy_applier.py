@@ -1059,6 +1059,26 @@ class QuarantineTest(ApplierTestBase):
                          "the next pass has nothing pending, so it must be "
                          "green rather than repeating yesterday's refusal")
 
+    def test_waiting_for_the_window_is_not_a_failure(self):
+        """A deferred request must leave the unit GREEN.
+
+        The readiness window is closed because the book is open, which on a
+        trading system is the normal state most of the day -- and the request
+        stays queued. Counting that as a failure kept the applier's unit red every
+        two minutes for as long as the book was open, which is the alarm fatigue
+        the quarantine work was meant to remove, reintroduced from the other side:
+        the pass that refuses a REAL deploy then looks exactly like the noise.
+
+        The request must still be there afterwards -- green means "nothing to do
+        yet", never "discarded".
+        """
+        self.write_status(_status_doc(state="busy"))
+        path, _ = self.stage([{"target": "engine/a.py", "payload": "x"}])
+        rc = run_once(self.outbox, self.root, dry_run=False, policy=self.policy)
+        self.assertEqual(rc, 0, "a closed readiness window is not a failure")
+        self.assertIn(path.name, self._pending(),
+                      "the request must still be waiting, not consumed")
+
 
 class LockAndCliTest(ApplierTestBase):
     def test_a_held_lock_refuses_a_second_applier(self):
@@ -1114,14 +1134,35 @@ class LockAndCliTest(ApplierTestBase):
                          "a dry run must leave the request pending")
 
     def test_cli_reports_rc2_when_a_request_is_refused(self):
-        self.write_status(_status_doc(state="busy"))
-        self.stage([{"target": "engine/cli2.py", "payload": "x"}],
+        """rc 2 is for a refusal the request can never outgrow.
+
+        A readiness window is deliberately NOT this case: it is closed because
+        the book is open, the request stays queued, and the unit must stay green
+        or the alarm means nothing by the time a real refusal arrives. So the
+        rc-2 path is exercised with a permanent refusal -- a target that escapes
+        the deployment root -- which is refused, quarantined, and reported once.
+        """
+        self.write_status(_status_doc(state="ready"))
+        self.stage([{"target": "../cli-escape.py", "payload": "x"}],
                    id="cli-refused")
         rc = main(["--root", str(self.root), "--outbox", str(self.outbox),
                    "--policy", str(self.policy_path), "--once",
                    "--status-path", str(self.status)])
         self.assertEqual(rc, 2)
-        self.assertFalse((self.root / "engine" / "cli2.py").exists())
+        self.assertFalse((self.root.parent / "cli-escape.py").exists())
+
+    def test_cli_stays_green_while_waiting_for_the_window(self):
+        """The complement: a deferral must not look like a refusal."""
+        self.write_status(_status_doc(state="busy"))
+        self.stage([{"target": "engine/cli3.py", "payload": "x"}],
+                   id="cli-deferred")
+        rc = main(["--root", str(self.root), "--outbox", str(self.outbox),
+                   "--policy", str(self.policy_path), "--once",
+                   "--status-path", str(self.status)])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.root / "engine" / "cli3.py").exists())
+        self.assertEqual(len(pending_requests(self.outbox)), 1,
+                         "and it is still queued for the next pass")
 
     def test_cli_rc3_when_the_root_does_not_exist(self):
         self.assertEqual(
