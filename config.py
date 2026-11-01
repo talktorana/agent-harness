@@ -310,6 +310,19 @@ SCHEDULE_FILE = Path(os.environ.get(
 SCHEDULE_STATE_FILE = Path(os.environ.get(
     "AGENT_SCHEDULE_STATE_FILE",
     str(SESSIONS_DIR / "schedule_state.json")))
+#: A HOLD file: while it exists, no scheduled job runs.
+#:
+#: An operator needs a way to stop the mission loop that does not mean editing
+#: the declaration (read-only, and the applier refuses it -- an agent that can
+#: rewrite its own brief owns its own guardrails) and does not mean stopping the
+#: container (which also kills the console, so nobody can look at why they
+#: stopped it). A file is the smallest thing with those properties, and the
+#: deployment can place it somewhere the agent can READ but not WRITE -- inside
+#: the read-only root -- so a misled agent cannot clear its own pause.
+#:
+#: Empty means "no hold support", which is the right default for a plain
+#: checkout: nothing to point at, nothing to forget to delete.
+SCHEDULE_HOLD = os.environ.get("AGENT_SCHEDULE_HOLD", "").strip()
 
 # --- browser automation (optional: requirements-browser.txt) -----------------
 # Headless chromium via Playwright. The tools degrade to a clear

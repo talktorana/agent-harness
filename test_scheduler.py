@@ -59,14 +59,20 @@ class SchedulerPaths(unittest.TestCase):
         self.dir = Path(self._tmp.name)
         self.declaration = self.dir / "schedule.json"
         self.state = self.dir / "state" / "schedule_state.json"
-        self._saved = (config.SCHEDULE_FILE, config.SCHEDULE_STATE_FILE)
+        self.hold = self.dir / "scheduler.hold"
+        self._saved = (config.SCHEDULE_FILE, config.SCHEDULE_STATE_FILE,
+                       getattr(config, "SCHEDULE_HOLD", ""))
         config.SCHEDULE_FILE = self.declaration
         config.SCHEDULE_STATE_FILE = self.state
+        #: Pointed at a scratch path so a hold left behind by a real run cannot
+        #: make an unrelated test pass or fail for the wrong reason.
+        config.SCHEDULE_HOLD = str(self.hold)
         #: every mission a test "runs", recorded verbatim
         self.ran: list = []
 
     def tearDown(self) -> None:
-        config.SCHEDULE_FILE, config.SCHEDULE_STATE_FILE = self._saved
+        (config.SCHEDULE_FILE, config.SCHEDULE_STATE_FILE,
+         config.SCHEDULE_HOLD) = self._saved
         # Undo any read-only bit before TemporaryDirectory cleanup, which on
         # Windows refuses to delete a file marked read-only.
         for p in self.dir.rglob("*"):
@@ -415,6 +421,106 @@ class TestRepeatLogging(unittest.TestCase):
                 self.assertIn("AGENT_SCHEDULE_STATE_FILE", out)
             finally:
                 config.SCHEDULE_FILE, config.SCHEDULE_STATE_FILE = saved
+
+
+class TestOperatorHoldPausesTheLoop(SchedulerPaths):
+    """A hold file stops missions, and its PRESENCE is the whole signal.
+
+    The requirement behind this: an operator needs to stop the mission loop
+    without editing the declaration (read-only, and on the applier's refuse list
+    -- an agent that can rewrite its own brief owns its own guardrails) and
+    without stopping the container (which also kills the console, so nobody can
+    inspect what they paused). A file satisfies both, and placing it inside the
+    read-only root means the agent can read it but cannot clear its own pause.
+    """
+
+    def test_no_hold_configured_means_never_held(self):
+        """A plain checkout has nothing to point at, so nothing to forget."""
+        _write(self.declaration, [_job()])
+        config.SCHEDULE_HOLD = ""
+        self.assertFalse(scheduler.hold()["held"])
+        self.assertEqual(len(scheduler.due_jobs()), 1,
+                         "no hold must not change scheduling")
+
+    def test_a_hold_file_stops_every_job_without_touching_the_declaration(self):
+        _write(self.declaration, [_job(), _job("second", every_min=1)])
+        before = self.declaration.read_bytes()
+        self.hold.write_text("{}", encoding="utf-8")
+        self.stub_task()
+
+        self.assertEqual(scheduler.due_jobs(), [],
+                         "a paused loop must schedule nothing")
+        self.assertEqual(scheduler.run_due_jobs(), [])
+        self.assertEqual(self.ran, [], "a mission ran while paused")
+        self.assertEqual(self.declaration.read_bytes(), before,
+                         "pausing must be an OUTSIDE file, not an edit to the "
+                         "reviewed declaration")
+
+    def test_touch_pauses_and_rm_resumes(self):
+        """The two things an operator actually reaches for must just work.
+
+        An empty file pauses. That is not a convenience: a pause mechanism whose
+        documented path is "run this script with these three flags" is one
+        somebody will mis-type at 2am.
+        """
+        _write(self.declaration, [_job()])
+        self.hold.write_text("", encoding="utf-8")
+        self.assertTrue(scheduler.hold()["held"])
+        self.hold.unlink()
+        self.assertFalse(scheduler.hold()["held"])
+        self.assertEqual(len(scheduler.due_jobs()), 1)
+
+    def test_an_unreadable_hold_body_still_pauses(self):
+        """Presence is the intent; a bad body must not resume the agent.
+
+        Failing to PARSE cannot be the one thing that silently releases a
+        shell-capable agent. The failure direction is chosen: a hold nobody can
+        read keeps the loop stopped and says so, rather than starting missions
+        the operator believes are paused.
+        """
+        _write(self.declaration, [_job()])
+        self.hold.write_text("{this is not json", encoding="utf-8")
+        state = scheduler.hold()
+        self.assertTrue(state["held"])
+        self.assertIn("paused", state["reason"])
+        self.assertEqual(scheduler.due_jobs(), [])
+
+    def test_the_pause_records_who_and_when_for_later_explanation(self):
+        _write(self.declaration, [_job()])
+        self.hold.write_text(json.dumps(
+            {"by": "dashboard", "since": "2026-11-01T12:00:00+00:00",
+             "reason": "owner asked for a pause"}), encoding="utf-8")
+        state = scheduler.hold()
+        self.assertTrue(state["held"])
+        self.assertEqual(state["by"], "dashboard")
+        self.assertEqual(state["since"], "2026-11-01T12:00:00+00:00")
+        self.assertEqual(state["reason"], "owner asked for a pause")
+
+    def test_describe_reports_the_hold_so_paused_is_not_confused_with_broken(self):
+        """A paused loop and a broken loop both run nothing.
+
+        Telling them apart is the entire question an operator is asking, so the
+        state is reported explicitly rather than inferred from an empty job list.
+        """
+        _write(self.declaration, [_job()])
+        self.hold.write_text("{}", encoding="utf-8")
+        doc = scheduler.describe()
+        self.assertTrue(doc["hold"]["held"])
+        self.assertTrue(doc["hold"]["configured"])
+        self.assertTrue(doc["schedule_readable"],
+                        "the declaration is still readable when paused")
+        #: ...and the jobs themselves still show as enabled, because the
+        #: declaration was not edited. Only `_due` reflects the pause.
+        self.assertFalse(doc["jobs"][0]["_due"])
+
+    def test_removing_the_hold_lets_the_next_pass_run(self):
+        _write(self.declaration, [_job()])
+        self.hold.write_text("{}", encoding="utf-8")
+        self.stub_task()
+        self.assertEqual(scheduler.run_due_jobs(), [])
+        self.hold.unlink()
+        self.assertEqual(len(scheduler.run_due_jobs()), 1)
+        self.assertEqual(self.ran, ["run a pass"])
 
 
 if __name__ == "__main__":

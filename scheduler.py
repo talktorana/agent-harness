@@ -140,6 +140,39 @@ def _job_key(job: Dict[str, Any], index: int) -> str:
     return str(ident) if ident else f"#{index}"
 
 
+def hold() -> Dict[str, Any]:
+    """Whether an operator has PAUSED the mission loop, and why.
+
+    Presence of the file is the signal, not its contents. That makes the two
+    things an operator actually reaches for work without reading documentation:
+    ``touch`` pauses, ``rm`` resumes. The JSON body is only read for the "who and
+    when" that makes a pause explainable later; an unreadable body still pauses,
+    because presence already expressed the intent and failing to PARSE must not
+    be the one thing that silently resumes an agent that can run shell commands.
+
+    Deliberately not the declaration's ``enabled`` flag: the declaration is
+    reviewed configuration on a read-only mount, and in a gated deployment it is
+    on the applier's refuse list -- so the pause has to live somewhere an
+    operator (not the agent) can write, while the agent can still read it.
+    """
+    raw = getattr(config, "SCHEDULE_HOLD", "") or ""
+    out: Dict[str, Any] = {"configured": bool(raw), "held": False,
+                           "path": str(raw) if raw else None,
+                           "reason": "", "since": None, "by": None}
+    if not raw:
+        return out
+    path = Path(raw)
+    if not path.exists():
+        return out
+    out["held"] = True
+    body = _read_json(path) or {}
+    out["by"] = body.get("by")
+    out["since"] = body.get("since") or body.get("at")
+    out["reason"] = str(body.get("reason") or
+                        "scheduler paused by an operator hold file")
+    return out
+
+
 def _due(job: Dict[str, Any], now: datetime,
          state: Optional[Dict[str, Any]] = None, key: str = "") -> bool:
     """Whether a job should fire now, given its persisted last_run."""
@@ -166,7 +199,14 @@ def _due(job: Dict[str, Any], now: datetime,
 
 
 def due_jobs(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """The jobs due now, each annotated with its state key (``_key``)."""
+    """The jobs due now, each annotated with its state key (``_key``).
+
+    A hold returns nothing at all, before the declaration is even consulted: the
+    pause is meant to stop the loop, so it must not depend on which jobs happen
+    to be enabled today.
+    """
+    if hold()["held"]:
+        return []
     now = now or datetime.now()
     data, state = _load(), _load_state()
     due: List[Dict[str, Any]] = []
@@ -255,6 +295,7 @@ def state_writable() -> bool:
 def describe() -> Dict[str, Any]:
     """The declaration merged with its runtime state (for --list and the UI)."""
     data, state = _load(), _load_state()
+    paused = hold()
     jobs = []
     for index, job in enumerate(data.get("jobs", [])):
         if not isinstance(job, dict):
@@ -262,11 +303,21 @@ def describe() -> Dict[str, Any]:
         key = _job_key(job, index)
         jobs.append({**job, "_key": key,
                      "_state": state.get("jobs", {}).get(key, {}),
-                     "_due": _due(job, datetime.now(), state, key)})
+                     #: A held job is NOT due, whatever its cadence says. The
+                     #: declaration still reads `enabled: true` -- the pause is
+                     #: an outside file, not an edit -- so reporting `_due: true`
+                     #: here would describe a job that will not run, which is the
+                     #: exact confusion this hold exists to remove.
+                     "_due": (False if paused["held"]
+                              else _due(job, datetime.now(), state, key))})
     return {"schedule_file": str(config.SCHEDULE_FILE),
             "schedule_readable": _read_json(config.SCHEDULE_FILE) is not None,
             "state_file": str(_state_path()),
             "state_writable": state_writable(),
+            #: Reported, not inferred. A paused loop and a broken loop both run
+            #: no jobs, and telling them apart is the whole question an operator
+            #: is asking when they open this.
+            "hold": hold(),
             "jobs": jobs}
 
 
@@ -310,6 +361,15 @@ def daemon(poll_sec: float = 30.0) -> None:
     while True:
         message: Optional[str] = None
         try:
+            paused = hold()
+            if paused["held"]:
+                #: Said once per transition, not once per poll: a hold that
+                #: repeats every 30 seconds is 2,880 lines a day, which is how
+                #: the read-only-mount failure stayed invisible.
+                message = (f"[scheduler] PAUSED by hold file {paused['path']}"
+                           + (f" (by {paused['by']}, since {paused['since']})"
+                              if paused["by"] or paused["since"] else "")
+                           + "; no jobs will run until it is removed")
             for record in run_due_jobs():
                 state = "ok" if record.get("ok") else \
                     f"FAILED: {record.get('error')}"
