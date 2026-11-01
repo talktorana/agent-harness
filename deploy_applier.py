@@ -287,16 +287,17 @@ def _quarantine_refused(path: Path, outbox: Path) -> Optional[Path]:
 def _payload_name(raw: Any) -> str:
     """The FILENAME of a staged payload, whatever path the requester recorded.
 
-    The sidecar stages a payload beside its request and records the path it sees
-    -- inside the container that is ``/project/stranglebot/data/deploy/outbox/
-    req-X.0.payload``, while the host applier reads the SAME directory as
-    ``/opt/stranglebot/data/deploy/outbox``. Two mount views of one directory,
-    deliberately (see the compose file: the outbox is the seam). Resolving the
-    recorded string as a path therefore looks for ``/project/...`` on a host
-    where no such path exists, and every request large enough to be staged as a
-    file was refused with "payload_path does not exist" -- live for a full day,
-    ten requests, zero appliable. The FILENAME is the only part that survives the
-    crossing, so that is the only part used.
+    The sidecar stages a payload beside its request and records the path IT
+    sees -- inside a container that may be ``/project/app/data/deploy/outbox/
+    req-X.0.payload``, while the host applier reads the SAME directory at a
+    different path (``/srv/app/data/deploy/outbox`` in one consumer's compose
+    file). Two mount views of one directory, deliberately: the outbox is the
+    seam, and the seam is the reason the views differ. Resolving the recorded
+    string as a path therefore looks for the REQUESTER's view on a host that
+    does not have it, and every request large enough to be staged as a file
+    was refused with "payload_path does not exist" -- live for a full day in
+    one consumer deployment, ten requests, zero appliable. The FILENAME is the
+    only part that survives the crossing, so that is the only part used.
     """
     text = str(raw or "").strip()
     #: Both separators, because the two halves of the seam may not run the same

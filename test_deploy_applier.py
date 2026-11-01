@@ -266,19 +266,20 @@ class SchemaGateTest(ApplierTestBase):
     def test_a_payload_recorded_through_another_mount_view_still_applies(self):
         """THE LIVE BUG: the two halves of the seam see different paths.
 
-        The sidecar stages through its own mount (``/project/stranglebot/data/
-        deploy/outbox``) and records that string; the host applier reads the SAME
-        directory as ``/opt/stranglebot/data/deploy/outbox``. Resolving the
-        recorded string literally looked for ``/project/...`` on a host where no
-        such path exists, so every request large enough to be staged as a file was
-        refused -- ten of them over a day, zero appliable, and the applier's unit
-        permanently FAILED as a result.
+        The sidecar stages through its own mount (a container path such as
+        ``/project/app/data/deploy/outbox``) and records that string; the host
+        applier reads the SAME directory at whatever path the host uses
+        (``/srv/app/data/deploy/outbox`` in one consumer). Resolving the
+        recorded string literally looked for the requester's view on a host
+        where no such path exists, so every request large enough to be staged
+        as a file was refused -- ten of them over a day, zero appliable, and
+        the applier's unit permanently FAILED as a result.
 
         Only the FILENAME survives the crossing, so only the filename is used.
         """
         payload = self.outbox / "req-test.0.payload"
         payload.write_bytes(b"CROSS-MOUNT")
-        foreign = f"/project/stranglebot/data/deploy/outbox/{payload.name}"
+        foreign = f"/project/app/data/deploy/outbox/{payload.name}"
         path, req = self.stage([{"target": "engine/blob.bin",
                                  "payload_path": payload,
                                  "as_recorded": foreign,
