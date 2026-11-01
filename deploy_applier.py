@@ -251,6 +251,47 @@ class PendingWindow(Refused):
     """
 
 
+def _move_staged_siblings(path: Path, outbox: Path, dest_dir: Path) -> None:
+    """Move the payloads staged beside a DECIDED request into ``dest_dir``.
+
+    The request and its ``.N.payload`` siblings are one unit: once the host has
+    decided, no gate will read the payload again, so leaving it in the outbox
+    root keeps a file that looks indistinguishable from pending work.
+
+    That is not hypothetical. On 2026-11-01 an agent tasked with a ROUTINE
+    CONFIG CHANGE sized ``req-...0.payload`` (631008 B, a copy of
+    ``engine/collector.py`` from an APPLIED request) and concluded the deployed
+    collector was that file, then reported the live feature as "never deployed"
+    and warned the owner their working tree was dangerous. The deployed file was
+    620781 B. The payload had sat in the root for eight hours because the
+    REFUSED path moved siblings and the APPLIED path did not -- so "everything
+    in the root is pending" was true for refusals and false for successes.
+
+    The direction of that error matters: a false "the code you think is running
+    is not running" makes an operator distrust a deployment that is fine, and
+    the natural next move is to redeploy over something. Keeping the root
+    meaning exactly one thing -- undecided requests -- is worth more than the
+    convenience of finding a payload where it was staged.
+
+    Failures are swallowed: this is tidy-up, and a pass that already applied the
+    change must not report failure because a file could not be moved.
+    """
+    receipt = _receipt_name(path)
+    base = (path.name[:-len(REQUEST_SUFFIX)]
+            if path.name.endswith(REQUEST_SUFFIX) else path.stem)
+    try:
+        for sibling in sorted(Path(outbox).glob(f"{base}.*")):
+            if sibling.name == receipt or not sibling.is_file():
+                continue
+            #: A directory (e.g. a per-request backup dir sharing the prefix)
+            #: is NOT ours to move; only the staged payload files are.
+            if sibling.is_symlink() or not sibling.resolve().is_file():
+                continue
+            shutil.move(str(sibling), str(dest_dir / sibling.name))
+    except OSError:
+        pass
+
+
 def _quarantine_refused(path: Path, outbox: Path) -> Optional[Path]:
     """Move a permanently-refused request out of the pending set.
 
@@ -272,13 +313,7 @@ def _quarantine_refused(path: Path, outbox: Path) -> Optional[Path]:
         #: The staged payloads travel with their request. Left behind they are
         #: files nothing will ever read again, accumulating in the directory the
         #: gates scan on every pass.
-        receipt = _receipt_name(path)
-        base = (path.name[:-len(REQUEST_SUFFIX)]
-                if path.name.endswith(REQUEST_SUFFIX) else path.stem)
-        for sibling in sorted(Path(outbox).glob(f"{base}.*")):
-            if sibling.name == receipt or not sibling.is_file():
-                continue
-            shutil.move(str(sibling), str(dest_dir / sibling.name))
+        _move_staged_siblings(path, outbox, dest_dir)
         return dest
     except OSError:
         return None
@@ -978,6 +1013,12 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         done_dir = outbox / "applied"
         done_dir.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(done_dir / path.name))
+        #: ...and its staged payloads with it, for the reason spelled out in
+        #: _move_staged_siblings: the outbox root must mean "undecided", and it
+        #: stopped meaning that because ONLY the refusal path moved siblings.
+        #: An agent read a leftover payload as the deployed file and reported a
+        #: live feature as missing.
+        _move_staged_siblings(path, outbox, done_dir)
         return json.loads(receipt.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         try:

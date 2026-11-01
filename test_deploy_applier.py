@@ -946,6 +946,56 @@ class ApplySemanticsTest(ApplierTestBase):
         self.assertEqual(pending_requests(self.outbox), [])
         self.assertTrue((self.outbox / "applied" / path.name).exists())
 
+    def test_an_applied_requests_payloads_leave_the_outbox_root(self):
+        """The root must mean UNDECIDED, for refusals AND for successes.
+
+        Live 2026-11-01: the REFUSED path moved a request's ``.N.payload``
+        files aside, the APPLIED path did not, so eight payloads accumulated in
+        the root. An agent tasked with a config change found
+        ``req-...0.payload`` (631008 B, an applied copy of engine/collector.py),
+        sized it, and concluded the deployed collector was that file -- then
+        reported a live feature as never deployed and warned the owner that a
+        rebuild would regress production. The deployed file was 620781 B.
+
+        A false "the code you think is running is not running" is worse than
+        clutter: the natural response is to redeploy over something that works.
+
+        The payload MUST be staged as a real FILE (``payload_path``), not as
+        inline ``content``: an inline request creates no file, so a glob over
+        ``<base>.*`` then matches only the RECEIPT and the assertion passes
+        while the bug is present. That is exactly how the first version of this
+        test was vacuous -- the mutation removing the fix survived it.
+        """
+        payload = self.outbox / "req-test.0.payload"
+        payload.write_bytes(b"staged payload bytes")
+        path, _ = self.stage(
+            [{"target": "engine/p.py", "payload_path": payload}])
+        self.assertTrue(payload.exists(),
+                        "the fixture staged no payload file, so this test "
+                        "would prove nothing")
+        self.assertEqual(self.handle(path)["status"], "applied")
+
+        self.assertFalse(payload.exists(),
+                         "the payload is still in the outbox root, where it "
+                         "reads as pending work")
+        self.assertTrue((self.outbox / "applied" / payload.name).exists(),
+                        "the payload was deleted rather than moved: it is part "
+                        "of the audit trail")
+        self.assertEqual(pending_requests(self.outbox), [])
+
+    def test_the_receipt_stays_where_the_dashboard_reads_it(self):
+        """Only the request and its payloads move; the verdict does not.
+
+        The deployment's dashboard reads receipts from the outbox ROOT to show
+        what the gate last decided, so moving the receipt with the request would
+        blank that view.
+        """
+        path, _ = self.stage([{"target": "engine/r2.py", "payload": "x"}])
+        self.assertEqual(self.handle(path)["status"], "applied")
+        self.assertTrue((self.outbox / _receipt_name(path)).exists(),
+                        "the receipt left the root and the dashboard can no "
+                        "longer show the verdict")
+
     def test_backups_are_written_before_payloads(self):
         target = self.root / "engine" / "b.py"
         target.write_text("before", encoding="utf-8")
