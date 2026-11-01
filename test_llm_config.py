@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
 import llm  # noqa: E402
+import webui  # noqa: E402
 
 CATALOG = {
     "default": {"provider": "alpha", "model": "fast"},
@@ -100,6 +101,34 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(cat["providers"]["alpha"]["models"],
                          ["fast", "smart"])
         self.assertEqual(cat["default"], ["alpha", "fast"])
+
+    def test_catalog_exposes_alias_to_real_id_mapping(self):
+        """The UI can only show what this payload carries.
+
+        Selecting a model used to expose nothing but the alias, so an operator
+        could not confirm which real model a choice reached -- the wire id
+        appeared to be missing from the dropdown when it was merely aliased.
+        """
+        cat = llm.catalog()
+        self.assertEqual(cat["providers"]["alpha"]["model_ids"],
+                         {"fast": "alpha-fast-1", "smart": "alpha-smart-2"})
+        self.assertEqual(cat["providers"]["beta"]["model_ids"],
+                         {"only": "beta-only-9"})
+        # Every offered alias must be resolvable through the mapping, or the
+        # dropdown would render an option with no real id behind it.
+        for name, block in cat["providers"].items():
+            for alias in block["models"]:
+                self.assertIn(alias, block["model_ids"],
+                              f"{name}/{alias} has no real id")
+
+    def test_the_webui_renders_the_real_id_not_just_the_alias(self):
+        """Guard the JS too: a payload nobody displays fixes nothing."""
+        source = Path(webui.__file__).read_text(encoding="utf-8")
+        self.assertIn("model_ids", source,
+                      "webui never reads model_ids from the catalogue")
+        # Both the console and the live view build their own dropdown.
+        self.assertEqual(source.count("p.model_ids"), 2,
+                         "expected the mapping wired into BOTH dropdowns")
 
     def test_env_provider_always_present_and_accepts_raw_ids(self):
         cat = llm.catalog()

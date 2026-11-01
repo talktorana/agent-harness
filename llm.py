@@ -205,9 +205,17 @@ def catalog() -> Dict[str, Any]:
     out: Dict[str, Any] = {"providers": {}, "default": list(default_choice())}
     for name, pcfg in sorted(table.items()):
         models = pcfg.get("models") or {}
+        aliases = sorted(models.keys()) if isinstance(models, dict) else []
         out["providers"][name] = {
             "base_url": str(pcfg.get("base_url") or ""),
-            "models": sorted(models.keys()) if isinstance(models, dict) else [],
+            "models": aliases,
+            # alias -> the provider's real model id on the wire. Served because
+            # the UI otherwise shows ONLY the alias, so an operator had no way
+            # to confirm which model a selection actually reaches -- they
+            # looked for "alicn/deepseek-v4.1-flash-1017" in the dropdown,
+            # saw "inferhub-deepseek-v4.1-flash", and concluded it was missing.
+            # Model ids are not secret; keys still never leave the process.
+            "model_ids": {a: str(models[a]) for a in aliases},
             "key_configured": _has_key(pcfg),
         }
     # The fallback chain as labels: the UI shows "a → b → c" so the operator

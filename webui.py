@@ -75,9 +75,12 @@ const log=document.getElementById('log'),q=document.getElementById('q'),
 let cur=null,timer=null,CAT=null;
 function fillModels(){
   mod.innerHTML='';
-  const p=CAT&&CAT.providers[prov.value];
+  const p=CAT&&CAT.providers[prov.value], ids=(p&&p.model_ids)||{};
   ((p&&p.models)||[]).forEach(m=>{
-    const o=document.createElement('option');o.value=m;o.textContent=m;
+    const o=document.createElement('option');o.value=m;
+    // Show the real model id beside the alias: the alias alone hides which
+    // model is actually selected on the wire.
+    o.textContent=(ids[m]&&ids[m]!==m)?(m+' \u2192 '+ids[m]):m;
     mod.appendChild(o);});
   if(CAT&&CAT.default&&CAT.default[0]===prov.value&&CAT.default[1]){
     mod.value=CAT.default[1];}
@@ -188,9 +191,10 @@ const msgs=document.getElementById('msgs'),q=document.getElementById('q'),
 let cur=null,timer=null,CAT=null,lastText='',lastAnswer='',liveBub=null,liveTools=null;
 function fillModels(){
  mod.innerHTML='';
- const p=CAT&&CAT.providers[prov.value];
+ const p=CAT&&CAT.providers[prov.value], ids=(p&&p.model_ids)||{};
  ((p&&p.models)||[]).forEach(m=>{
-  const o=document.createElement('option');o.value=m;o.textContent=m;
+  const o=document.createElement('option');o.value=m;
+  o.textContent=(ids[m]&&ids[m]!==m)?(m+' \u2192 '+ids[m]):m;
   mod.appendChild(o);});
  if(CAT&&CAT.default&&CAT.default[0]===prov.value&&CAT.default[1])
   mod.value=CAT.default[1];
