@@ -121,6 +121,110 @@ class EnvOverrideTest(unittest.TestCase):
             self.assertEqual(res.base_url, config.BASE_URL)
 
 
+class DotenvProviderKeyTest(unittest.TestCase):
+    """.env loading of the key names providers.json declares.
+
+    Provider keys are NOT ``AGENT_``-prefixed, so a whitelist limited to that
+    prefix silently ignored them: the key sat in .env while the run died with
+    "environment variable TEST_ALPHA_KEY is not set" -- naming the very file
+    that already held it. The loader still whitelists rather than importing
+    everything, so unrelated credentials cannot reach generated code.
+    """
+
+    #: Names the tests may write into os.environ; each is removed first and
+    #: restored after, because "already exported" changes loader behaviour.
+    TOUCHED = ("TEST_ALPHA_KEY", "TEST_MISSING_KEY", "BROKER_SECRET",
+               "QUOTED", "AGENT_MODEL")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.catalog = self.root / "providers.json"
+        self.catalog.write_text(json.dumps(CATALOG), encoding="utf-8")
+        self.env_file = self.root / ".env"
+        self._clear_touched()
+
+    def _clear_touched(self):
+        """Empty these keys for the test, then restore the original state.
+
+        Cleanups run in reverse order of registration, so the wipe is
+        registered LAST and executes FIRST; the restore follows it. Without
+        the wipe the loader's own writes would leak into later test classes.
+        """
+        saved = {}
+        for key in self.TOUCHED:
+            if key in os.environ:
+                saved[key] = os.environ.pop(key)
+        self.addCleanup(os.environ.update, saved)
+        self.addCleanup(
+            lambda: [os.environ.pop(key, None) for key in self.TOUCHED])
+
+    def _catalogue_env(self):
+        return mock.patch.dict(os.environ,
+                               {"AGENT_PROVIDERS_FILE": str(self.catalog)})
+
+    def test_key_names_come_from_the_catalogue(self):
+        with self._catalogue_env():
+            self.assertEqual(config._provider_key_names(),
+                             {"TEST_ALPHA_KEY", "TEST_MISSING_KEY"})
+
+    def test_unreadable_catalogue_yields_no_names(self):
+        with mock.patch.dict(os.environ, {"AGENT_PROVIDERS_FILE":
+                                          str(self.root / "absent.json")}):
+            self.assertEqual(config._provider_key_names(), set())
+        self.catalog.write_text("{not json", encoding="utf-8")
+        with self._catalogue_env():
+            self.assertEqual(config._provider_key_names(), set())
+
+    def test_whitelisted_key_loads_unlisted_secret_does_not(self):
+        self.env_file.write_text(
+            "AGENT_MODEL=from-file\n"
+            "TEST_ALPHA_KEY=k-from-env-file\n"
+            "QUOTED='still works'\n"
+            "BROKER_SECRET=must-not-leak\n"
+            "# a comment\n"
+            "\n"
+            "NO_EQUALS_LINE\n",
+            encoding="utf-8")
+        with self._catalogue_env():
+            allowed = config._provider_key_names()
+            self.assertIn("TEST_ALPHA_KEY", allowed)
+            config._load_dotenv(self.env_file, allowed=allowed)
+            # Assertions live INSIDE the patch: patch.dict restores os.environ
+            # on exit, which would discard exactly the keys just loaded.
+            self.assertEqual(os.environ["TEST_ALPHA_KEY"], "k-from-env-file")
+            self.assertEqual(os.environ["AGENT_MODEL"], "from-file")
+            self.assertNotIn("BROKER_SECRET", os.environ)
+            self.assertNotIn("QUOTED", os.environ)
+            self.assertNotIn("NO_EQUALS_LINE", os.environ)
+            self.assertEqual(config.source_of("TEST_ALPHA_KEY"), ".env")
+
+    def test_loaded_key_reaches_resolve(self):
+        """The point of the whole exercise: llm.resolve() sees it."""
+        self.env_file.write_text("TEST_ALPHA_KEY=k-from-env-file\n",
+                                 encoding="utf-8")
+        with self._catalogue_env(), \
+                mock.patch.object(llm, "PROVIDERS_FILE", self.catalog):
+            config._load_dotenv(self.env_file,
+                                allowed=config._provider_key_names())
+            res = llm.resolve("alpha", "fast")
+        self.assertEqual(res.api_key, "k-from-env-file")
+        self.assertEqual(res.model_id, "alpha-fast-1")
+
+    def test_exported_key_wins_and_shadowing_is_reported(self):
+        self.env_file.write_text("TEST_ALPHA_KEY=from-file\n", encoding="utf-8")
+        os.environ["TEST_ALPHA_KEY"] = "from-shell"
+        self.addCleanup(os.environ.pop, "TEST_ALPHA_KEY", None)
+        with self._catalogue_env():
+            config._load_dotenv(self.env_file,
+                                allowed=config._provider_key_names())
+            # Inside the patch for the same reason: the exported value must be
+            # what survives the load, and the shadowing must be recorded.
+            self.assertEqual(os.environ["TEST_ALPHA_KEY"], "from-shell")
+            self.assertIn("shadows", config.source_of("TEST_ALPHA_KEY"))
+
+
 class RoutingTest(unittest.TestCase):
     """Ordered fallback chains across providers (llm.route_chain)."""
 

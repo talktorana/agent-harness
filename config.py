@@ -5,9 +5,10 @@ OpenAI, a local model, or any OpenAI-compatible proxy -- including a switch to
 a different provider without touching the harness.
 """
 
+import json
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable
 
 #: Where each AGENT_* setting actually came from. An exported variable
 #: silently beating the .env you just edited is exactly the kind of thing that
@@ -16,7 +17,7 @@ from typing import Dict
 SOURCES: Dict[str, str] = {}
 
 
-def _load_dotenv(*candidates) -> None:
+def _load_dotenv(*candidates, allowed: Iterable[str] = ()) -> None:
     """Read .env files into the environment WITHOUT overriding what is
     already exported.
 
@@ -28,13 +29,16 @@ def _load_dotenv(*candidates) -> None:
 
     Two rules learned the hard way:
 
-    * ONLY ``AGENT_*`` keys are read. A project's own .env routinely holds
-      broker credentials and tokens for other systems; importing those would
-      make them visible to generated code through ``os.environ`` for no
-      benefit to this harness at all.
+    * Keys are WHITELISTED, never imported wholesale: ``AGENT_*`` always, plus
+      any name the caller passes in ``allowed`` (see ``_provider_key_names``,
+      which whitelists the provider API keys ``providers.json`` asks for).
+      A project's own .env routinely holds broker credentials and tokens for
+      other systems; importing those would make them visible to generated
+      code through ``os.environ`` for no benefit to this harness at all.
     * Exported variables win, and the shadowing is reported. Silently losing
       to a stale export is what made a valid key in .env produce a 401.
     """
+    permitted = set(allowed)
     for raw in candidates:
         p = Path(raw)
         if not p.exists():
@@ -46,13 +50,48 @@ def _load_dotenv(*candidates) -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if not key.startswith("AGENT_"):
+            if not (key.startswith("AGENT_") or key in permitted):
                 continue
             if key in os.environ:
                 SOURCES[key] = f"environment (exported) -- shadows {p.name}"
                 continue
             os.environ[key] = value
             SOURCES[key] = p.name
+
+
+def _provider_key_names() -> set:
+    """Env-var names ``providers.json`` points at through ``api_key_env``.
+
+    They are NOT ``AGENT_``-prefixed (``OPENROUTER_API_KEY``, or whatever your
+    gateway calls it), so the whitelist above skipped them: a key written to
+    .env sat there unused while the run failed with "environment variable X is
+    not set" -- pointing at the very file that already held it, which is the
+    worst kind of error message.
+    Still a whitelist and not a wholesale import: only the names the catalogue
+    declares it needs become readable.
+
+    Parsed here rather than imported from ``llm``: llm imports config, and
+    configuration must be readable before any provider code loads.
+    """
+    path = Path(os.environ.get(
+        "AGENT_PROVIDERS_FILE",
+        str(Path(__file__).resolve().parent / "providers.json")))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    raw = data.get("providers")
+    names = set()
+    if isinstance(raw, dict):
+        for pcfg in raw.values():
+            if not isinstance(pcfg, dict):
+                continue
+            env_name = str(pcfg.get("api_key_env") or "").strip()
+            if env_name:
+                names.add(env_name)
+    return names
 
 
 for _exported in os.environ:
@@ -63,7 +102,17 @@ for _exported in os.environ:
 # project's own config (credentials and tokens for other systems) was pulled
 # agent's environment -- and a stale AGENT_* export in the shell could change
 # where the agent looked without a word about it.
-_load_dotenv(Path(__file__).resolve().parent / ".env")
+_ENV_FILE = Path(__file__).resolve().parent / ".env"
+_load_dotenv(_ENV_FILE)
+
+# Provider keys are a SECOND pass on purpose: the catalogue's own location can
+# come from AGENT_PROVIDERS_FILE in the .env the first pass just read, so the
+# whitelist cannot be built before that pass runs.
+_PROVIDER_KEY_ENVS = _provider_key_names()
+for _exported in os.environ:
+    if _exported in _PROVIDER_KEY_ENVS:
+        SOURCES[_exported] = "environment (exported)"
+_load_dotenv(_ENV_FILE, allowed=_PROVIDER_KEY_ENVS)
 
 
 def source_of(key: str) -> str:

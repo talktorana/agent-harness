@@ -122,8 +122,10 @@ def _key_for(pcfg: Dict[str, Any], name: str) -> str:
     if env_name:
         raise ProviderError(
             f"provider {name!r}: environment variable {env_name} is not set "
-            f"(and no usable inline api_key). Export it or edit "
-            f"{PROVIDERS_FILE.name}.")
+            f"(and no usable inline api_key). Put it in the .env beside the "
+            f"harness (persistent, gitignored), export it in THIS shell "
+            f"(an export in another terminal does not reach this process), "
+            f"or set api_key in {PROVIDERS_FILE.name}.")
     raise ProviderError(
         f"provider {name!r}: no api_key_env or api_key configured.")
 
