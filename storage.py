@@ -105,9 +105,15 @@ def prune_sessions(root: Path, keep: int, max_bytes: int,
 
     ``keep`` is a COUNT of runs (<= 0 = unlimited); ``max_bytes`` is a total
     budget across the directory (<= 0 = unlimited). Both are applied, count
-    first, because they answer different questions: the count bounds file
-    explosion on a box that runs a mission every half hour, the byte budget
-    bounds one pathological run that logged enormous tool output.
+    first.
+
+    KNOW WHICH ONE IS POLICY. Either can set the retention WINDOW, and the
+    smaller one wins silently. The count was 50 on a deployment whose scheduler
+    runs a mission every thirty minutes: 25 hours of history, re-learned as a
+    data-loss question ("is history not persisted?") with 8.1 MB used against a
+    200 MB allowance. The byte budget is meant to be the policy and the count a
+    backstop against file explosion; keep the count high enough that it never
+    decides, or the two knobs disagree without either being wrong.
 
     The newest pair is always left alone. It is the run that just finished, or
     the one in progress, and a retention rule that can delete the log of the

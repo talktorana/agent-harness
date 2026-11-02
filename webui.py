@@ -189,6 +189,63 @@ def _recent(path: Path, now: datetime, window_sec: float = 600.0) -> bool:
         return False
 
 
+def _stamp_of(path: Path) -> str:
+    """``2026-11-02T04-31-41_ab12cd34.jsonl`` -> ``2026-11-02T04:31:41``.
+
+    The filename uses dashes in the TIME too, so the whole stamp cannot simply
+    have dashes replaced: that yields ``2026:11:02T04:31:41``, which is not a
+    date anything can parse and was the first thing this helper got wrong.
+    """
+    stamp = path.stem.split("_", 1)[0]
+    date, _, clock = stamp.partition("T")
+    return f"{date}T{clock.replace('-', ':')}" if clock else stamp
+
+
+def retention_facts() -> Dict[str, Any]:
+    """What the retention bound actually is, and how far back it reaches.
+
+    Reported, not inferred, and for a reason that cost a real investigation:
+    the count bound was 50 on a deployment that runs a mission every thirty
+    minutes, so the visible window was about a day. Nothing on the page said so,
+    and "where did yesterday go?" is not a question anybody should have to
+    answer by reading `storage.prune_sessions`.
+    """
+    facts: Dict[str, Any] = {
+        "keep": getattr(config, "SESSIONS_KEEP", 0),
+        "max_bytes": getattr(config, "SESSIONS_MAX_BYTES", 0),
+        "max_bytes_mb": getattr(config, "SESSIONS_MAX_MB", 0),
+        "runs": 0, "oldest": None, "newest": None, "bytes": 0,
+        #: Which bound is actually deleting things. Two knobs can both be set
+        #: and only one decides; naming it is the difference between "we keep
+        #: 2000 runs" and "we keep a month".
+        "over_budget": False,
+    }
+    try:
+        #: Same enumeration the list uses, so the numbers quoted here cannot
+        #: disagree with the rows above them. Imported from storage would be a
+        #: second source of truth for "what counts as a run".
+        paths = _session_files(100000)
+    except Exception:  # noqa: BLE001 - a reporting helper must never 500 a page
+        return facts
+    facts["runs"] = len(paths)
+    if paths:
+        facts["oldest"] = _stamp_of(paths[-1])
+        facts["newest"] = _stamp_of(paths[0])
+        total = 0
+        for stem in (p.stem for p in paths):
+            for suffix in (".jsonl", ".md"):
+                try:
+                    total += (_sessions_dir() / f"{stem}{suffix}").stat().st_size
+                except OSError:
+                    pass
+        facts["bytes"] = total
+        keep = int(facts["keep"] or 0)
+        limit = int(facts["max_bytes"] or 0)
+        facts["over_budget"] = bool(
+            (keep and len(paths) >= keep) or (limit and total >= limit))
+    return facts
+
+
 def run_detail(session_id: str) -> Optional[Dict[str, Any]]:
     """The full prompt, every step, and the final answer of ONE run."""
     for path in _session_files(200):
@@ -255,6 +312,7 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 <div id="sched" class="m">loading schedule...</div>
 <div id="err"></div>
+<div id="keep" class="m"></div>
 <table><thead><tr>
  <th style="width:150px">started (UTC)</th><th style="width:90px">status</th>
  <th style="width:56px">steps</th><th style="width:70px">took</th>
@@ -344,6 +402,22 @@ async function loadRuns(){
     document.getElementById('err').innerHTML=
       '<div class="bad">could not read runs: '+esc(e)+'</div>';return;}
   const tb=document.getElementById('runs');
+  // Say HOW MUCH history exists and WHY it stops where it does. The page used
+  // to show a list and nothing else, so an operator who noticed that yesterday
+  // was missing had to read the retention code to find out whether the data was
+  // lost, never written, or deleted on purpose. Naming the oldest run and the
+  // bound turns that into one line they can act on.
+  const keep=document.getElementById('keep');
+  if(keep){
+    const held=j.held||{};
+    keep.textContent=(held.keep||held.max_bytes)
+      ? ('history: '+rows.length+' run(s)'+(held.oldest?' back to '
+          +String(held.oldest).replace('T',' ').slice(0,16)+' UTC':'')
+         +'\u2014older runs are deleted by retention (keep '+held.keep
+         +' runs, '+held.max_bytes_mb+' MB budget)'
+         +(held.over_budget?' \u2014 byte budget is the binding limit':''))
+      : '';
+  }
   if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="m">'
     +'no runs on disk yet</td></tr>';return;}
   tb.innerHTML=rows.map(function(r){
@@ -834,7 +908,8 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         pass
             payload = {"runs": run_summaries(limit),
-                       "sessions_dir": str(_sessions_dir())}
+                       "sessions_dir": str(_sessions_dir()),
+                       "held": retention_facts()}
             self._send(200, json.dumps(payload, default=str).encode(),
                        "application/json")
         elif route.startswith("/run/"):

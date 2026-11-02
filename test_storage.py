@@ -182,7 +182,129 @@ class SessionRetentionTest(unittest.TestCase):
         self.assertEqual(stems[-1], self.stems[0])
 
 
+class RetentionWindowTest(unittest.TestCase):
+    """The count bound must not silently define the RETENTION WINDOW.
+
+    Live 2026-11-02: the operator asked "is history not persisted?" after
+    /agent/runs showed nothing older than about a day. Nothing was broken --
+    they were reading the count bound. ``SESSIONS_KEEP`` was 50, the scheduler
+    runs a mission every thirty minutes, so 50 runs is ~25 hours, and every pass
+    deleted the run that aged out. The same directory held 8.1 MB against a
+    200 MB allowance, i.e. 96% of the budget unused while history was destroyed.
+
+    So these tests pin the RELATIONSHIP between the two knobs, not the numbers:
+    the byte budget is the policy and the count is a backstop high enough that it
+    cannot become the policy by accident.
+    """
+
+    def test_the_default_count_cannot_set_the_window_by_itself(self):
+        """At the live cadence, the DEFAULT count must outlast the byte budget.
+
+        Derived rather than asserted as a magic number: at the ~160 KB/run seen
+        on the deployment, the 200 MB budget holds ~1280 runs. If the count
+        default is below that, the count is deciding retention and a run that is
+        "within budget" is still being deleted.
+        """
+        live_bytes_per_run = 160 * 1024          # measured: 8.1 MB / 50 runs
+        runs_the_budget_holds = (config.SESSIONS_MAX_BYTES
+                                 // live_bytes_per_run)
+        self.assertGreaterEqual(
+            config.SESSIONS_KEEP, runs_the_budget_holds,
+            f"the count bound ({config.SESSIONS_KEEP}) is smaller than what the "
+            f"byte budget holds (~{runs_the_budget_holds} runs), so the count is "
+            f"silently the retention policy -- which is how a day-old history "
+            f"came to be deleted from a directory using 4% of its allowance")
+
+    def test_the_default_window_covers_more_than_a_week(self):
+        """A monitoring pass every 30 min is 48 runs/day; a week is 336."""
+        per_day = 48
+        self.assertGreaterEqual(config.SESSIONS_KEEP / per_day, 7,
+                                "the default retains less than a week of runs")
+
+    def test_the_byte_budget_still_bounds_a_runaway_directory(self):
+        """Raising the count must not make retention unbounded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(10):
+                _make_run(root, f"2026-11-0{i % 9 + 1}T00-00-0{i}_run{i}",
+                          100_000, 100_000, mtime=1000.0 + i)
+            out = storage.prune_sessions(root, keep=1000, max_bytes=500_000)
+            self.assertGreater(out["kept"], 0, "it deleted everything")
+            remaining = sum(
+                (root / f"{s}{sfx}").stat().st_size
+                for s in storage.session_stems(root)
+                for sfx in (".jsonl", ".md")
+                if (root / f"{s}{sfx}").exists())
+            self.assertLessEqual(
+                remaining, 500_000 + 200_000,
+                "the byte budget stopped being enforced once the count was "
+                "raised")
+
+    def test_the_newest_run_survives_any_bound(self):
+        """The rule that must hold at every setting: never delete the live run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(5):
+                _make_run(root, f"2026-11-0{i + 1}T00-00-00_run{i}", 10, 10,
+                          mtime=1000.0 + i)
+            newest = storage.session_stems(root)[0]
+            storage.prune_sessions(root, keep=1, max_bytes=1)
+            self.assertTrue((root / f"{newest}.jsonl").exists(),
+                            "retention deleted the newest run -- the one that "
+                            "may still be in progress")
+
+
+class RetentionReportingTest(unittest.TestCase):
+    """The runs page must SAY how far back it reaches, not just list rows."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "sessions").mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _facts(self):
+        import webui            # imported lazily: it pulls in prompts/config
+        with mock.patch.object(config, "SESSIONS_DIR",
+                               str(self.root / "sessions")):
+            return webui.retention_facts()
+
+    def test_an_empty_directory_reports_zero_not_an_error(self):
+        facts = self._facts()
+        self.assertEqual(facts["runs"], 0)
+        self.assertIsNone(facts["oldest"])
+
+    def test_it_reports_the_oldest_and_newest_run_it_can_still_see(self):
+        for i in range(3):
+            _make_run(self.root / "sessions",
+                      f"2026-11-0{i + 1}T0{i}-00-00_run{i}", 10, 10,
+                      mtime=1000.0 + i)
+        facts = self._facts()
+        self.assertEqual(facts["runs"], 3)
+        self.assertEqual(facts["oldest"], "2026-11-01T00:00:00")
+        self.assertEqual(facts["newest"], "2026-11-03T02:00:00")
+
+    def test_a_timestamp_with_dashes_in_the_clock_is_still_a_time(self):
+        """``2026:11:02T04:31:41`` is what a naive replace produces."""
+        import webui
+        stamp = webui._stamp_of(Path("x/2026-11-02T04-31-41_ab12cd34.jsonl"))
+        self.assertEqual(stamp, "2026-11-02T04:31:41")
+        self.assertNotIn("2026:11", stamp)
+
+    def test_it_names_the_bound_so_nobody_has_to_read_the_pruner(self):
+        _make_run(self.root / "sessions", "2026-11-02T00-00-00_run", 10, 10)
+        facts = self._facts()
+        self.assertIn("keep", facts)
+        self.assertIn("max_bytes_mb", facts)
+        self.assertGreater(facts["keep"], 0)
+        self.assertGreater(facts["max_bytes_mb"], 0)
+
+
 class TranscriptRotationTest(unittest.TestCase):
+    """Rotating the raw API transcript, independent of session retention."""
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.path = Path(self._tmp.name) / "transcript.jsonl"
@@ -449,31 +571,44 @@ class ConfigKnobTest(unittest.TestCase):
 
     def test_the_documented_knobs_are_read_from_the_environment(self):
         import importlib
-        with mock.patch.dict(os.environ, {
-                "AGENT_SESSIONS_KEEP": "7",
-                "AGENT_SESSIONS_MAX_MB": "3",
-                "AGENT_TRANSCRIPT_MAX_MB": "1",
-                "AGENT_TRANSCRIPT_BACKUPS": "4",
-                "AGENT_MEMORY_SOFT_MAX_MB": "2"}):
-            fresh = importlib.reload(config)
-            try:
+        #: The restore reload MUST happen after the environment patch is gone.
+        #:
+        #: It used to sit in a finally INSIDE the ``mock.patch.dict`` block, so
+        #: it reloaded config while the patched variables were still set and
+        #: "restored" it to AGENT_SESSIONS_KEEP=7 -- permanently, for the rest of
+        #: the run. Nothing caught it because no other test asserted a value
+        #: above 7; the retention-window tests added on 2026-11-02 did, and
+        #: failed only in a FULL suite run (each passed alone). A cleanup that
+        #: runs inside the thing it is cleaning up is not a cleanup.
+        try:
+            with mock.patch.dict(os.environ, {
+                    "AGENT_SESSIONS_KEEP": "7",
+                    "AGENT_SESSIONS_MAX_MB": "3",
+                    "AGENT_TRANSCRIPT_MAX_MB": "1",
+                    "AGENT_TRANSCRIPT_BACKUPS": "4",
+                    "AGENT_MEMORY_SOFT_MAX_MB": "2"}):
+                fresh = importlib.reload(config)
                 self.assertEqual(fresh.SESSIONS_KEEP, 7)
                 self.assertEqual(fresh.SESSIONS_MAX_BYTES, 3 << 20)
                 self.assertEqual(fresh.TRANSCRIPT_MAX_BYTES, 1 << 20)
                 self.assertEqual(fresh.TRANSCRIPT_BACKUPS, 4)
                 self.assertEqual(fresh.MEMORY_SOFT_MAX_BYTES, 2 << 20)
-            finally:
-                importlib.reload(config)
-                #: The other modules captured config's attributes at import, so
-                #: reload them too or later tests see the patched values. Only
-                #: reload what actually imported: on a host without the SDK
-                #: `agent` is None, and reloading None raises TypeError -- which
-                #: is how this test, written to prove the knobs work, became the
-                #: only failure in the suite on the one machine it must also run
-                #: on.
-                importlib.reload(storage)
-                if agent is not None:
-                    importlib.reload(agent)
+        finally:
+            #: Now the environment is the real one again, so this reload puts
+            #: the DEFAULTS back rather than the patch.
+            importlib.reload(config)
+            importlib.reload(storage)
+            #: The other modules captured config's attributes at import, so
+            #: reload them too. Only reload what actually imported: on a host
+            #: without the SDK `agent` is None, and reloading None raises
+            #: TypeError -- which is how this test, written to prove the knobs
+            #: work, became the only failure in the suite on the one machine it
+            #: must also run on.
+            if agent is not None:
+                importlib.reload(agent)
+        self.assertGreater(
+            config.SESSIONS_KEEP, 7,
+            "the suite left config patched for every later test")
 
 
 if __name__ == "__main__":

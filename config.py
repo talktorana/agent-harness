@@ -226,8 +226,23 @@ def _non_negative_int(name: str, default: int) -> int:
 
 
 #: How many runs' session pairs to keep (a pair is one .jsonl + one .md).
-SESSIONS_KEEP = _non_negative_int("AGENT_SESSIONS_KEEP", 50)
-#: Total byte budget across the sessions directory, applied after the count.
+#:
+#: A BACKSTOP against file explosion, not the retention policy. It used to be
+#: 50, and that quietly became the policy -- with a monitoring pass every thirty
+#: minutes that is ~25 HOURS of history, so every run older than a day was
+#: deleted each pass. Measured on the deployment 2026-11-02: 50 runs held 8.1 MB
+#: against a 200 MB budget, i.e. 96% of the allowance unused while a day-old
+#: history was thrown away. The operator asked "is history not persisted?" and
+#: the honest answer was "it is persisted, and we delete it".
+#:
+#: The BYTE budget is the real bound; this only has to be large enough that it
+#: never decides the window by itself. 2000 pairs at the ~160 KB seen live is
+#: ~320 MB, so on a normal deployment SESSIONS_MAX_MB always bites first.
+SESSIONS_KEEP = _non_negative_int("AGENT_SESSIONS_KEEP", 2000)
+#: Total byte budget across the sessions directory -- THE retention bound.
+#: Applied after the count, which only matters for a pathological set of tiny
+#: runs. At the live ~160 KB/run this is ~1200 runs, i.e. ~25 days at a pass
+#: every thirty minutes.
 SESSIONS_MAX_MB = _non_negative_int("AGENT_SESSIONS_MAX_MB", 200)
 #: Rotate the raw API transcript past this size, keeping N numbered backups.
 TRANSCRIPT_MAX_MB = _non_negative_int("AGENT_TRANSCRIPT_MAX_MB", 8)
