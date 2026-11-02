@@ -565,6 +565,13 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
         #: test_deploy_tools.py.
         "readiness": _readiness_of(receipt),
         "backups": receipt.get("backups") or [],
+        #: DID THIS REQUEST OVERWRITE SOMETHING NEWER? Copied through from the
+        #: receipt, because the applier records it and this is the only path by
+        #: which the agent can learn about it. Two gaps existed on this line:
+        #: the summariser never printed it, and this dict never carried it, so
+        #: the check was invisible end to end -- written, persisted, unread.
+        "staged_against": receipt.get("staged_against") or [],
+        "staged_against_warning": receipt.get("staged_against_warning"),
         #: Did the applied change reach the repository? Reported so the agent
         #: can tell the operator WHERE the code now lives. A deploy that landed
         #: but never got pushed is still a real deploy -- it just means the
@@ -683,6 +690,28 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
     for row in outcome.get("files") or []:
         lines.append(f"  target {row.get('target')} "
                      f"({row.get('bytes')} bytes, sha256 {row.get('sha256')}...)")
+    #: DID THIS REQUEST OVERWRITE SOMETHING NEWER?
+    #:
+    #: The applier records this and nothing else read it, which made the whole
+    #: check one-directional: the fact existed in the receipt and the only
+    #: consumer that could act on it -- the agent, hours later, deciding whether
+    #: its staged change is still the right one -- could not see it. A field
+    #: written for a reader who never reads it is the same as not writing it.
+    #:
+    #: Printed as a warning rather than a fact, because the applier applies the
+    #: requested bytes either way (the owner's 2026-11-02 directive) and the
+    #: only correct response is for the agent to LOOK, not to assume.
+    superseded = outcome.get("staged_against") or []
+    if superseded:
+        lines.append(
+            f"WARNING: {len(superseded)} file(s) changed AFTER this request was "
+            f"staged, and the staged content overwrote them:")
+        for row in superseded:
+            lines.append(f"  {row.get('target')}: staged against "
+                         f"{row.get('staged_against')}, found "
+                         f"{row.get('found_instead')}")
+        lines.append("  Check whether this undid a newer fix before reporting "
+                     "the change as closed.")
     backups = outcome.get("backups") or []
     if backups:
         lines.append(f"backups: {len(backups)} file(s) copied aside")

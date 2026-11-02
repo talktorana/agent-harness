@@ -16,6 +16,7 @@ Run:  python -m unittest test_deploy_tools
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -865,6 +866,70 @@ class GitVerdictPassthroughTest(unittest.TestCase):
         import inspect
         src = inspect.getsource(tools_deploy)
         self.assertIn('"git": receipt.get("git")', src)
+
+
+class StagedAgainstReachesTheAgentTest(unittest.TestCase):
+    """A field the applier records must reach the ONLY reader that can act on it.
+
+    The applier writes `staged_against` when a request overwrites files that
+    changed after it was staged. That fact is only useful to the agent, hours
+    later, deciding whether its staged change is still the right one -- and it
+    can only learn it through `deploy_status`.
+
+    Both ends of that chain were missing when the field was introduced: the
+    outcome builder never copied it out of the receipt, and the summariser never
+    printed it. The check was therefore written, persisted and UNREAD -- which is
+    the same as not writing it, and worse than not writing it, because the
+    receipt then implies somebody was told.
+
+    These tests pin the chain in both directions so a future field cannot repeat
+    the pattern: carried through, and rendered as a warning rather than a fact,
+    because the applier applies the requested bytes either way and the only
+    correct response is to LOOK.
+    """
+
+    RECEIPT = {
+        "status": "applied",
+        "reason": "all gates passed and payloads written",
+        "files": [{"target": "/x/engine/mod.py", "bytes": 12,
+                   "sha256": "abcdef1234567890"}],
+        "staged_against": [{
+            "target": "/x/engine/mod.py",
+            "staged_against": "324556bcabde9945",
+            "found_instead": "dde83b4a4c8aa00f",
+            "would_overwrite": "5fbbe6d00381c8e6",
+        }],
+        "staged_against_warning": "the deployment changed these files AFTER "
+                                  "this request was staged: /x/engine/mod.py",
+    }
+
+    def test_the_outcome_carries_the_field_out_of_the_receipt(self):
+        src = inspect.getsource(tools_deploy)
+        self.assertIn('"staged_against": receipt.get("staged_against")', src,
+                      "the outcome builder must copy it, or the summariser has "
+                      "nothing to print")
+
+    def test_the_summary_warns_that_a_newer_change_was_overwritten(self):
+        text = tools_deploy._summarise_outcome(dict(self.RECEIPT))
+        self.assertIn("changed AFTER this request was staged", text)
+        self.assertIn("324556bcabde9945", text)
+        self.assertIn("dde83b4a4c8aa00f", text)
+        self.assertIn("undid a newer fix", text,
+                      "the reader must be told what to DO about it, not just "
+                      "given hashes")
+
+    def test_a_receipt_without_the_field_prints_no_warning(self):
+        """The common case must stay quiet, or the warning becomes noise."""
+        clean = dict(self.RECEIPT)
+        clean.pop("staged_against")
+        text = tools_deploy._summarise_outcome(clean)
+        self.assertNotIn("changed AFTER this request was staged", text)
+
+    def test_an_empty_list_is_treated_as_nothing_to_report(self):
+        clean = dict(self.RECEIPT)
+        clean["staged_against"] = []
+        text = tools_deploy._summarise_outcome(clean)
+        self.assertNotIn("changed AFTER this request was staged", text)
 
 
 if __name__ == "__main__":
