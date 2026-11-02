@@ -340,7 +340,12 @@ function ago(iso){
 function secs(v){return (v==null)?'':
   (v<60?v.toFixed(0)+'s':(v/60).toFixed(1)+'m');}
 function esc(s){return (s==null?'':String(s))
-  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  // Quotes too, not just angle brackets: this value is interpolated into the
+  // onclick attribute below, and an id containing a quote would otherwise end
+  // the attribute and inject markup. Escaping them is one line and closes the
+  // class rather than the instance.
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 async function loadSchedule(){
   let j=null;
@@ -400,9 +405,18 @@ function tog(el){
 }
 
 async function loadRuns(){
-  let rows=[];
+  // `held` is declared HERE, beside `rows`, and NOT with `const` inside the try.
+  //
+  // It was `const j = await r.json()` inside the try and then `j.held` after it,
+  // so the retention line referenced a block-scoped name that no longer exists
+  // outside the block: a ReferenceError, thrown on every load, which aborted
+  // loadRuns BEFORE the table was filled. The page therefore rendered "no runs"
+  // for every operator while /runs.json happily served 54 of them -- a display
+  // defect that makes a healthy system look wiped. Nothing caught it because
+  // this page had no test that ever EXECUTED its script.
+  let rows=[], held={};
   try{const r=await fetch('__AGENT_BASE__/runs.json');const j=await r.json();
-      rows=j.runs||[];}catch(e){
+      rows=j.runs||[]; held=j.held||{};}catch(e){
     document.getElementById('err').innerHTML=
       '<div class="bad">could not read runs: '+esc(e)+'</div>';return;}
   const tb=document.getElementById('runs');
@@ -413,7 +427,6 @@ async function loadRuns(){
   // bound turns that into one line they can act on.
   const keep=document.getElementById('keep');
   if(keep){
-    const held=j.held||{};
     keep.textContent=(held.keep||held.max_bytes)
       ? ('history: '+rows.length+' run(s)'+(held.oldest?' back to '
           +String(held.oldest).replace('T',' ').slice(0,16)+' UTC':'')
@@ -432,7 +445,22 @@ async function loadRuns(){
       ? '<div class="bad">died '+esc(r.died_during)
         +(r.last_event_at?' at '+esc(r.last_event_at.slice(11,19)):'')+'</div>'
       : '';
-    return '<tr class="run" onclick="showRun(\''+r.session_id+'\')">'
+    // The id travels in a DATA ATTRIBUTE, and the handler reads it back.
+    //
+    // This was built by concatenating quotes into the onclick string:
+    //     '...onclick="showRun(\''+r.session_id+'\')">'
+    // The `\'` survives Python as a plain `'`, so the SERVED script read
+    //     '...showRun(''+r.session_id+'')...'
+    // -- three adjacent string literals with no operators between them, a
+    // SyntaxError that stopped the WHOLE page script from parsing. Not one
+    // line failed: nothing ran at all, no schedule, no rows, and an operator
+    // saw an empty table with data sitting behind it (reported 2026-11-02 as
+    // "no history for the past two hours").
+    //
+    // A data attribute has no nested quotes to get wrong, and the value is
+    // escaped, so it cannot break out of the attribute either.
+    return '<tr class="run" data-sid="'+esc(r.session_id)+'"'
+      +' onclick="showRun(this.dataset.sid)">'
       +'<td>'+esc(r.started?r.started.replace('T',' ').slice(0,19):'?')
       +'<div class="m">'+ago(r.started)+'</div></td>'
       +'<td class="'+cls(r.status)+'">'+esc(NICE[r.status]||r.status)+died
