@@ -2347,6 +2347,95 @@ class StagedAgainstTest(ApplierTestBase):
         self.assertEqual((self.root / "engine" / "mod.py")
                          .read_text(encoding="utf-8"), "STAGED = 3\n")
 
+    # -- "could not check" must not read as "it changed" -----------------
+    #
+    # Found in a LIVE receipt (req-20261102T152957-77d6456e, 2026-11-02). The
+    # sidecar could not read the target it was staging over, so tools_deploy
+    # recorded the sentinel ``unreadable`` instead of a hash. The applier
+    # compared that string to a real digest, they never matched, and the
+    # receipt claimed:
+    #
+    #     "the deployment changed these files AFTER this request was staged"
+    #
+    # which was false -- no base existed, so a change was UNDETECTABLE. A
+    # monitoring pass then spent turns hunting a revert that had not happened.
+    #
+    # This is the inverse of "I did not check must not read as it matched", and
+    # it is just as corrosive: a warning that fires when nothing happened
+    # teaches the reader to ignore the one that fires when something did.
+
+    def test_an_unreadable_base_is_reported_as_unknown_not_as_a_change(self):
+        self.live("engine/mod.py", "ORIGINAL = 1\n")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", "unreadable")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(
+            receipt["staged_against"], [],
+            "an unknown base is not evidence that the file changed")
+        self.assertNotIn(
+            "staged_against_warning", receipt,
+            "the receipt must not assert a change it cannot evidence")
+        self.assertEqual(len(receipt["staged_against_unknown"]), 1, receipt)
+        row = receipt["staged_against_unknown"][0]
+        #: RESOLVED, like the superseded test above: Windows reports the temp
+        #: directory in 8.3 form on one side (DRAGON~1) and long form on the
+        #: other, so a string comparison fails on a path that is one file.
+        self.assertEqual(Path(row["target"]).resolve(),
+                         (self.root / "engine" / "mod.py").resolve())
+        self.assertIn("cannot be detected", row["reason"])
+
+    def test_the_unknown_warning_says_it_is_not_a_change_report(self):
+        """The reader is told what the line does NOT mean, not just that it is
+        there -- otherwise "unknown" is read as "changed" and the pass hunts."""
+        self.live("engine/mod.py", "ORIGINAL = 1\n")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", "unreadable")
+        receipt = self.handle(path)
+        warning = receipt["staged_against_unknown_warning"]
+        self.assertIn("could NOT be checked", warning)
+        self.assertIn("NOT a report that they changed", warning)
+        self.assertIn("engine", warning)
+
+    def test_an_unreadable_base_still_applies_the_payload(self):
+        """Unknown base is an observation, never a veto."""
+        self.live("engine/mod.py", "ORIGINAL = 1\n")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", "unreadable")
+        self.handle(path)
+        self.assertEqual((self.root / "engine" / "mod.py")
+                         .read_text(encoding="utf-8"), "STAGED = 3\n")
+
+    def test_a_real_change_is_still_reported_alongside_an_unknown_one(self):
+        """The two must not collapse into one list.
+
+        A receipt that reported BOTH under ``staged_against`` would be right
+        about one file and fabricating about the other in the same sentence.
+        """
+        base = self.live("engine/changed.py", "ORIGINAL = 1\n")
+        self.live("engine/unknown.py", "ORIGINAL = 1\n")
+        path, req = self.stage([
+            {"target": "engine/changed.py", "payload": "STAGED = 3\n"},
+            {"target": "engine/unknown.py", "payload": "STAGED = 4\n"},
+        ])
+        hashes = {e["target"]: h for e, h
+                  in zip(req["files"], [base, "unreadable"])}
+        for entry in req["files"]:
+            entry["staged_against_sha256"] = hashes[entry["target"]]
+        path.write_text(json.dumps(req), encoding="utf-8")
+        # ...another pass fixes the one we have a base for...
+        (self.root / "engine" / "changed.py").write_text("THEIRS = 2\n",
+                                                         encoding="utf-8")
+        receipt = self.handle(path)
+        self.assertEqual(len(receipt["staged_against"]), 1, receipt)
+        self.assertEqual(Path(receipt["staged_against"][0]["target"]).name,
+                         "changed.py")
+        self.assertEqual(len(receipt["staged_against_unknown"]), 1, receipt)
+        self.assertEqual(
+            Path(receipt["staged_against_unknown"][0]["target"]).name,
+            "unknown.py")
+        self.assertIn("AFTER this request was staged",
+                      receipt["staged_against_warning"])
+        self.assertIn("NOT a report that they changed",
+                      receipt["staged_against_unknown_warning"])
+
 
 if __name__ == "__main__":
     unittest.main()

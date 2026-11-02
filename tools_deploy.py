@@ -572,6 +572,16 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
         #: the check was invisible end to end -- written, persisted, unread.
         "staged_against": receipt.get("staged_against") or [],
         "staged_against_warning": receipt.get("staged_against_warning"),
+        #: Files whose BASE was never recorded, so a change could not be
+        #: detected either way. Carried separately from ``staged_against``
+        #: because that key means "this DID change" -- and the two must not be
+        #: conflated in an audit trail. Live 2026-11-02 a request staged with
+        #: ``staged_against_sha256: "unreadable"`` produced a receipt claiming
+        #: the deployment had changed under it, which sent a pass hunting a
+        #: revert that never happened.
+        "staged_against_unknown": receipt.get("staged_against_unknown") or [],
+        "staged_against_unknown_warning": receipt.get(
+            "staged_against_unknown_warning"),
         #: Did the applied change reach the repository? Reported so the agent
         #: can tell the operator WHERE the code now lives. A deploy that landed
         #: but never got pushed is still a real deploy -- it just means the
@@ -712,6 +722,21 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
                          f"{row.get('found_instead')}")
         lines.append("  Check whether this undid a newer fix before reporting "
                      "the change as closed.")
+    #: The other half of the same question, and NOT the same answer. A file
+    #: whose base was never recorded cannot be compared, so it is reported as
+    #: unknown rather than as a change. Printed because an unprinted field is
+    #: an invisible one, and because the failure mode here is an agent hunting
+    #: for a revert the receipt never evidenced.
+    unknown = outcome.get("staged_against_unknown") or []
+    if unknown:
+        lines.append(
+            f"NOTE: {len(unknown)} file(s) had NO recorded base, so a change "
+            f"since staging was NOT checked (this is not a report that they "
+            f"changed):")
+        for row in unknown:
+            lines.append(f"  {row.get('target')}: now {row.get('found_instead')}")
+        lines.append("  Do not hunt for a revert on this line alone -- stage "
+                     "an explicit verify_command if the content matters.")
     backups = outcome.get("backups") or []
     if backups:
         lines.append(f"backups: {len(backups)} file(s) copied aside")

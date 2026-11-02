@@ -69,6 +69,31 @@ SCHEMA_VERSION = 1
 REQUEST_SUFFIX = ".deploy.json"
 RECEIPT_SUFFIX = ".receipt.json"
 
+#: The two non-hash values ``tools_deploy`` may put in
+#: ``staged_against_sha256`` (see ``STAGED_AGAINST_ABSENT`` /
+#: ``STAGED_AGAINST_UNREADABLE`` there). They MUST be recognised by name here:
+#: the comparison below reads that field as a hash, and a sentinel is not one.
+#:
+#: WHY THIS MATTERS (found in a live receipt, 2026-11-02): a request staged
+#: from the sidecar carried ``staged_against_sha256: "unreadable"`` because the
+#: sidecar could not read the target it was staging over. The applier compared
+#: that string to a real digest, they never matched, and the receipt asserted
+#:
+#:     "the deployment changed these files AFTER this request was staged"
+#:     "... the request carried the older content"
+#:
+#: Neither was true: no base was ever recorded, so a change was UNDETECTABLE.
+#: A pass then spent turns looking for a newer fix that had never been
+#: overwritten. This is the exact inverse of the rule the readiness gate is
+#: built on -- "I did not check" must not read as "it matched" -- and it is
+#: just as corrosive: a warning that fires when nothing happened teaches passes
+#: to ignore the warning that fires when something did.
+STAGED_AGAINST_ABSENT = "absent"
+STAGED_AGAINST_UNREADABLE = "unreadable"
+STAGED_AGAINST_SENTINELS = frozenset({STAGED_AGAINST_ABSENT,
+                                      STAGED_AGAINST_UNREADABLE})
+
+
 #: Refused in EVERY deployment, whatever the policy says. Secrets and VCS
 #: metadata are never a legitimate deploy payload, so they are not left to the
 #: policy author to remember. ``--policy`` can only ADD to this list.
@@ -1811,6 +1836,12 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
     #: ``unknown`` rather than a clean bill, because "I did not check" must
     #: never read as "it matched".
     staged_against: List[Dict[str, Any]] = []
+    #: Files whose BASE is unknown, so no comparison is possible either way.
+    #: Kept separate from ``staged_against`` on purpose: that list means "this
+    #: file changed under the request", and a file we could never read is not
+    #: evidence of a change. Reporting it there made the applier claim a revert
+    #: that had not happened.
+    staged_against_unknown: List[Dict[str, Any]] = []
     for entry, target, (_pname, payload) in zip(
             req.get("files") or [], targets, pairs):
         if not isinstance(entry, dict):
@@ -1820,8 +1851,26 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             continue
         try:
             current = sha256_bytes(Path(target).read_bytes())
+        except FileNotFoundError:
+            current = STAGED_AGAINST_ABSENT
         except OSError:
-            current = "absent"
+            # Present but unreadable at APPLY time. Naming it ``absent`` would
+            # report a deleted file that is still there -- the same mislabel in
+            # the other direction.
+            current = STAGED_AGAINST_UNREADABLE
+        if declared == STAGED_AGAINST_UNREADABLE:
+            # No base was recorded, so "did it change?" has no answer. Say so
+            # and claim nothing else.
+            staged_against_unknown.append({
+                "target": str(target),
+                "reason": "no base hash was recorded when this request was "
+                          "staged, so a change since then cannot be detected",
+                "found_instead": current[:16],
+                "would_overwrite": (sha256_bytes(payload)[:16]
+                                    if current not in STAGED_AGAINST_SENTINELS
+                                    else None),
+            })
+            continue
         if declared == current:
             continue
         staged_against.append({
@@ -1829,7 +1878,7 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             "staged_against": declared[:16],
             "found_instead": current[:16],
             "would_overwrite": (sha256_bytes(payload)[:16]
-                                if current != "absent" else None),
+                                if current != STAGED_AGAINST_ABSENT else None),
         })
 
     plan = {
@@ -1843,6 +1892,9 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         #: was staged, OR the request predates the field -- so the distinction
         #: is recorded explicitly rather than left to an empty list.
         "staged_against": staged_against,
+        #: Files that could not be compared at all. Distinct from the list
+        #: above so "changed" and "unknown" never share a key.
+        "staged_against_unknown": staged_against_unknown,
         "services": list(req.get("services") or []),
         "verify_command": req.get("verify_command"),
         "would_restart": bool(allow_restart and (req.get("services") or [])),
@@ -1853,6 +1905,14 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             + ", ".join(e["target"] for e in staged_against)
             + ". They were overwritten as requested, but check whether this "
               "undid a newer fix -- the request carried the older content.")
+    if staged_against_unknown:
+        plan["staged_against_unknown_warning"] = (
+            "base unknown for these files, so a change since staging could NOT "
+            "be checked: "
+            + ", ".join(e["target"] for e in staged_against_unknown)
+            + ". This is NOT a report that they changed -- there is no evidence "
+              "either way. Do not go looking for a revert on this line alone.")
+
 
     if dry_run:
         receipt = write_receipt(outbox, path, "dry_run",

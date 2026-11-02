@@ -931,6 +931,43 @@ class StagedAgainstReachesTheAgentTest(unittest.TestCase):
         text = tools_deploy._summarise_outcome(clean)
         self.assertNotIn("changed AFTER this request was staged", text)
 
+    # -- the same question, the OTHER answer -----------------------------
+    #
+    # A file whose base was never recorded cannot be compared. That is not a
+    # change, and reporting it as one (which the applier did until 2026-11-02)
+    # sends a pass hunting a revert that never happened. The distinction is
+    # only useful if it reaches the agent, so it is carried and printed here.
+
+    def test_the_outcome_carries_the_unknown_list_out_of_the_receipt(self):
+        src = inspect.getsource(tools_deploy)
+        self.assertIn('"staged_against_unknown": receipt.get(', src,
+                      "carried but unprinted is invisible; unread is the same "
+                      "as not written")
+
+    def test_an_unknown_base_prints_a_note_that_denies_being_a_change(self):
+        receipt = dict(self.RECEIPT)
+        receipt["staged_against"] = []
+        receipt.pop("staged_against_warning")
+        receipt["staged_against_unknown"] = [{
+            "target": "/x/engine/mod.py",
+            "reason": "no base hash was recorded",
+            "found_instead": "dde83b4a4c8aa00f",
+            "would_overwrite": None,
+        }]
+        text = tools_deploy._summarise_outcome(receipt)
+        self.assertIn("NOT checked", text)
+        self.assertIn("not a report that they changed", text)
+        self.assertIn("dde83b4a4c8aa00f", text)
+        self.assertNotIn("changed AFTER this request was staged", text,
+                         "an unknown base must never be summarised as a "
+                         "change -- that is the defect this test pins")
+
+    def test_a_receipt_with_a_known_change_prints_only_the_change(self):
+        """No phantom note on the ordinary superseded path."""
+        text = tools_deploy._summarise_outcome(dict(self.RECEIPT))
+        self.assertIn("changed AFTER this request was staged", text)
+        self.assertNotIn("NOT checked", text)
+
 
 if __name__ == "__main__":
     unittest.main()
