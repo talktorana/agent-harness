@@ -292,25 +292,21 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         """
         (self.root / "engine").mkdir(parents=True, exist_ok=True)
         (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
-        compose = {
-            "services": {
-                "svc-a": {"image": "shared:1.0"},
-                "svc-b": {"image": "shared:1.0"},
-                "svc-c": {"image": "other:2.0"},
-            }
-        }
+        mapping = {"svc-a": "shared:1.0", "svc-b": "shared:1.0",
+                   "svc-c": "other:2.0"}
 
         def fake_run(cmd, cwd, timeout):
-            if cmd[:3] == ["docker", "compose", "config"]:
-                return 0, json.dumps(compose)
             return 0, "ok"
 
-        original = deploy_applier.run_command
+        original_run = deploy_applier.run_command
+        original_map = deploy_applier._service_images
         deploy_applier.run_command = fake_run
+        deploy_applier._service_images = lambda root: dict(mapping)
         try:
             rows = deploy_applier.restart_services(["svc-a"], self.root, 20.0)
         finally:
-            deploy_applier.run_command = original
+            deploy_applier.run_command = original_run
+            deploy_applier._service_images = original_map
 
         self.assertTrue(all(r["rc"] == 0 for r in rows))
         stamp = json.loads((self.root / "data" / "deploy"
@@ -328,22 +324,62 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         self.assertNotIn("image:other:2.0", stamp,
                          "an unrelated image must not be stamped")
 
+    def test_the_image_mapping_parses_full_output_not_a_log_tail(self):
+        """`run_command` keeps only the last 2,500 chars -- fatal for JSON.
+
+        The first version of this probe went through it, `json.loads` failed on
+        a string cut mid-token, the mapping came back EMPTY, and the caller
+        silently fell back to service-only stamping. That is the worst shape of
+        failure available here: nothing errored, the feature simply did nothing,
+        and the misleading stamp it was meant to fix stayed misleading.
+
+        So this asserts the REAL parser against a config larger than the tail
+        limit, and that the result is non-empty.
+        """
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        #: No trailing comma: an invalid fixture would fail `json.loads` and
+        #: this test would then pass for the wrong reason on any implementation.
+        padding = ",".join('"KEY_%d": "%s"' % (i, "v" * 40)
+                           for i in range(200))
+        big = ('{"services": {"svc-a": {"image": "shared:1.0", '
+               '"environment": {' + padding + '}}, '
+               '"svc-b": {"image": "shared:1.0"}}, '
+               '"padding": "' + "x" * 6000 + '"}')
+
+        class _Proc:
+            returncode = 0
+            stdout = big
+            stderr = ""
+
+        original = deploy_applier.subprocess.run
+        deploy_applier.subprocess.run = lambda *a, **k: _Proc()
+        try:
+            mapping = deploy_applier._service_images(self.root)
+        finally:
+            deploy_applier.subprocess.run = original
+        self.assertEqual(mapping,
+                         {"svc-a": "shared:1.0", "svc-b": "shared:1.0"},
+                         "a truncated tail would have yielded {} here, which "
+                         "reads downstream as 'no shared images'")
+
     def test_an_unresolvable_image_mapping_still_writes_the_service_key(self):
         """Bookkeeping degradation must never lose the stamp entirely."""
         (self.root / "engine").mkdir(parents=True, exist_ok=True)
         (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
 
         def fake_run(cmd, cwd, timeout):
-            if cmd[:3] == ["docker", "compose", "config"]:
-                return 1, "boom"
             return 0, "ok"
 
-        original = deploy_applier.run_command
+        original_run = deploy_applier.run_command
+        original_map = deploy_applier._service_images
         deploy_applier.run_command = fake_run
+        deploy_applier._service_images = lambda root: {}
         try:
             deploy_applier.restart_services(["svc-a"], self.root, 20.0)
         finally:
-            deploy_applier.run_command = original
+            deploy_applier.run_command = original_run
+            deploy_applier._service_images = original_map
 
         stamp = json.loads((self.root / "data" / "deploy"
                             / deploy_applier.IMAGE_STAMP_NAME).read_text(

@@ -1086,8 +1086,44 @@ def restart_services(services: List[str], root: Path,
 IMAGE_STAMP_NAME = "image_state.json"
 
 
+def _service_images(root: Path) -> Dict[str, str]:
+    """service -> image reference for every compose service. Best effort.
+
+    Uses ``subprocess`` DIRECTLY rather than :func:`run_command`, because that
+    helper deliberately keeps only the last 2,500 characters of output -- fine
+    for a build log tail, fatal for JSON. The first version of this probe went
+    through it, `json.loads` failed on a string cut mid-token, the mapping came
+    back EMPTY, and the caller silently fell back to service-only stamping --
+    leaving intact the very misleading stamp this function exists to remove.
+    Caught on the host in the same pass it was written, only because the result
+    was printed rather than assumed.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "config", "--format", "json"],
+            cwd=str(root), capture_output=True, text=True, timeout=60.0,
+            encoding="utf-8", errors="replace")
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    start = (proc.stdout or "").find("{")
+    if start < 0:
+        return {}
+    try:
+        config = json.loads(proc.stdout[start:])
+    except ValueError:
+        return {}
+    out_map: Dict[str, str] = {}
+    for name, svc in (config.get("services") or {}).items():
+        image = (svc or {}).get("image")
+        if isinstance(image, str) and image:
+            out_map[str(name)] = image
+    return out_map
+
+
 def _service_image(root: Path, service: str) -> str:
-    """The image reference a compose service runs, or "" if it cannot be read.
+    """The image reference a compose service runs, or "" if unreadable.
 
     WHY THIS EXISTS (found live 2026-11-02). The build stamp was keyed by
     SERVICE, but ``docker compose build`` replaces an IMAGE TAG -- and two
@@ -1101,27 +1137,8 @@ def _service_image(root: Path, service: str) -> str:
     both containers already ran the rebuilt image. The stamp was reporting the
     last time that SERVICE was named in a build, which is a different question,
     and the brief teaches passes to read it as "is this service's code current".
-
-    Best-effort by design: a failed compose call returns "" and the caller falls
-    back to the service-only key, which is what older stamps have anyway.
     """
-    try:
-        rc, out = run_command(["docker", "compose", "config", "--format",
-                               "json"], Path(root), 60.0)
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
-    if rc not in (0, None):
-        return ""
-    start = out.find("{")
-    if start < 0:
-        return ""
-    try:
-        config = json.loads(out[start:])
-    except ValueError:
-        return ""
-    svc = (config.get("services") or {}).get(service) or {}
-    image = svc.get("image")
-    return image if isinstance(image, str) else ""
+    return _service_images(root).get(service, "")
 
 
 def _record_image_stamp(root: Path, service: str,
@@ -1179,30 +1196,6 @@ def _record_image_stamp(root: Path, service: str,
         os.replace(tmp, stamp_path)
     except Exception:  # noqa: BLE001 - bookkeeping must never fail a build
         pass
-
-
-def _service_images(root: Path) -> Dict[str, str]:
-    """service -> image reference for every compose service. Best effort."""
-    try:
-        rc, out = run_command(["docker", "compose", "config", "--format",
-                               "json"], Path(root), 60.0)
-    except (subprocess.TimeoutExpired, OSError):
-        return {}
-    if rc not in (0, None):
-        return {}
-    start = out.find("{")
-    if start < 0:
-        return {}
-    try:
-        config = json.loads(out[start:])
-    except ValueError:
-        return {}
-    out_map: Dict[str, str] = {}
-    for name, svc in (config.get("services") or {}).items():
-        image = (svc or {}).get("image")
-        if isinstance(image, str):
-            out_map[str(name)] = image
-    return out_map
 
 
 # ============================================================== typed actions
