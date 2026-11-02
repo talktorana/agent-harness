@@ -243,6 +243,27 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 duration = None
 
+        #: WHEN the run that is in progress started, and how long it has been
+        #: going. ``next_due`` is ALWAYS the next FIRE time (last_run + the
+        #: interval), including while a run is live -- but a reader who sees
+        #: ``running: true`` next to a future ``next_due`` has no way to tell
+        #: whether that stamp means "when this run ends" or "when the next one
+        #: starts", and guessing is worse than not asking.
+        #:
+        #: Live 2026-11-02 the 09:20 pass hit exactly this: it read a positive
+        #: ``seconds_until`` with ``running: true``, reasoned aloud about both
+        #: interpretations, and reported its own next-wake time as
+        #: **UNVERIFIED**. A fact the console already held cost turns and ended
+        #: as a hedge in the one field an operator scans first. So the console
+        #: now states the basis outright rather than leaving it to be derived.
+        in_progress_since = entry.get("last_run") if running else None
+        in_progress_sec: Optional[float] = None
+        if running and last_run:
+            try:
+                in_progress_sec = round((when - last_run).total_seconds(), 1)
+            except (TypeError, ValueError):
+                in_progress_sec = None
+
         jobs.append({
             "id": key,
             "interval": _interval_label(job),
@@ -259,12 +280,23 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             "last_ok": entry.get("last_ok"),
             "last_error": entry.get("last_error"),
             "next_due": next_due.isoformat() if next_due else None,
+            #: Say WHAT next_due means, so it cannot be read as the end of the
+            #: run in flight. A future stamp with `running: true` is otherwise
+            #: genuinely ambiguous, and the field an operator looks at first is
+            #: the wrong place to leave an inference.
+            "next_due_basis": ("last_run + every_min; this is the next FIRE "
+                               "time, even while a run is in progress"),
             "seconds_until": (round(seconds_until)
                               if seconds_until is not None else None),
             "due_now": _due(job, when, state, key),
             "overdue": bool(seconds_until is not None and seconds_until < 0),
             #: A run in progress: finished has not caught up with last_run yet.
             "running": running,
+            #: When it started, and for how long. Non-null only while running,
+            #: so a reader never has to decide between "the run in flight" and
+            #: "the previous one" from `last_run`/`finished` alone.
+            "in_progress_since": in_progress_since,
+            "in_progress_sec": in_progress_sec,
             #: Duration of the LAST COMPLETED run, never negative.
             "duration_sec": duration,
             #: A run that died with a previous process. Shown so an operator

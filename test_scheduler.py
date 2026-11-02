@@ -643,5 +643,65 @@ class TestRunKilledWithTheProcess(SchedulerPaths):
         self.assertEqual(scheduler.reclaim_interrupted(), [])
 
 
+class TestFactsTheConsoleMustNotLeaveToInference(SchedulerPaths):
+    """A field an operator reads first must never require a guess.
+
+    Live 2026-11-02, the 09:20 pass: it read a POSITIVE ``seconds_until`` next to
+    ``running: true``, reasoned aloud about whether that stamp meant "when this
+    run ends" or "when the next one starts", and reported its own next-wake time
+    as **UNVERIFIED**. Both facts were already in the payload; they were simply
+    not stated, so the agent spent turns deriving them and hedged the one line an
+    operator scans first.
+
+    ``next_due`` is ALWAYS last_run + the interval -- the next FIRE time, even
+    mid-run. That is now said in the payload, and the run in flight gets its own
+    start and elapsed fields instead of being inferred from last_run/finished.
+    """
+
+    def mid_run(self, started_min_ago: float = 12.0) -> None:
+        """A job that fired, is running now, and is not yet due again."""
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+        started = (datetime.now()
+                   - timedelta(minutes=started_min_ago)).isoformat()
+        previous = (datetime.now()
+                    - timedelta(minutes=started_min_ago + 30)).isoformat()
+        self.state.write_text(json.dumps({"jobs": {"monitor": {
+            "last_run": started, "finished": previous, "last_ok": True,
+        }}}), encoding="utf-8")
+
+    def test_a_future_next_due_is_stated_as_the_next_fire_time(self):
+        _write(self.declaration, [_job(every_min=30)])
+        self.mid_run()
+        job = scheduler.status()["jobs"][0]
+        self.assertTrue(job["running"])
+        self.assertGreater(job["seconds_until"], 0,
+                           "precondition: a future next_due WHILE running, "
+                           "which is the ambiguity that cost a pass")
+        self.assertIn("next FIRE time", job["next_due_basis"])
+        self.assertIn("even while a run is in progress", job["next_due_basis"])
+
+    def test_the_run_in_flight_has_its_own_start_and_elapsed(self):
+        _write(self.declaration, [_job(every_min=30)])
+        self.mid_run(started_min_ago=12)
+        job = scheduler.status()["jobs"][0]
+        self.assertIsNotNone(job["in_progress_since"])
+        self.assertAlmostEqual(job["in_progress_sec"] / 60, 12.0, delta=1.0)
+        #: ...and it is NOT reported as a completed duration, which is the
+        #: adjacent mistake (a negative 'took' shipped once already).
+        self.assertIsNone(job["duration_sec"])
+
+    def test_an_idle_job_reports_no_run_in_progress(self):
+        """Null, not zero: "no run" and "a run that just started" must differ."""
+        _write(self.declaration, [_job(every_min=30)])
+        self.stub_task()
+        scheduler.run_due_jobs()
+        job = scheduler.status()["jobs"][0]
+        self.assertFalse(job["running"])
+        self.assertIsNone(job["in_progress_since"])
+        self.assertIsNone(job["in_progress_sec"])
+        self.assertIsNotNone(job["duration_sec"],
+                             "a completed run still reports how long it took")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

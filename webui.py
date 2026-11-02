@@ -368,8 +368,13 @@ async function loadSchedule(){
     let next='';
     if(job.next_due){
       const s=job.seconds_until;
+      // Say WHAT the stamp means. A future next_due next to "running now" is
+      // otherwise ambiguous -- the 09:20 pass read both and reported its own
+      // next-wake time as UNVERIFIED -- so the label states the basis instead
+      // of leaving the reader to work it out.
       next='next due <b>'+(s!=null&&s>0?(s>=60?Math.round(s/60)+'m '+Math.round(s%60)+'s':
-            s+'s'):'now')+'</b> <span class="m">('+esc(job.next_due)+')</span>';
+            s+'s'):'now')+'</b> <span class="m">('+esc(job.next_due)+')</span>'
+        +' <span class="m">= last run + '+esc(job.every_min||'?')+' min</span>';
       if(job.overdue) next+=' <span class="warn">overdue</span>';
     }
     h+='<div class="row"><b>'+esc(job.id)+'</b>'
@@ -378,7 +383,13 @@ async function loadSchedule(){
       +(job.last_run?' <span class="m">('+ago(job.last_run)+')</span>':'')+'</span>'
       // A run in progress has no duration yet: finished still describes the
       // PREVIOUS run, and showing a difference would print a negative number.
-      +(job.running?'<span class="warn">running now</span>'
+      // It gets its OWN elapsed clock instead, so "running now" is a fact with
+      // a number next to it rather than a word to interpret.
+      +(job.running?('<span class="warn">running now'
+        +(job.in_progress_sec!=null?' for <b>'+secs(job.in_progress_sec)+'</b>':'')
+        +(job.in_progress_since?' <span class="m">(since '
+          +esc(job.in_progress_since)+')</span>':'')
+        +'</span>')
         :(job.duration_sec!=null?'<span>last took <b>'+secs(job.duration_sec)
           +'</b></span>':''))
       +(job.last_run?'<span>last outcome <span class="'+cls(job.last_ok?'ok':'bad')
