@@ -1020,6 +1020,73 @@ class RebuildOnlyStagingTest(unittest.TestCase):
         with self.assertRaises(tools_deploy.DeployError):
             tools_deploy.compose_deploy_request(purpose="p")
 
+    # -- a duplicate must not be stageable while one is pending ------------
+    #
+    # The brief says "never re-stage an identical request". A monitoring pass did
+    # it anyway on 2026-11-02 -- twice in 61 seconds, honestly flagging the
+    # second as its own error. Both were rebuild-only requests for the same
+    # service, so each runs `docker compose build` AND `up -d`: the container is
+    # recreated TWICE for one repair. Harmless only because the book was closed.
+    #
+    # A prose rule does not survive a model that has lost track of what it
+    # staged, and `deploy_status` is a snapshot it may have read earlier. So the
+    # check lives where the duplicate is created, and the refusal names the
+    # request already waiting.
+
+    def test_staging_the_same_rebuild_twice_refuses_the_second(self):
+        first = tools_deploy.compose_deploy_request(
+            purpose="rebuild", files=[], services=["svc-a"])
+        self.assertTrue(first.get("_request_path"))
+        with self.assertRaises(tools_deploy.DeployError) as ctx:
+            tools_deploy.compose_deploy_request(
+                purpose="rebuild again please", files=[], services=["svc-a"])
+        self.assertIn("already PENDING", str(ctx.exception))
+        self.assertIn(first["id"], str(ctx.exception),
+                      "the refusal must name the request already waiting, or "
+                      "the reader has to search the outbox to find it")
+
+    def test_rewording_does_not_make_it_a_different_request(self):
+        """A retry usually comes with a fresh sentence; that is still a dup."""
+        first = tools_deploy.compose_deploy_request(
+            purpose="rebuild the stale image", files=[], services=["svc-a"])
+        with self.assertRaises(tools_deploy.DeployError):
+            tools_deploy.compose_deploy_request(
+                purpose="REBUILD the stale image (retry)", files=[],
+                services=["svc-a"])
+        self.assertIn("svc-a", first["services"])
+
+    def test_a_different_service_is_not_a_duplicate(self):
+        tools_deploy.compose_deploy_request(purpose="rebuild", files=[],
+                                           services=["svc-a"])
+        second = tools_deploy.compose_deploy_request(
+            purpose="rebuild", files=[], services=["svc-b"])
+        self.assertTrue(second.get("_request_path"))
+
+    def test_a_different_payload_is_not_a_duplicate(self):
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "a.py").write_text("A = 1\n", encoding="utf-8")
+        (self.root / "engine" / "b.py").write_text("B = 1\n", encoding="utf-8")
+        tools_deploy.compose_deploy_request(
+            purpose="ship", files=[{"target": "engine/x.py",
+                                    "source": str(self.root / "engine" / "a.py")}])
+        second = tools_deploy.compose_deploy_request(
+            purpose="ship", files=[{"target": "engine/x.py",
+                                    "source": str(self.root / "engine" / "b.py")}])
+        self.assertTrue(second.get("_request_path"),
+                        "different content is different work")
+
+    def test_a_decided_request_does_not_block_a_new_one(self):
+        """Once decided, the same work may legitimately be staged again."""
+        first = tools_deploy.compose_deploy_request(
+            purpose="rebuild", files=[], services=["svc-a"])
+        applied = self.root / ".deploy" / "outbox" / "applied"
+        applied.mkdir(parents=True, exist_ok=True)
+        shutil.move(first["_request_path"], str(applied / Path(
+            first["_request_path"]).name))
+        second = tools_deploy.compose_deploy_request(
+            purpose="rebuild", files=[], services=["svc-a"])
+        self.assertTrue(second.get("_request_path"))
+
 
 if __name__ == "__main__":
     unittest.main()

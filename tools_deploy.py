@@ -31,7 +31,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import config
 
@@ -453,12 +453,83 @@ def compose_deploy_request(purpose: str,
         request["verify_command"] = verify_command.strip()
 
     path = outbox / f"{rid}{REQUEST_SUFFIX}"
+    #: REFUSE A DUPLICATE of a request that is still PENDING.
+    #:
+    #: The brief already says "never re-stage an identical request", and on
+    #: 2026-11-02 a monitoring pass did it anyway -- twice in 61 seconds
+    #: (req-...-eeadab2d and req-...-4c23fbc2), honestly flagging the second as
+    #: its own error. Both were rebuild-only requests for the same service, so
+    #: each one runs `docker compose build` AND `docker compose up -d`, i.e. the
+    #: trading container is recreated TWICE for one repair. Harmless when the
+    #: book is closed, which is the only reason that instance cost nothing.
+    #:
+    #: A rule stated only in prose does not survive contact with a model that
+    #: has lost track of what it already staged -- and the pass cannot always
+    #: tell, because `deploy_status` is a snapshot it may read at any point. So
+    #: the check lives here, where the duplicate is actually created, and the
+    #: refusal NAMES the request already waiting: that is more useful than a
+    #: second identical file in the outbox.
+    duplicate = _pending_duplicate(outbox, request)
+    if duplicate is not None:
+        raise DeployError(
+            "an identical request is already PENDING in the outbox: "
+            f"{duplicate['id']} (staged {duplicate.get('created_at')}). It has "
+            "not been decided yet -- read its verdict with deploy_status "
+            "instead of staging it again. Two pending copies mean two "
+            "rebuild/recreate cycles for one repair.")
+
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(request, indent=2), encoding="utf-8")
     os.replace(tmp, path)
     request["_request_path"] = str(path)
     request["_outbox"] = str(outbox)
     return request
+
+
+def _request_fingerprint(req: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """What makes two requests THE SAME WORK.
+
+    Deliberately NOT the id or the timestamp -- those differ by construction and
+    are how a duplicate hides. Identity is the payload: which files with which
+    content, which services, the action, and the verifier. ``purpose`` is
+    excluded too: re-wording the reason does not change the work, and a model
+    that retries usually rewords.
+    """
+    files = []
+    for entry in req.get("files") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        files.append((entry.get("target"), entry.get("sha256")))
+    action = req.get("action")
+    if isinstance(action, Mapping):
+        action = (action.get("kind"), action.get("instance_id"),
+                  json.dumps(action.get("set"), sort_keys=True, default=repr))
+    return (
+        tuple(sorted(files)),
+        tuple(sorted(str(s) for s in (req.get("services") or []))),
+        action,
+        req.get("verify_command"),
+    )
+
+
+def _pending_duplicate(outbox: Path,
+                       request: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """An undecided request in ``outbox`` that asks for exactly this work."""
+    want = _request_fingerprint(request)
+    try:
+        candidates = sorted(outbox.glob(f"*{REQUEST_SUFFIX}"))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            other = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # A half-written or unreadable request is not evidence of a
+            # duplicate; the applier will deal with it.
+            continue
+        if isinstance(other, Mapping) and _request_fingerprint(other) == want:
+            return dict(other, id=str(other.get("id") or path.stem))
+    return None
 
 
 def run_applier(extra: Optional[List[str]] = None,
