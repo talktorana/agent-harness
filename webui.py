@@ -104,11 +104,43 @@ def _one_line(text: Any, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[:limit - 1] + "\u2026"
 
 
+def _last_activity(path: Path, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """What the run was DOING when the file stopped growing.
+
+    A missing ``session_end`` now means one thing -- the process went away
+    mid-run -- but "what was it doing?" is what identifies the cause. A file
+    that stops on ``model_call`` means it died during an API call; stopping on
+    ``action`` means it died executing a tool. Without this the console could
+    only say "no end record", which is the point where an investigation stops.
+    """
+    last = {}
+    for record in reversed(records):
+        if record.get("event") in ("session_start", "session_end"):
+            continue
+        last = record
+        break
+    kind = last.get("event") or ""
+    tool = str(last.get("tool") or "")
+    if kind == "action":
+        phrase = "during a tool call" + (f" ({tool})" if tool else "")
+    else:
+        phrase = {
+            "model_call": "during a model call",
+            "assistant": "while the model was replying",
+            "answer": "after answering",
+            "api_retry": "while retrying an API call",
+            "tool": "during a tool call",
+        }.get(kind, f"on a {kind} event" if kind else "before writing anything")
+    return {"last_event": kind or None,
+            "last_event_at": last.get("at"),
+            "died_during": phrase}
+
+
 def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
     """One row per run: when, what it was told, how it ended.
 
     The status comes from the ``session_end`` record. Absence of one is
-    meaningful and is reported as such: a run with no end was KILLED, which is
+    meaningful and is reported as such: the process died mid-run, which is
     exactly the case an operator needs to see and could not previously.
     """
     now = datetime.now(timezone.utc)
@@ -116,7 +148,7 @@ def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
     for path in _session_files(limit):
         head = _read_lines(path, 3, tail=False)
         start = next((r for r in head if r.get("event") == "session_start"), {})
-        tail = _read_lines(path, 6, tail=True)
+        tail = _read_lines(path, 8, tail=True)
         end = next((r for r in reversed(tail)
                     if r.get("event") == "session_end"), None)
         answer = next((r for r in reversed(tail)
@@ -128,7 +160,7 @@ def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
         else:
             status = str(end.get("status") or "ok")
 
-        rows.append({
+        row = {
             "session_id": _session_id(path),
             "file": path.name,
             "started": started,
@@ -140,7 +172,10 @@ def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
             "prompt_preview": _one_line(start.get("task"), 140),
             "answer_preview": _one_line((answer or {}).get("text"), 200),
             "has_answer": bool(answer),
-        })
+        }
+        if not end:
+            row.update(_last_activity(path, tail))
+        rows.append(row)
     return rows
 
 
@@ -222,7 +257,7 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div id="detail"></div>
 <script>
 const NICE={ok:'ok',success:'ok',running:'running',no_end_record:'no end record',
-            error:'error',failed:'failed',timeout:'timeout',
+            error:'error',failed:'failed',timeout:'timeout',crashed:'crashed',
             step_limit_with_answer:'step limit (partial)',
             step_limit:'step limit (no answer)'};
 // 'step_limit_with_answer' really occurs: the agent ran out of steps but still
@@ -306,10 +341,18 @@ async function loadRuns(){
   if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="m">'
     +'no runs on disk yet</td></tr>';return;}
   tb.innerHTML=rows.map(function(r){
-    return '<tr class="run" onclick="showRun(\\''+r.session_id+'\\')">'
+    // An unfinished run says what it was DOING when the file stopped growing:
+    // 'no end record' alone is where an investigation stops, and the last event
+    // is what distinguishes a container restart from a crash.
+    const died=(r.status==='no_end_record'&&r.died_during)
+      ? '<div class="bad">died '+esc(r.died_during)
+        +(r.last_event_at?' at '+esc(r.last_event_at.slice(11,19)):'')+'</div>'
+      : '';
+    return '<tr class="run" onclick="showRun(\''+r.session_id+'\')">'
       +'<td>'+esc(r.started?r.started.replace('T',' ').slice(0,19):'?')
       +'<div class="m">'+ago(r.started)+'</div></td>'
-      +'<td class="'+cls(r.status)+'">'+esc(NICE[r.status]||r.status)+'</td>'
+      +'<td class="'+cls(r.status)+'">'+esc(NICE[r.status]||r.status)+died
+      +'</td>'
       +'<td>'+(r.steps==null?'':r.steps)+'</td>'
       +'<td>'+(r.elapsed_sec==null?'':secs(r.elapsed_sec))+'</td>'
       +'<td class="m">'+(r.prompt_preview?'<span class="clip">'

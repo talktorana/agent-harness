@@ -396,15 +396,24 @@ class AgentWiringTest(unittest.TestCase):
     def test_a_run_actually_invokes_retention(self):
         """The call site, not just the helper.
 
-        Deleting ``self._bound_storage()`` from ``run()`` left every test above
-        green -- they all drive the helper directly -- which means the harness
-        would have shipped with retention that never ran, and the only symptom
-        would have been a disk that filled months later. A behavioural test of a
-        helper cannot see a missing caller; this asserts the caller.
+        Deleting ``self._bound_storage()`` from the run body left every test
+        above green -- they all drive the helper directly -- which means the
+        harness would have shipped with retention that never ran, and the only
+        symptom would have been a disk that filled months later. A behavioural
+        test of a helper cannot see a missing caller; this asserts the caller.
+
+        The body moved to ``_run_impl`` when ``run()`` gained a guard that
+        closes the session on an unexpected exception (a crash used to look
+        identical to the process being killed). So the guard must be checked
+        too: inspecting only one of the two methods would let a refactor delete
+        the delegation and silently stop every run.
         """
         import inspect
-        src = inspect.getsource(agent.Agent.run)
-        self.assertIn("_bound_storage()", src,
+        wrapper = inspect.getsource(agent.Agent.run)
+        body = inspect.getsource(agent.Agent._run_impl)
+        self.assertIn("_run_impl(task, images)", wrapper,
+                      "run() no longer delegates -- _run_impl would never run")
+        self.assertIn("_bound_storage()", body,
                       "a run never bounds its own storage")
 
     def test_retention_runs_after_the_session_log_exists(self):
@@ -415,7 +424,7 @@ class AgentWiringTest(unittest.TestCase):
         deleted the evidence of its own failure" is not a shape worth allowing.
         """
         import inspect
-        src = inspect.getsource(agent.Agent.run)
+        src = inspect.getsource(agent.Agent._run_impl)
         self.assertLess(src.index("SessionLog("), src.index("_bound_storage()"))
 
 

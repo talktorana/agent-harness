@@ -521,6 +521,47 @@ class Agent:
     # ---------------------------------------------------------------- loop
 
     def run(self, task: str, images: Optional[List[str]] = None) -> str:
+        """``_run_impl`` with a guarantee that the session is CLOSED.
+
+        Every normal exit from the loop already calls ``session.finish``, but an
+        UNEXPECTED exception (one raised in ``_run_tool``, say, or anywhere the
+        loop does not wrap) escaped the whole method with the session still
+        open -- so the .jsonl ended with no ``session_end``.
+
+        That mattered because "no end record" is what the console uses to mean
+        "the process died", and it was also what a plain crash looked like. The
+        two are very different: one means nothing was written for a reason, the
+        other means the reason is IN the file. Closing the session on the way
+        out makes a missing end record mean exactly one thing -- the process
+        went away mid-run (a container restart, an OOM) -- which is the signal
+        that actually points at the cause.
+
+        The exception is re-raised so the caller still reports it; this only
+        makes sure the record is honest before it does.
+        """
+        try:
+            return self._run_impl(task, images)
+        except BaseException as exc:      # noqa: BLE001 - incl. KeyboardInterrupt
+            session = getattr(self, "session", None)
+            if session is not None:
+                try:
+                    self._log({"event": "crashed",
+                               "type": type(exc).__name__,
+                               "error": str(exc)[:1000]})
+                    session.event("crashed", type=type(exc).__name__,
+                                  error=str(exc)[:1000])
+                    session.finish("crashed")
+                except Exception:         # noqa: BLE001
+                    # Never let the attempt to record a crash become a second
+                    # crash; the original exception is the one worth raising.
+                    pass
+            try:
+                self._close()
+            except Exception:             # noqa: BLE001
+                pass
+            raise
+
+    def _run_impl(self, task: str, images: Optional[List[str]] = None) -> str:
         # Session record and memory come first: the model should see its own
         # notes before it acts, and the record of what it did should exist even
         # if this dies on the very first API call.

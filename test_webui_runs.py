@@ -245,6 +245,53 @@ class RunHistoryTest(TempDirs):
         self.assertEqual(row["status"], "no_end_record")
         self.assertNotEqual(row["status"], "ok")
 
+    def test_an_unfinished_run_says_what_it_was_doing(self):
+        """'no end record' alone is where an investigation stops.
+
+        The last event is what separates a container restart from a crash, and
+        it is the whole reason the four killed runs could be explained instead
+        of guessed at.
+        """
+        #: No answer: a run that died mid-work never got that far.
+        path = self.write_session(status=None, answer=None)
+        import os
+        old = (datetime.now(timezone.utc) - timedelta(hours=3)).timestamp()
+        os.utime(path, (old, old))
+        row = webui.run_summaries()[0]
+        self.assertEqual(row["last_event"], "action")
+        self.assertIn("tool call", row["died_during"])
+        self.assertIn("run_command", row["died_during"])
+        self.assertTrue(row["last_event_at"])
+
+    def test_dying_during_a_model_call_is_named_as_such(self):
+        """The live case: a file that stops on model_call stopped mid-API."""
+        path = self.sessions / "2026-11-02T04-07-54_dead0001.jsonl"
+        path.write_text("\n".join([
+            json.dumps({"event": "session_start", "at": "2026-11-02T04:07:54",
+                        "task": "a manual question"}),
+            json.dumps({"event": "model_call", "at": "2026-11-02T04:09:25",
+                        "model": "m", "attempt": 1}),
+        ]) + "\n", encoding="utf-8")
+        import os
+        old = (datetime.now(timezone.utc) - timedelta(hours=3)).timestamp()
+        os.utime(path, (old, old))
+        row = [r for r in webui.run_summaries()
+               if r["session_id"] == "dead0001"][0]
+        self.assertEqual(row["status"], "no_end_record")
+        self.assertEqual(row["last_event"], "model_call")
+        self.assertEqual(row["died_during"], "during a model call")
+
+    def test_a_finished_run_carries_no_died_during(self):
+        """The field must not appear on a run that ended properly."""
+        self.write_session(status="ok")
+        self.assertNotIn("died_during", webui.run_summaries()[0])
+
+    def test_a_crashed_run_reports_crashed_not_no_end(self):
+        """Once Agent.run closes the session on the way out, a real crash is
+        distinguishable from the process being killed."""
+        self.write_session(status="crashed")
+        self.assertEqual(webui.run_summaries()[0]["status"], "crashed")
+
     def test_a_run_still_writing_is_reported_as_running(self):
         self.write_session(status=None)
         self.assertEqual(webui.run_summaries()[0]["status"], "running")
