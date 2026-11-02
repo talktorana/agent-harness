@@ -370,18 +370,38 @@ def memory_search(pattern: str, scope: str = None,
     return _MEMORY.search(pattern, scope, max_results)
 
 
-def memory_append(scope: str, text: str, heading: str = None) -> str:
+def memory_append(scope: str = "repo", text: str = "",
+                  heading: str = None) -> str:
     """Record something durable in memory. Prepends, never overwrites.
 
     Call this BEFORE finishing whenever you learned something that would save
     time next session: a root cause, a rule, a deploy recipe, a trap that
     nearly cost money. Prefer a short titled note over a transcript -- the
     point is that the lesson stops being re-derived. Default scope is 'repo'.
+
+    WHY ``scope`` HAS A DEFAULT AND ``text`` DOES NOT LOOK LIKE IT SHOULD
+    --------------------------------------------------------------------
+    The schema lists only ``text`` as required and tells the model that scope
+    defaults to 'repo', so a model that follows the schema omits it -- and this
+    signature demanded it, so every such call died with
+    ``memory_append() missing 1 required positional argument: 'scope'``.
+
+    Found in the run transcripts 2026-11-02: eight failed memory writes across
+    the scheduled passes. The agent had *done* the work and could not record it,
+    which is the one thing its memory layer exists for, and the failure was
+    invisible in the answer because the tool error came back as text.
+
+    The body already read ``scope or "repo"``; only the signature disagreed.
+    ``text`` is defaulted for the same reason -- so a call with no usable
+    arguments gets a clear message instead of a TypeError.
     """
+    if not str(text or "").strip():
+        return ("NOT SAVED: memory_append needs 'text' (the note body). "
+                "Nothing was written.")
     return _MEMORY.append(scope or "repo", text, heading)
 
 
-def memory_revise(scope: str, old: str, new: str) -> str:
+def memory_revise(scope: str = "repo", old: str = "", new: str = "") -> str:
     """Correct an existing note in place, rather than stacking a correction
     on top of a wrong one.
 
@@ -389,18 +409,28 @@ def memory_revise(scope: str, old: str, new: str) -> str:
     Zero matches is a miss; several is a guess about which to change, and both
     are refused. Set 'new' empty to delete the matched text. A backup of the
     previous file is written alongside it first.
+
+    ``scope`` defaults to 'repo' because the schema does not list it as
+    required and the model therefore omits it. See memory_append.
     """
+    if not str(old or "").strip():
+        return "NOT DONE: memory_revise needs 'old' (the text to replace)."
     return _MEMORY.revise(scope or "repo", old, new)
 
 
-def memory_retire(scope: str, heading: str) -> str:
+def memory_retire(scope: str = "repo", heading: str = "") -> str:
     """Remove one whole titled note from a scope.
 
     Use when a note is simply wrong or superseded -- otherwise the bad
     conclusion stays in the file forever, still readable and still wrong.
     Matches the heading exactly ('#' plus the title). A backup is written
     first.
+
+    ``scope`` defaults to 'repo' because the schema does not list it as
+    required and the model therefore omits it. See memory_append.
     """
+    if not str(heading or "").strip():
+        return "NOT DONE: memory_retire needs 'heading'."
     return _MEMORY.retire(scope or "repo", heading)
 
 
