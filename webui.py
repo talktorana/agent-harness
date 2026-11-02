@@ -18,8 +18,10 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import config
 
@@ -42,6 +44,316 @@ def _render(html: str) -> str:
     base = getattr(config, "WEBUI_BASE_PATH", "")
     return html.replace(_BASE_TOKEN, base or "")
 
+
+# ======================================================== run history
+#
+# Scheduled runs happen while nobody is watching, and the console showed only
+# the task in THIS tab. So "is it running every 30 minutes?" and "what did it
+# actually do at 03:17?" were unanswerable from the UI -- the evidence existed
+# on disk and nowhere else.
+#
+# Two readers, both read-only and both bounded: a run's JSONL can be ~70 KB and
+# there are dozens, so the list reads the HEAD and TAIL of each file rather than
+# the whole thing. The detail view reads one file, on demand.
+
+def _sessions_dir() -> Path:
+    return Path(getattr(config, "SESSIONS_DIR", "") or "sessions")
+
+
+def _session_files(limit: int) -> List[Path]:
+    """Newest first. The filename starts with a sortable UTC timestamp."""
+    root = _sessions_dir()
+    try:
+        files = [p for p in root.glob("*.jsonl") if p.is_file()]
+    except OSError:
+        return []
+    files.sort(key=lambda p: p.name, reverse=True)
+    return files[:max(1, limit)]
+
+
+def _session_id(path: Path) -> str:
+    """``<stamp>_<id>.jsonl`` -> ``<id>``."""
+    stem = path.stem
+    return stem.rsplit("_", 1)[-1] if "_" in stem else stem
+
+
+def _read_lines(path: Path, limit: int, *, tail: bool) -> List[Dict[str, Any]]:
+    """Parse up to ``limit`` JSONL records from one end of a file."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    picked = lines[-limit:] if tail else lines[:limit]
+    out: List[Dict[str, Any]] = []
+    for line in picked:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue          # a record being written right now
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
+def _one_line(text: Any, limit: int = 200) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "\u2026"
+
+
+def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
+    """One row per run: when, what it was told, how it ended.
+
+    The status comes from the ``session_end`` record. Absence of one is
+    meaningful and is reported as such: a run with no end was KILLED, which is
+    exactly the case an operator needs to see and could not previously.
+    """
+    now = datetime.now(timezone.utc)
+    rows: List[Dict[str, Any]] = []
+    for path in _session_files(limit):
+        head = _read_lines(path, 3, tail=False)
+        start = next((r for r in head if r.get("event") == "session_start"), {})
+        tail = _read_lines(path, 6, tail=True)
+        end = next((r for r in reversed(tail)
+                    if r.get("event") == "session_end"), None)
+        answer = next((r for r in reversed(tail)
+                       if r.get("event") == "answer"), None)
+
+        started = start.get("at") or ""
+        if not end:
+            status = "running" if _recent(path, now) else "no_end_record"
+        else:
+            status = str(end.get("status") or "ok")
+
+        rows.append({
+            "session_id": _session_id(path),
+            "file": path.name,
+            "started": started,
+            "status": status,
+            "steps": (end or {}).get("steps"),
+            "elapsed_sec": (end or {}).get("elapsed_sec"),
+            "model": start.get("model"),
+            "prompt": str(start.get("task") or ""),
+            "prompt_preview": _one_line(start.get("task"), 140),
+            "answer_preview": _one_line((answer or {}).get("text"), 200),
+            "has_answer": bool(answer),
+        })
+    return rows
+
+
+def _recent(path: Path, now: datetime, window_sec: float = 600.0) -> bool:
+    """Was this file touched recently enough that the run may still be going?"""
+    try:
+        return (now - datetime.fromtimestamp(path.stat().st_mtime,
+                                             timezone.utc)
+                ).total_seconds() < window_sec
+    except OSError:
+        return False
+
+
+def run_detail(session_id: str) -> Optional[Dict[str, Any]]:
+    """The full prompt, every step, and the final answer of ONE run."""
+    for path in _session_files(200):
+        if _session_id(path) != session_id and path.stem != session_id:
+            continue
+        records = _read_lines(path, 100000, tail=False)
+        events: List[Dict[str, Any]] = []
+        prompt = ""
+        answer = ""
+        for record in records:
+            kind = record.get("event")
+            if kind == "session_start":
+                prompt = str(record.get("task") or "")
+                #: The start record IS the prompt; listing it as a step too
+                #: would show a phantom action before anything happened.
+                continue
+            if kind == "session_end":
+                continue
+            if kind == "answer":
+                answer = str(record.get("text") or "")
+            events.append(record)
+        return {"session_id": _session_id(path), "file": path.name,
+                "prompt": prompt, "answer": answer, "events": events}
+    return None
+
+RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>agent-harness runs</title>
+<style>
+ body{font:13px/1.5 ui-monospace,Consolas,monospace;margin:0;background:#111;
+      color:#ddd}
+ #wrap{max-width:1180px;margin:0 auto;padding:16px}
+ h3{margin:0 0 4px}
+ a{color:#7fd1ff}
+ .m{color:#888}.ok{color:#8ee08e}.bad{color:#ff9d9d}.warn{color:#ffd27f}
+ #sched{background:#181818;border:1px solid #333;border-radius:6px;padding:10px;
+        margin:12px 0}
+ #sched .row{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline}
+ .pill{padding:1px 8px;border-radius:10px;border:1px solid #444;font-size:12px}
+ .pill.on{background:#1f4d2f;border-color:#2a6}
+ .pill.off{background:#4d1f1f;border-color:#6a2a2a}
+ table{width:100%;border-collapse:collapse;margin-top:8px}
+ th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #262626;
+       vertical-align:top}
+ th{color:#888;font-weight:normal;font-size:12px}
+ tr.run{cursor:pointer}
+ tr.run:hover{background:#1a1a1a}
+ pre{white-space:pre-wrap;background:#181818;border:1px solid #333;
+     border-radius:6px;padding:10px;max-height:46vh;overflow:auto;margin:6px 0}
+ #detail{margin-top:14px}
+ .tab{display:inline-block;padding:3px 10px;border:1px solid #333;
+      border-radius:5px;cursor:pointer;margin-right:6px;font-size:12px}
+ .tab.sel{background:#2a2a2a;border-color:#555}
+ .clip{max-height:3.6em;overflow:hidden}
+</style></head><body><div id="wrap">
+<h3>agent-harness <span class="m">schedule &amp; runs</span>
+  <a href="__AGENT_BASE__/live" style="font-size:12px">live view -&gt;</a>
+  <a href="__AGENT_BASE__/" style="font-size:12px;margin-left:10px">console</a>
+</h3>
+<div id="sched" class="m">loading schedule...</div>
+<div id="err"></div>
+<table><thead><tr>
+ <th style="width:150px">started (UTC)</th><th style="width:90px">status</th>
+ <th style="width:56px">steps</th><th style="width:70px">took</th>
+ <th>prompt (scheduled runs only)</th><th>answer</th>
+</tr></thead><tbody id="runs"></tbody></table>
+<div id="detail"></div>
+<script>
+const NICE={ok:'ok',success:'ok',running:'running',no_end_record:'no end record',
+            error:'error',failed:'failed',timeout:'timeout'};
+function cls(s){return s==='ok'||s==='success'?'ok':
+                    (s==='running'?'warn':'bad');}
+function ago(iso){
+  if(!iso)return '';
+  const t=Date.parse(iso); if(isNaN(t))return iso;
+  const d=Math.max(0,Math.round((Date.now()-t)/1000));
+  if(d<60)return d+'s ago';
+  if(d<3600)return Math.round(d/60)+'m ago';
+  return Math.round(d/3600)+'h '+Math.round((d%3600)/60)+'m ago';
+}
+function secs(v){return (v==null)?'':
+  (v<60?v.toFixed(0)+'s':(v/60).toFixed(1)+'m');}
+function esc(s){return (s==null?'':String(s))
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+async function loadSchedule(){
+  let j=null;
+  try{const r=await fetch('__AGENT_BASE__/schedule');j=await r.json();}catch(e){}
+  const el=document.getElementById('sched');
+  if(!j){el.textContent='schedule unavailable (scheduler not readable here)';
+          el.className='bad';return;}
+  let h='';
+  if(j.paused){
+    h+='<div class="bad">PAUSED by an operator hold file'
+      +(j.hold&&j.hold.reason?' -- '+esc(j.hold.reason):'')
+      +(j.hold&&j.hold.since?' (since '+esc(j.hold.since)+')':'')+'</div>';
+  }
+  if(!j.jobs||!j.jobs.length){
+    h+='<div class="warn">no jobs declared in '+esc(j.schedule_file)+'</div>';
+  }
+  (j.jobs||[]).forEach(function(job){
+    const statePill=job.enabled?'<span class="pill on">enabled</span>'
+                               :'<span class="pill off">disabled</span>';
+    let next='';
+    if(job.next_due){
+      const s=job.seconds_until;
+      next='next due <b>'+(s!=null&&s>0?(s>=60?Math.round(s/60)+'m '+Math.round(s%60)+'s':
+            s+'s'):'now')+'</b> <span class="m">('+esc(job.next_due)+')</span>';
+      if(job.overdue) next+=' <span class="warn">overdue</span>';
+    }
+    h+='<div class="row"><b>'+esc(job.id)+'</b>'
+      +'<span>'+esc(job.interval)+'</span>'+statePill
+      +'<span>last run <b>'+esc(job.last_run||'never')+'</b>'
+      +(job.last_run?' <span class="m">('+ago(job.last_run)+')</span>':'')+'</span>'
+      +(job.finished?'<span>took <b>'+secs(job.duration_sec)+'</b></span>':'')
+      +(job.last_run?'<span>last outcome <span class="'+cls(job.last_ok?'ok':'bad')
+        +'">'+(job.last_ok===false?'FAILED':'ok')+'</span></span>':'')
+      +'<span>'+next+'</span></div>';
+    if(job.last_error) h+='<div class="bad">last error: '+esc(job.last_error)+'</div>';
+    h+='<div class="m" style="margin-top:4px">prompt sent each run ('
+      +job.prompt_chars+' chars): '+(job.prompt
+        ? '<span class="clip">'+esc(job.prompt_preview)+'</span>'
+        : '<span class="bad">EMPTY</span>')+'</div>';
+    if(job.prompt){
+      h+='<div><span class="tab" onclick="tog(this)">show full prompt</span>'
+        +'<div style="display:none"><pre>'+esc(job.prompt)+'</pre></div></div>';
+    }
+  });
+  el.innerHTML=h; el.className='';
+  document.getElementById('schedh').textContent='';
+}
+function tog(el){
+  const body=el.nextElementSibling;
+  const open=body.style.display!=='none';
+  body.style.display=open?'none':'block';
+  el.textContent=open?'show full prompt':'hide prompt';
+}
+
+async function loadRuns(){
+  let rows=[];
+  try{const r=await fetch('__AGENT_BASE__/runs.json');const j=await r.json();
+      rows=j.runs||[];}catch(e){
+    document.getElementById('err').innerHTML=
+      '<div class="bad">could not read runs: '+esc(e)+'</div>';return;}
+  const tb=document.getElementById('runs');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="m">'
+    +'no runs on disk yet</td></tr>';return;}
+  tb.innerHTML=rows.map(function(r){
+    return '<tr class="run" onclick="showRun(\\''+r.session_id+'\\')">'
+      +'<td>'+esc(r.started?r.started.replace('T',' ').slice(0,19):'?')
+      +'<div class="m">'+ago(r.started)+'</div></td>'
+      +'<td class="'+cls(r.status)+'">'+esc(NICE[r.status]||r.status)+'</td>'
+      +'<td>'+(r.steps==null?'':r.steps)+'</td>'
+      +'<td>'+(r.elapsed_sec==null?'':secs(r.elapsed_sec))+'</td>'
+      +'<td class="m">'+(r.prompt_preview?'<span class="clip">'
+          +esc(r.prompt_preview)+'</span>':'<span class="bad">(no prompt)</span>')
+      +'<div class="m">'+(r.model?esc(r.model):'')+'</div></td>'
+      +'<td class="m">'+(r.has_answer?esc(r.answer_preview)
+          :'<span class="warn">no answer recorded</span>')+'</td></tr>';
+  }).join('');
+}
+
+async function showRun(id){
+  const el=document.getElementById('detail');
+  el.innerHTML='<div class="m">loading '+esc(id)+'...</div>';
+  let j=null;
+  try{const r=await fetch('__AGENT_BASE__/run/'+encodeURIComponent(id));
+      j=await r.json();}catch(e){}
+  if(!j||j.error){el.innerHTML='<div class="bad">run not found: '+esc(id)
+    +'</div>';return;}
+  let h='<h3 style="margin-top:16px">run <span class="m">'+esc(j.session_id)
+    +'</span> <span class="m" style="font-size:12px">'+esc(j.file)+'</span></h3>';
+  h+='<div class="m">prompt sent to the agent</div><pre>'
+    +(j.prompt?esc(j.prompt):'<span class="bad">EMPTY</span>')+'</pre>';
+  h+='<div class="m">final answer</div><pre>'
+    +(j.answer?esc(j.answer):'<span class="warn">none recorded</span>')+'</pre>';
+  h+='<div class="m">steps and tool calls</div>';
+  (j.events||[]).forEach(function(e){
+    if(e.event==='action'){
+      h+='<div class="'+((e.ok===false)?'bad':'ok')+'">'
+        +'step '+(e.step)+'  '+esc(e.tool)
+        +(e.seconds!=null?'  '+Number(e.seconds).toFixed(1)+'s':'')+'</div>';
+      if(e.detail) h+='<div class="m">  '+esc(e.detail)+'</div>';
+      if(e.result_preview) h+='<pre style="max-height:12em">'
+        +esc(e.result_preview)+'</pre>';
+    } else if(e.event==='assistant'){
+      h+='<div class="m">says: '+esc(e.text)+'</div>';
+    } else if(e.event==='model_call'){
+      h+='<div class="m">model '+esc(e.model)+' attempt '+(e.attempt)+'</div>';
+    } else if(e.event==='api_retry'){
+      h+='<div class="warn">retry: '+esc(e.error||'')+'</div>';
+    }
+  });
+  el.innerHTML=h;
+}
+
+loadSchedule(); loadRuns();
+setInterval(loadSchedule,15000); setInterval(loadRuns,30000);
+</script></div></body></html>"""
+
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>agent-harness</title>
 <style>
@@ -60,7 +372,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  button:disabled{opacity:.4;cursor:default}
 </style></head><body><div id="wrap">
 <h3>agent-harness <span class="m" id="state"></span>
-  <a href="__AGENT_BASE__/live" style="color:#7fd1ff;font-size:12px">live view -></a></h3>
+  <a href="__AGENT_BASE__/live" style="color:#7fd1ff;font-size:12px">live view -></a>
+  <a href="__AGENT_BASE__/runs" style="color:#7fd1ff;font-size:12px;margin-left:10px">schedule &amp; runs -></a></h3>
 <div id="pick" class="m">
  <select id="prov"></select><select id="mod"></select>
  <span id="routes" style="font-size:11px"></span>
@@ -171,6 +484,7 @@ LIVE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <span class="m" id="state"></span>
  <span id="chain"></span>
  <a href="__AGENT_BASE__/" class="m">simple view</a>
+ <a href="__AGENT_BASE__/runs" class="m">schedule &amp; runs</a>
 </header>
 <div id="msgs"></div>
 <form id="f"><textarea id="q" placeholder="task... (Ctrl+Enter to send)"></textarea>
@@ -435,6 +749,43 @@ class Handler(BaseHTTPRequestHandler):
             self._send_page(PAGE)
         elif route in ("/live", "/live/"):
             self._send_page(LIVE_PAGE)
+        elif route in ("/runs", "/runs/"):
+            self._send_page(RUNS_PAGE)
+        elif route == "/schedule":
+            #: Read live rather than cached: the whole point is to see whether
+            #: the loop is alive RIGHT NOW, and a stale answer would be the
+            #: same blindness the page exists to fix.
+            import scheduler
+            try:
+                payload = scheduler.status()
+            except Exception as exc:  # noqa: BLE001
+                payload = {"error": f"{type(exc).__name__}: {exc}",
+                           "jobs": [], "paused": False}
+            self._send(200, json.dumps(payload, default=str).encode(),
+                       "application/json")
+        elif route == "/runs.json":
+            limit = 60
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for part in query.split("&"):
+                if part.startswith("limit="):
+                    try:
+                        limit = max(1, min(500, int(part.split("=", 1)[1])))
+                    except ValueError:
+                        pass
+            payload = {"runs": run_summaries(limit),
+                       "sessions_dir": str(_sessions_dir())}
+            self._send(200, json.dumps(payload, default=str).encode(),
+                       "application/json")
+        elif route.startswith("/run/"):
+            wanted = route.split("/run/", 1)[1].strip("/")
+            detail = run_detail(wanted) if wanted else None
+            if detail is None:
+                self._send(404, json.dumps(
+                    {"error": "unknown run", "session_id": wanted}
+                ).encode(), "application/json")
+            else:
+                self._send(200, json.dumps(detail, default=str).encode(),
+                           "application/json")
         elif route.startswith("/task/"):
             task_id = route.split("/task/", 1)[1]
             with _LOCK:

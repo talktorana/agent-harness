@@ -54,7 +54,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -140,6 +140,126 @@ def _job_key(job: Dict[str, Any], index: int) -> str:
     return str(ident) if ident else f"#{index}"
 
 
+def _interval_label(job: Dict[str, Any]) -> str:
+    """How often this job runs, in words a glance can read."""
+    every = job.get("every_min")
+    if every:
+        try:
+            minutes = float(every)
+        except (TypeError, ValueError):
+            return str(every)
+        if minutes >= 60 and minutes % 60 == 0:
+            return f"every {int(minutes // 60)}h"
+        return f"every {minutes:g} min"
+    if job.get("at"):
+        return f"daily at {job['at']}"
+    return "not scheduled"
+
+
+def _parse_stamp(value: Any) -> Optional[datetime]:
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return stamp
+
+
+def _comparable(stamp: Optional[datetime],
+                reference: datetime) -> Optional[datetime]:
+    """Put ``stamp`` on the same clock as ``reference`` so maths cannot raise.
+
+    The scheduler writes NAIVE local stamps (``datetime.now()``) while sessions
+    are named in UTC, so the two surfaces genuinely mix awareness. Subtracting
+    them raises ``TypeError: can't subtract offset-naive and offset-aware`` --
+    and a console that crashes on a timestamp is worse than one that shows
+    nothing, because the operator cannot even tell which surface is broken.
+    A naive stamp is read as UTC, which is exact on any host whose local time
+    is UTC (this deployment) and is the conservative reading elsewhere.
+    """
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None and reference.tzinfo is not None:
+        return stamp.replace(tzinfo=timezone.utc)
+    if stamp.tzinfo is not None and reference.tzinfo is None:
+        return stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamp
+
+
+
+def status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Everything an operator needs to see whether the loop is alive.
+
+    The console could show what happened but not WHY nothing was happening, so
+    "paused", "disabled", "running every 30 minutes" and "the scheduler is
+    wedged" all looked like an empty page. This is the single place that
+    assembles that answer, so the UI cannot drift from what the loop obeys --
+    ``_due`` decides whether a job fires, and this reports the same inputs.
+
+    ``now`` defaults to NAIVE local, matching the clock the run loop and the
+    state file use. Using UTC here instead would make ``due_now`` disagree with
+    what the loop actually does near a boundary, i.e. the view would lie about
+    the very thing it exists to show.
+    """
+    when = now or datetime.now()
+    doc = _load()
+    state = _load_state()
+    held = hold()
+    jobs: List[Dict[str, Any]] = []
+
+    for index, job in enumerate(doc.get("jobs") or []):
+        if not isinstance(job, dict):
+            continue
+        key = _job_key(job, index)
+        entry = (state.get("jobs") or {}).get(key) or {}
+        message = str(job.get("message") or "")
+        last_run = _comparable(_parse_stamp(entry.get("last_run")), when)
+        finished = _comparable(_parse_stamp(entry.get("finished")), when)
+
+        next_due: Optional[datetime] = None
+        seconds_until: Optional[float] = None
+        every = job.get("every_min")
+        if job.get("enabled", True) and every and last_run:
+            try:
+                next_due = last_run + timedelta(minutes=float(every))
+                seconds_until = (next_due - when).total_seconds()
+            except (TypeError, ValueError):
+                next_due = None
+
+        jobs.append({
+            "id": key,
+            "interval": _interval_label(job),
+            "every_min": every,
+            "enabled": bool(job.get("enabled", True)),
+            # The prompt is the thing an operator most wants to check -- "what
+            # is it actually being told to do every half hour?" -- so it is
+            # served in full, with a preview for list rendering.
+            "prompt": message,
+            "prompt_preview": " ".join(message.split())[:160],
+            "prompt_chars": len(message),
+            "last_run": entry.get("last_run"),
+            "finished": entry.get("finished"),
+            "last_ok": entry.get("last_ok"),
+            "last_error": entry.get("last_error"),
+            "next_due": next_due.isoformat() if next_due else None,
+            "seconds_until": (round(seconds_until)
+                              if seconds_until is not None else None),
+            "due_now": _due(job, when, state, key),
+            "overdue": bool(seconds_until is not None and seconds_until < 0),
+            "duration_sec": (round((finished - last_run).total_seconds(), 1)
+                             if last_run and finished else None),
+        })
+
+    return {
+        "now": when.isoformat(),
+        "schedule_file": str(config.SCHEDULE_FILE),
+        "state_file": str(config.SCHEDULE_STATE_FILE),
+        "hold": held,
+        "paused": bool(held.get("held")),
+        "jobs": jobs,
+        "any_enabled": any(j["enabled"] for j in jobs),
+    }
+
+
 def hold() -> Dict[str, Any]:
     """Whether an operator has PAUSED the mission loop, and why.
 
@@ -188,6 +308,11 @@ def _due(job: Dict[str, Any], now: datetime,
             previous = datetime.fromisoformat(str(stamp))
         except ValueError:
             return True          # unreadable stamp: fire once, then rewrite it
+        #: Normalise before subtracting. A stamp and a clock of different
+        #: awareness raise TypeError, and this function gates every run -- so a
+        #: crash here stops the mission loop entirely rather than skipping one
+        #: job. Found when the schedule view passed an aware clock.
+        previous = _comparable(previous, now) or previous
         return (now - previous).total_seconds() >= float(every) * 60
     at = job.get("at")
     if at:
