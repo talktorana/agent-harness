@@ -1209,11 +1209,24 @@ class GitMirrorTest(ApplierTestBase):
                                   "HEAD", cwd=self.mirror))
 
     # ------------------------------------------------------------------ failure
+    def reject_pushes(self):
+        """A remote that accepts fetch but refuses push.
+
+        A nonexistent URL will not do: the sync now FETCHES before committing
+        (a commit on a stale base is unpushable), so a broken remote fails at
+        the fetch and the push path is never reached. A pre-receive hook keeps
+        the fetch working and fails only the push.
+        """
+        hook = self.origin / "hooks" / "pre-receive"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\necho 'push rejected by test' >&2\nexit 1\n",
+                        encoding="utf-8")
+        hook.chmod(0o755)
+
     def test_a_failed_push_keeps_the_commit_and_still_reports_applied(self):
         """The deploy landed and was verified; a push problem must not undo it."""
-        self.git("remote", "set-url", "origin",
-                 str(Path(self.tmp.name) / "gone.git"), cwd=self.mirror)
-        receipt, _t = self.apply(policy=self.with_git(remote="origin"))
+        self.reject_pushes()
+        receipt, _t = self.apply()
         self.assertEqual(receipt["status"], "applied",
                          "a push failure must never overturn a verified deploy")
         gitinfo = receipt["git"]
@@ -1225,11 +1238,10 @@ class GitMirrorTest(ApplierTestBase):
         self.assertIn("git push origin", gitinfo["retry"])
 
     def test_a_push_that_fails_leaves_the_change_retrievable(self):
-        """The retry hint must actually work, once the remote is fixed."""
-        self.git("remote", "set-url", "origin",
-                 str(Path(self.tmp.name) / "gone.git"), cwd=self.mirror)
+        """The retry hint must actually work, once the remote accepts pushes."""
+        self.reject_pushes()
         self.apply()
-        self.git("remote", "set-url", "origin", str(self.origin), cwd=self.mirror)
+        (self.origin / "hooks" / "pre-receive").unlink()
         self.git("push", "origin", "main", cwd=self.mirror)
         self.assertEqual(
             self.git("show", "main:engine/thing.py", cwd=self.origin), "x = 1\n")
@@ -1240,8 +1252,11 @@ class GitMirrorTest(ApplierTestBase):
                         side_effect=FileNotFoundError("no git")):
             receipt, _t = self.apply()
         self.assertEqual(receipt["status"], "applied")
-        self.assertEqual(receipt["git"]["state"], "failed")
+        #: Whether it is reported as stale_mirror or failed is an implementation
+        #: detail; what matters is that the reason says git was missing and the
+        #: deploy above still succeeded.
         self.assertIn("git is not installed", receipt["git"]["reason"])
+        self.assertFalse((self.mirror / "engine").exists())
 
     # ------------------------------------------------------------------ wiring
     def test_the_receipt_on_disk_carries_the_git_verdict(self):
@@ -1308,6 +1323,67 @@ class GitMirrorTest(ApplierTestBase):
                 self.assertEqual(receipt["git"]["state"], "failed",
                                  receipt["git"])
                 self.assertIn("subdir", receipt["git"]["reason"])
+
+    # ------------------------------------------------------- stale clone
+    def another_commit_on_origin(self, name="other.py"):
+        """A human push from somewhere else, i.e. the clone falls behind."""
+        work = Path(self.tmp.name) / "someone-else"
+        self.git("clone", str(self.origin), str(work))
+        (work / name).write_text("theirs\n", encoding="utf-8")
+        self.git("-c", "user.name=h", "-c", "user.email=h@h", "add", name,
+                 cwd=work)
+        self.git("-c", "user.name=h", "-c", "user.email=h@h", "commit", "-m",
+                 "a human push", cwd=work)
+        self.git("push", "origin", "main", cwd=work)
+
+    def test_a_clone_behind_origin_is_fast_forwarded_before_committing(self):
+        """Otherwise the feature dies silently after the first human push.
+
+        A commit made on the stale base is unpushable, the push is rejected,
+        the commit is (correctly) kept, and every later attempt repeats the
+        same rejection for ever.
+        """
+        self.another_commit_on_origin()
+        receipt, _t = self.apply()
+        self.assertEqual(receipt["git"]["state"], "pushed", receipt["git"])
+        #: Both the human's commit and the deploy are on origin.
+        log = self.git("log", "--format=%s", "main", cwd=self.origin)
+        self.assertIn("a human push", log)
+        self.assertIn("agent deploy", log)
+        self.assertTrue((self.mirror / "other.py").exists(),
+                        "the clone was not brought up to date")
+
+    def test_a_diverged_clone_is_reported_not_guessed_at(self):
+        """Guessing a merge could discard a human's work; refuse and say so."""
+        self.another_commit_on_origin()
+        # Local commit in the clone that origin does not have, off the old base.
+        (self.mirror / "local-only.py").write_text("mine\n", encoding="utf-8")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "add",
+                 "local-only.py", cwd=self.mirror)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m",
+                 "local only", cwd=self.mirror)
+
+        receipt, _t = self.apply()
+        self.assertEqual(receipt["status"], "applied",
+                         "the deploy must still succeed")
+        self.assertEqual(receipt["git"]["state"], "stale_mirror", receipt["git"])
+        self.assertIn("DIVERGED", receipt["git"]["reason"])
+        #: Nothing was written into the clone and no commit was invented.
+        self.assertFalse((self.mirror / "engine" / "thing.py").exists())
+
+    def test_a_modified_tracked_file_in_the_clone_blocks_the_sync(self):
+        (self.mirror / "README.md").write_text("edited by hand\n",
+                                              encoding="utf-8")
+        receipt, _t = self.apply()
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"]["state"], "stale_mirror", receipt["git"])
+        self.assertIn("modified tracked", receipt["git"]["reason"])
+
+    def test_an_untracked_file_does_not_block_the_sync(self):
+        """A fast-forward moves HEAD; it cannot lose an untracked file."""
+        (self.mirror / "stray.log").write_text("noise\n", encoding="utf-8")
+        receipt, _t = self.apply()
+        self.assertEqual(receipt["git"]["state"], "pushed", receipt["git"])
 
 
 class ApplySemanticsTest(ApplierTestBase):

@@ -1244,6 +1244,67 @@ def _stageable(path: Path, root: Path, policy: "Policy") -> bool:
     return True
 
 
+def _refresh_mirror(mirror: Path, cfg: Dict[str, Any],
+                    ident: Dict[str, str]) -> Optional[str]:
+    """Bring the clone up to date with the remote. None = safe to commit.
+
+    Without this the feature dies quietly after the first human push: the clone
+    falls behind ``origin``, a commit is made on that stale base, the push is
+    then rejected as non-fast-forward, the commit is (correctly) kept, and
+    EVERY subsequent attempt repeats the same rejection forever. The receipt
+    would say ``committed_not_pushed`` every time and nothing would ever reach
+    the repository again.
+
+    So: fetch, and fast-forward when the clone is merely behind. Refuse to
+    proceed when it has DIVERGED or is dirty, because guessing there would risk
+    discarding work -- ``stale_mirror`` is reported instead, and the deploy
+    itself is unaffected either way.
+    """
+    remote, branch = cfg["remote"], cfg["branch"]
+    rc, out = _git(mirror, ["fetch", "--quiet", "--prune", remote],
+                   cfg["timeout_sec"], ident)
+    if rc != 0:
+        return (f"cannot reach {remote} to refresh the clone (rc={rc}): "
+                f"{out[-200:]}. Committing here could create an unpushable "
+                f"commit, so the sync is deferred.")
+    if not branch:
+        # Nothing to compare against; the push will report its own verdict.
+        return None
+
+    upstream = f"{remote}/{branch}"
+    rc, _out = _git(mirror, ["rev-parse", "--verify", "--quiet", upstream],
+                    cfg["timeout_sec"], ident)
+    if rc != 0:
+        return f"{upstream} does not exist; check git.branch and git.remote"
+
+    #: ``--untracked-files=no``: a fast-forward only moves HEAD, so an untracked
+    #: file cannot be lost by it. Treating one as a blocker would stop the sync
+    #: whenever anything stray sits in the clone -- which, on a host that has
+    #: been running for a while, is most of the time.
+    rc, dirty = _git(mirror, ["status", "--porcelain", "--untracked-files=no"],
+                     cfg["timeout_sec"], ident)
+    if rc == 0 and dirty.strip():
+        return (f"the clone has {len(dirty.splitlines())} modified tracked "
+                f"path(s); refusing to move it under someone else's edits")
+
+    behind, _ = _git(mirror, ["merge-base", "--is-ancestor", "HEAD", upstream],
+                     cfg["timeout_sec"], ident)
+    if behind == 0:
+        rc, out = _git(mirror, ["merge", "--ff-only", upstream],
+                       cfg["timeout_sec"], ident)
+        if rc != 0:
+            return f"fast-forward to {upstream} failed (rc={rc}): {out[-200:]}"
+        return None
+
+    ahead, _ = _git(mirror, ["merge-base", "--is-ancestor", upstream, "HEAD"],
+                    cfg["timeout_sec"], ident)
+    if ahead == 0:
+        # Our own earlier unpushed commits: a plain push carries them.
+        return None
+    return (f"the clone has DIVERGED from {upstream}; a push would be rejected "
+            f"and guessing a merge could discard work. Needs a human.")
+
+
 def sync_applied_files(targets: List[Path], root: Path, *,
                        policy: "Policy", rid: str,
                        purpose: Optional[str] = None) -> Dict[str, Any]:
@@ -1293,6 +1354,16 @@ def sync_applied_files(targets: List[Path], root: Path, *,
                 "skipped": skipped}
 
     ident = {"user_name": cfg["user_name"], "user_email": cfg["user_email"]}
+
+    #: Must happen BEFORE anything is written: a commit on a stale base is
+    #: unpushable, and every later attempt would repeat the same rejection.
+    stale = _refresh_mirror(mirror, cfg, ident)
+    if stale:
+        return {"state": "stale_mirror", "mirror": str(mirror),
+                "reason": stale,
+                "retry": f"cd {mirror} && git fetch {cfg['remote']} && "
+                         f"git status"}
+
     copied: List[str] = []
     for src in rels:
         rel = src.resolve().relative_to(root.resolve())
