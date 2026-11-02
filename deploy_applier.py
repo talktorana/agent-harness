@@ -557,8 +557,31 @@ def gate_schema(req: Dict[str, Any],
             f"schema_version must be {SCHEMA_VERSION}, got "
             f"{req.get('schema_version')!r}")
     files = req.get("files")
-    if not isinstance(files, list) or not files:
-        raise Refused("'files' must be a non-empty list")
+    #: A REBUILD-ONLY REQUEST is a real request, and the deployment could not
+    #: express one until 2026-11-02.
+    #:
+    #: Every file on the host already matched the repo, but the running image
+    #: predated them -- the "stale image" case. The monitoring pass could see
+    #: it perfectly well and could not act: a request needs files, and it had
+    #: no file to change. So the finding reappeared pass after pass while
+    #: `restart_services` -- which already runs ``docker compose build`` -- sat
+    #: one gate away, unused. A capability nobody can reach is not a capability.
+    #:
+    #: So an EMPTY file list is permitted when, and only when, the request
+    #: names at least one service. That keeps the original rule intact for the
+    #: dangerous direction: "a deploy that writes nothing AND asks for nothing
+    #: is not a deploy" still refuses, because there is then nothing to do.
+    #: Written as ``files is None`` rather than falsy so a malformed value
+    #: still fails loudly instead of being read as "no files".
+    services = req.get("services")
+    wants_service = isinstance(services, list) and bool(
+        [s for s in services if str(s).strip()])
+    if files is None and wants_service:
+        files = []
+    if not isinstance(files, list) or (not files and not wants_service):
+        raise Refused(
+            "'files' must be a non-empty list (or an empty list together with "
+            "a non-empty 'services' list, for a rebuild-only request)")
     pairs: List[Tuple[str, Any]] = []
     for i, entry in enumerate(files):
         if not isinstance(entry, dict):
@@ -1043,7 +1066,70 @@ def restart_services(services: List[str], root: Path,
                         "output": tail[-600:]})
             if rc != 0:
                 return out
+        _record_image_stamp(root, svc, out)
     return out
+
+
+#: Where the build stamp is published so the READ-ONLY sidecar can read it.
+#:
+#: WHY THIS EXISTS (2026-11-02). The agent could see the deployment tree (the
+#: files) and had no way to see whether the RUNNING image was built from them --
+#: no docker, no socket. So "the image is stale" was a fact it could only
+#: inherit from an earlier pass, never measure, and the item circulated for days.
+#: A fix landed here every pass; the diagnosis did not.
+#:
+#: The mounted tree is one of the roots this applier writes into, so a stamp
+#: dropped beside the outbox is visible to the agent at no extra privilege. It
+#: records what the image was built FROM (host file hashes at build time), which
+#: is the only thing that settles the question: if the tree has moved on since,
+#: the image is behind, and the sidecar can prove it by hashing the same paths.
+IMAGE_STAMP_NAME = "image_state.json"
+
+
+def _record_image_stamp(root: Path, service: str,
+                        results: List[Dict[str, Any]]) -> None:
+    """Record which host files the just-built image was built from.
+
+    Best-effort by design: a build that SUCCEEDED must not be reported as failed
+    because this bookkeeping could not be written. The absence of a stamp reads
+    as "unknown", and unknown must never read as "fresh" -- so the file also
+    carries the build time, and a reader that finds no stamp for a service says
+    so instead of assuming parity.
+    """
+    try:
+        stamp_path = Path(root) / "data" / "deploy" / IMAGE_STAMP_NAME
+        stamp = {}
+        if stamp_path.is_file():
+            try:
+                stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stamp = {}
+        built_from: Dict[str, str] = {}
+        for rel in ("engine", "strategies", "dashboard"):
+            base = Path(root) / rel
+            if not base.is_dir():
+                continue
+            for path in sorted(base.rglob("*.py")):
+                if "__pycache__" in path.parts:
+                    continue
+                try:
+                    built_from[path.relative_to(root).as_posix()] = \
+                        sha256_bytes(path.read_bytes())
+                except OSError:
+                    continue
+        stamp[service] = {
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "built_from": built_from,
+            "commands": [r.get("cmd") for r in results
+                         if r.get("service") == service],
+        }
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = stamp_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(stamp, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, stamp_path)
+    except Exception:  # noqa: BLE001 - bookkeeping must never fail a build
+        pass
 
 
 # ============================================================== typed actions

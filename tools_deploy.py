@@ -815,6 +815,12 @@ def deploy_request(purpose: str,
     and reports its verdict in a receipt. In ``direct`` mode the same applier
     is invoked here, with identical gates.
 
+    A REBUILD-ONLY request is ``files=[]`` plus ``services=[...]``: no file
+    changes, the host just runs ``docker compose build`` and recreates those
+    services. Use it when the deployment tree is already correct and the
+    RUNNING image is stale -- the one repair a read-only sidecar can diagnose
+    but could not previously express. See ``compose_deploy_request``.
+
     ``dry_run`` rehearses the whole thing -- every gate evaluated, a receipt
     written, nothing changed. Use it to prove a change before anything live is
     at risk; for an action it also reveals whether the deployment accepts the
@@ -840,8 +846,16 @@ def deploy_request(purpose: str,
                 "also try to edit the file it comes from.")
     else:
         targets = ", ".join(str(f.get("target")) for f in request["files"])
-        header = (f"{staged}\n  purpose: {request['purpose']}\n"
-                  f"  targets: {targets}\n  mode: {config.DEPLOY_MODE}")
+        if targets:
+            header = (f"{staged}\n  purpose: {request['purpose']}\n"
+                      f"  targets: {targets}\n  mode: {config.DEPLOY_MODE}")
+        else:
+            #: REBUILD-ONLY. Say so explicitly: the receipt for this request
+            #: has an empty ``files`` list, and a reader who is not told why
+            #: reads that as a broken request rather than a deliberate one.
+            header = (f"{staged}\n  purpose: {request['purpose']}\n"
+                      f"  targets: (none -- rebuild only)\n"
+                      f"  mode: {config.DEPLOY_MODE}")
         tail = ""
     if services:
         header += f"\n  services to restart: {', '.join(services)}"

@@ -27,6 +27,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+#: The module itself, as well as the names above: one test replaces
+#: ``restart_services`` to prove the build leg is actually driven, and that
+#: needs the module object rather than a copied reference.
+import deploy_applier  # noqa: E402
+
 from deploy_applier import (  # noqa: E402
     REQUEST_SUFFIX,
     MAX_FAILED_ATTEMPTS,
@@ -202,6 +207,216 @@ class ApplierTestBase(unittest.TestCase):
                 "status_path": self.status}
         opts.update(kw)
         return handle_request(path, self.outbox, self.root, **opts)
+
+
+class RebuildOnlyRequestTest(ApplierTestBase):
+    """A stale-image repair must be expressible: services, and no files.
+
+    WHY THIS EXISTS (2026-11-02, live). The deployment tree on the host matched
+    the repo byte for byte, and the RUNNING image still predated those files. A
+    monitoring pass could see that perfectly well and could not act on it: a
+    request had to carry at least one file, and there was no file left to
+    change. So the same finding was re-reported pass after pass -- "the image
+    has not been rebuilt" -- while ``restart_services``, which already runs
+    ``docker compose build``, sat one gate away and unused.
+
+    A capability that cannot be reached is not a capability. This pins both
+    directions:
+
+      * services + no files  -> ALLOWED, and it actually builds;
+      * no services + no files -> still REFUSED, because that request asks for
+        nothing, and "a deploy that writes nothing" must stay a mistake.
+    """
+
+    def stage_rebuild(self, services, rid="req-rebuild"):
+        req = {
+            "schema_version": 1,
+            "id": rid,
+            "purpose": "rebuild the stale image; the tree is already correct",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "files": [],
+            "services": list(services),
+        }
+        path = self.outbox / f"{rid}{REQUEST_SUFFIX}"
+        path.write_text(json.dumps(req), encoding="utf-8")
+        return path
+
+    def test_a_request_with_no_files_and_no_services_is_still_refused(self):
+        """The original rule survives: nothing to do is not a deploy."""
+        path, _req = self.stage([])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("non-empty", json.dumps(receipt))
+
+    def test_a_services_only_request_is_accepted(self):
+        """No files is legal when a service is named -- that IS the work."""
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=False)
+        self.assertEqual(receipt["status"], "applied", receipt)
+        self.assertEqual(receipt["files"], [],
+                         "a rebuild changes no file, and the receipt must say "
+                         "so rather than implying one was written")
+
+    def test_the_services_only_request_actually_reaches_compose(self):
+        """Reaching the gate is not the fix; running compose is.
+
+        The fixture root holds no compose file, so ``docker compose`` fails --
+        which is exactly what makes this a useful assertion: the call is made
+        with the right arguments, and its failure is REPORTED. A test that
+        only checked ``status != refused`` would pass on a stub that never
+        spawned anything.
+        """
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=True)
+        restart = receipt.get("restart") or []
+        self.assertTrue(restart, "no restart was attempted: %r" % (receipt,))
+        cmds = [r.get("cmd") for r in restart]
+        self.assertIn("build svc-a", cmds,
+                      "the build leg is the whole point of this request: %r"
+                      % (cmds,))
+
+    def test_a_failed_build_is_never_reported_as_applied(self):
+        """The failure has to surface, or the pass thinks the image is fresh.
+
+        This is the failure mode the whole feature exists to prevent: a receipt
+        that says ``applied`` for a rebuild that did not happen would let the
+        next pass re-report "image stale" with a green receipt beside it.
+        """
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=True)
+        self.assertEqual(receipt["status"], "failed", receipt)
+        self.assertIn("service restart failed", receipt["reason"])
+        rows = receipt.get("restart") or []
+        self.assertTrue(rows and rows[0].get("rc") not in (0, None),
+                        "the failing rc must be on the receipt: %r" % (rows,))
+
+    def test_a_successful_build_runs_build_then_up_in_that_order(self):
+        """Order is load-bearing: ``up`` before ``build`` starts the OLD image."""
+        calls = []
+
+        def fake_restart(services, root, timeout):
+            calls.append(list(services))
+            return [{"service": s, "cmd": "build " + s, "rc": 0}
+                    for s in services] + [
+                        {"service": s, "cmd": "up -d --no-deps " + s, "rc": 0}
+                        for s in services]
+
+        original = deploy_applier.restart_services
+        deploy_applier.restart_services = fake_restart
+        try:
+            path = self.stage_rebuild(["svc-a"])
+            receipt = self.handle(path, allow_restart=True)
+        finally:
+            deploy_applier.restart_services = original
+        self.assertEqual(receipt["status"], "applied", receipt)
+        self.assertEqual(calls, [["svc-a"]])
+        cmds = [r["cmd"] for r in receipt["restart"]]
+        self.assertEqual(cmds, ["build svc-a",
+                                "up -d --no-deps svc-a"])
+
+    def test_a_request_that_omits_files_entirely_still_works_for_a_rebuild(self):
+        """`files` absent, not merely empty.
+
+        A caller that has no payloads has no reason to write the key at all, and
+        an older agent build may omit it. Read as ``files is None`` rather than
+        falsy so a malformed value (a string, a dict) still fails loudly
+        instead of being silently treated as "no files".
+        """
+        req = {
+            "schema_version": 1,
+            "id": "req-nofiles",
+            "purpose": "rebuild only",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "services": ["svc-a"],
+        }
+        path = self.outbox / f"req-nofiles{REQUEST_SUFFIX}"
+        path.write_text(json.dumps(req), encoding="utf-8")
+        receipt = self.handle(path, allow_restart=False)
+        self.assertEqual(receipt["status"], "applied", receipt)
+        self.assertEqual(receipt["files"], [])
+
+    def test_a_malformed_files_value_is_still_refused_even_with_services(self):
+        """The relaxation must not become a hole: a string is not a file list."""
+        req = {
+            "schema_version": 1,
+            "id": "req-malformed",
+            "purpose": "rebuild only",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "files": "engine/mod.py",
+            "services": ["svc-a"],
+        }
+        path = self.outbox / f"req-malformed{REQUEST_SUFFIX}"
+        path.write_text(json.dumps(req), encoding="utf-8")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "refused", receipt)
+        self.assertIn("files", json.dumps(receipt))
+
+    def test_a_successful_build_publishes_what_it_built_from(self):
+        """The agent cannot see the image, so the build must publish its basis.
+
+        Without this, "the image is stale" is a fact a pass can only INHERIT
+        from an earlier pass. With it, the sidecar hashes the same paths in the
+        mounted tree and can prove staleness -- or prove the absence of it.
+
+        ``run_command`` is patched rather than ``restart_services``: patching
+        the latter would let the test pass with the stamp call deleted from the
+        real function, which is exactly the wiring worth checking.
+        """
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        seen = []
+
+        def fake_run(cmd, cwd, timeout):
+            seen.append(" ".join(cmd))
+            return 0, "ok"
+
+        original = deploy_applier.run_command
+        deploy_applier.run_command = fake_run
+        try:
+            rows = deploy_applier.restart_services(["svc-a"],
+                                                   self.root, 20.0)
+        finally:
+            deploy_applier.run_command = original
+
+        self.assertEqual(seen, ["docker compose build svc-a",
+                                "docker compose up -d --no-deps svc-a"],
+                         "order is load-bearing: up before build starts the OLD "
+                         "image")
+        self.assertTrue(all(r["rc"] == 0 for r in rows))
+        stamp_path = self.root / "data" / "deploy" / deploy_applier.IMAGE_STAMP_NAME
+        self.assertTrue(stamp_path.is_file(), "no stamp was published")
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        self.assertIn("svc-a", stamp)
+        entry = stamp["svc-a"]
+        self.assertIn("built_at", entry)
+        recorded = entry["built_from"]
+        self.assertIn("engine/mod.py", recorded)
+        #: The recorded hash must be the REAL one, or the comparison the agent
+        #: performs would report staleness on a fresh image.
+        self.assertEqual(recorded["engine/mod.py"],
+                         sha256_bytes((self.root / "engine" / "mod.py")
+                                      .read_bytes()))
+
+    def test_the_stamp_accumulates_per_service_rather_than_resetting(self):
+        """Building service B must not erase what was recorded for A."""
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        for svc in ("svc-a", "svc-b"):
+            deploy_applier._record_image_stamp(
+                self.root, svc, [{"service": svc, "cmd": "build " + svc,
+                                  "rc": 0}])
+        stamp = json.loads((self.root / "data" / "deploy"
+                            / deploy_applier.IMAGE_STAMP_NAME).read_text(
+                                encoding="utf-8"))
+        self.assertEqual(sorted(stamp), ["svc-a", "svc-b"])
+
+    def test_without_allow_restart_a_rebuild_request_says_so(self):
+        """Never a silent success: the receipt must state the restart was skipped."""
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=False)
+        self.assertNotIn("restart", receipt)
+        self.assertIn("restart_skipped", receipt)
+        self.assertIn("--allow-restart", receipt["restart_skipped"])
 
 
 class TypedActionTest(ApplierTestBase):
