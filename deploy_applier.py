@@ -1628,6 +1628,60 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             _quarantine_refused(path, outbox)
         return json.loads(receipt.read_text(encoding="utf-8"))
 
+    #: NOTHING TO DO is reported honestly, and skips the expensive half.
+    #:
+    #: Live 2026-11-02: the agent re-proposed a collector fix that was ALREADY
+    #: deployed. Both staged files were byte-identical to the live ones, yet the
+    #: applier rewrote them, ran a ~90 s verification in a container, hit a
+    #: pre-existing failing test, restored the originals and reported "failed"
+    #: -- then retried every three minutes until the request aged out. Fifteen
+    #: minutes of write/verify/restore churn on production files for a change
+    #: that could not have changed anything.
+    #:
+    #: The status stays ``applied`` because that is the established contract for
+    #: re-applying identical content (the git mirror already reports
+    #: ``no_change`` for exactly this case, and consumers key off the status),
+    #: but the receipt now says so and verification is skipped: running a
+    #: verifier against code the request did not change tests the DEPLOYMENT,
+    #: not the proposal, and its verdict then gets attached to the wrong thing.
+    #:
+    #: A request whose files are all identical but which ASKS FOR A RESTART is
+    #: NOT a no-op -- restarting is its whole intent -- so services disqualify
+    #: the shortcut.
+    unchanged: List[str] = []
+    for target, (_pname, payload) in zip(targets, pairs):
+        try:
+            if Path(target).read_bytes() == payload:
+                unchanged.append(str(target))
+        except OSError:
+            continue          # unreadable or absent: that IS a change to make
+    if (targets and len(unchanged) == len(targets)
+            and not (req.get("services") or [])):
+        receipt = write_receipt(
+            outbox, path, "applied",
+            "every staged file already matches the deployment byte for byte, "
+            "so nothing was written and verification was skipped -- the change "
+            "this request describes is already live. Re-stage only if the "
+            "intent has moved on.",
+            {"id": rid, "purpose": req.get("purpose"), "changed": False,
+             "files": unchanged, "verify_skipped": "no staged file differs "
+             "from the deployment", "dry_run": dry_run,
+             #: The git mirror is synced HERE TOO, rather than reporting
+             #: "no_change" by hand: re-applying identical content already has a
+             #: documented contract (`git.state == "no_change"`, no empty
+             #: commit), and this path must not be the one place that invents a
+             #: different answer. It also keeps the mirror honest if a previous
+             #: apply's push had failed.
+             "git": sync_applied_files(targets, root, policy=policy, rid=rid,
+                                       purpose=req.get("purpose"))},
+            dry_run=dry_run)
+        if not dry_run:
+            done_dir = outbox / "applied"
+            done_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(done_dir / path.name))
+            _move_staged_siblings(path, outbox, done_dir)
+        return json.loads(receipt.read_text(encoding="utf-8"))
+
     plan = {
         "id": rid,
         "purpose": req.get("purpose"),

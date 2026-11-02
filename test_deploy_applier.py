@@ -1444,6 +1444,84 @@ class ApplySemanticsTest(ApplierTestBase):
         self.assertEqual(target.read_text(encoding="utf-8"), "original\n",
                          "the last attempt must still restore the original")
 
+    def test_a_request_that_changes_nothing_is_not_verified_or_retried(self):
+        """A no-op must be REPORTED as one, not written, verified and failed.
+
+        Live 2026-11-02: the agent re-proposed a collector fix that was already
+        deployed, so both staged files were byte-identical to the live ones. The
+        applier rewrote them, ran a ~90 s verification, hit a pre-existing
+        failing test, restored the originals and said "failed" -- then retried
+        every three minutes until the request aged out. The gate was reporting a
+        problem with the patch when the truth was that there was no patch.
+
+        The verify command below is deliberately one that FAILS (exit 7): if the
+        no-op short-circuit ever stops running before verification, this test
+        goes red instead of silently passing on a green verifier.
+        """
+        target = self.root / "engine" / "same.py"
+        payload = "unchanged content\n"
+        #: write_bytes, not write_text: on Windows write_text translates \n to
+        #: CRLF, the staged payload is LF, and the fixture would then be testing
+        #: a genuine byte difference instead of a no-op.
+        target.write_bytes(payload.encode("utf-8"))
+        path, _ = self.stage([{"target": "engine/same.py", "payload": payload}],
+                             id="req-noop", verify_command="exit 7")
+
+        receipt = self.handle(path)
+
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertFalse(receipt.get("changed"),
+                         "the receipt must say that nothing changed")
+        self.assertIn("already matches the deployment", receipt["reason"])
+        self.assertIn("verify_skipped", receipt)
+        self.assertNotIn("verify_rc", receipt,
+                         "a request with nothing to write must not run a "
+                         "verifier against code it did not change")
+        #: Consumed, not left pending: otherwise it retries forever, which is
+        #: the churn this shortcut exists to prevent.
+        self.assertFalse(path.exists())
+        self.assertTrue((self.outbox / "applied" / path.name).is_file())
+        self.assertFalse((self.outbox / "backups" / "req-noop").exists(),
+                         "nothing was written, so nothing needed a backup")
+        self.assertEqual(target.read_bytes(), payload.encode("utf-8"))
+
+    def test_identical_files_with_a_restart_request_is_still_a_restart(self):
+        """The shortcut must not swallow the one intent it cannot express.
+
+        "No file changed" is not "nothing to do" when the request asks for a
+        service restart: restarting IS its purpose. Skipping it would consume
+        the request and report success without doing the only thing it wanted.
+        """
+        target = self.root / "engine" / "same3.py"
+        payload = "identical\n"
+        target.write_bytes(payload.encode("utf-8"))
+        path, _ = self.stage([{"target": "engine/same3.py", "payload": payload}],
+                             id="req-restart-only", services=["engine"],
+                             verify_command="exit 7")
+        receipt = self.handle(path)
+        #: It must NOT take the no-op path: with a failing verifier that means
+        #: the normal path ran, i.e. the restart was not skipped.
+        self.assertEqual(receipt["status"], "failed", receipt.get("reason"))
+        self.assertIn("verification failed", receipt["reason"])
+
+    def test_a_partly_identical_request_is_still_applied(self):
+        """The short-circuit must require EVERY target to match.
+
+        A request usually carries the fix AND its test; one of them matching the
+        deployment already is normal and must not suppress the other.
+        """
+        same = self.root / "engine" / "same2.py"
+        same.write_bytes(b"already here\n")
+        changed = self.root / "engine" / "changed2.py"
+        changed.write_text("old\n", encoding="utf-8")
+        path, _ = self.stage(
+            [{"target": "engine/same2.py", "payload": "already here\n"},
+             {"target": "engine/changed2.py", "payload": "new\n"}],
+            id="req-mixed")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual(changed.read_text(encoding="utf-8"), "new\n")
+
     def test_a_verifier_that_could_not_run_is_not_reported_as_test_failure(self):
         """127/126 mean the shell never reached the verifier.
 
