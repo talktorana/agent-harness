@@ -2109,7 +2109,13 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         #: looking for it -- the confident-wrong-line failure this deployment
         #: keeps paying for.
         if not targets and services:
-            rebuilt = [r.get("service") for r in (plan.get("restart") or [])]
+            #: DEDUPE, because ``restart`` holds TWO rows per service (the build
+            #: and the recreate). A naive read produced "the RUNNING IMAGE of
+            #: market-collector, market-collector was rebuilt" on the first live
+            #: receipt -- harmless, but it reads as a bug in the deploy rather
+            #: than a quirk of the receipt.
+            rebuilt = list(dict.fromkeys(
+                r.get("service") for r in (plan.get("restart") or [])))
             if rebuilt:
                 reason = ("all gates passed and the RUNNING IMAGE of "
                           + ", ".join(str(s) for s in rebuilt)

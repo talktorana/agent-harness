@@ -440,7 +440,11 @@ class RebuildOnlyRequestTest(ApplierTestBase):
                          "no payload was written for a fileless request: %r"
                          % (reason,))
         self.assertIn("NO FILES WERE WRITTEN", reason)
-        self.assertIn("svc-a", reason)
+        #: `restart` carries TWO rows per service (build + up), so a naive read
+        #: of the service names printed the same name twice on the first live
+        #: receipt.
+        self.assertEqual(reason.count("svc-a"), 1,
+                         "the service name must appear once: %r" % (reason,))
 
     def test_a_failed_rebuild_does_not_claim_files_were_applied(self):
         """The failure path had the same untruth, and it matters more.
