@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deploy_applier import (  # noqa: E402
     REQUEST_SUFFIX,
+    MAX_FAILED_ATTEMPTS,
     ApplierLock,
     DeployError,
     PendingWindow,
@@ -1398,6 +1399,50 @@ class ApplySemanticsTest(ApplierTestBase):
         self.assertIn("verification failed", receipt["reason"])
         self.assertEqual(target.read_text(encoding="utf-8"), "original\n",
                          "a failed verification must not leave the change in")
+
+    def test_a_failed_verification_still_retries_then_stops(self):
+        """Bounded retries: a flaky verifier deserves a second look, not fifty.
+
+        Live 2026-11-02: a request whose verify failed retried every three
+        minutes -- each pass backing up production code, writing the payload
+        over it, running a ~90 s verification and restoring the original -- and
+        only stopped when the request aged past the 15-minute window. Nothing
+        counted the attempts, so the loop was bounded by the AGE gate by
+        accident.
+        """
+        target = self.root / "engine" / "retry.py"
+        target.write_text("original\n", encoding="utf-8")
+        path, _ = self.stage([{"target": "engine/retry.py",
+                               "payload": "replacement\n"}],
+                             id="req-retry", verify_command="exit 7")
+        first = self.handle(path)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["attempts"], 1)
+        self.assertNotIn("quarantined", first,
+                         "one failure is usually a flaky verifier: retry it")
+        self.assertTrue(path.exists(),
+                        "the request must stay pending after one failure")
+        self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+
+        second = self.handle(path)
+        self.assertEqual(second["attempts"], 2)
+        self.assertTrue(path.exists())
+
+        third = self.handle(path)
+        self.assertEqual(third["status"], "failed")
+        self.assertEqual(third["attempts"], MAX_FAILED_ATTEMPTS)
+        self.assertTrue(third.get("quarantined"),
+                        "the exhausted request must be marked in its receipt")
+        self.assertIn("Giving up after", third["reason"])
+        self.assertIn("re-stage", third["reason"])
+        self.assertFalse(
+            path.exists(),
+            "an exhausted request must leave the pending set, or every pass "
+            "rewrites and restores the deployment's files again")
+        self.assertTrue((self.outbox / "refused" / path.name).is_file(),
+                        "nothing is deleted -- re-staging starts by hand")
+        self.assertEqual(target.read_text(encoding="utf-8"), "original\n",
+                         "the last attempt must still restore the original")
 
     def test_a_verifier_that_could_not_run_is_not_reported_as_test_failure(self):
         """127/126 mean the shell never reached the verifier.

@@ -1674,11 +1674,14 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
                 else:
                     reason = (f"verification failed (rc={rc}); originals "
                               f"restored")
-                receipt = write_receipt(
-                    outbox, path, "failed", reason,
+                #: BOUNDED retries: a verification failure used to leave the
+                #: request pending forever, rewriting and restoring the
+                #: deployment's files on every pass. See _record_failure.
+                return _record_failure(
+                    outbox, path, reason,
                     {**plan, "verify_rc": rc, "verify_command": verify,
-                     "verify_output": tail, "backups": made})
-                return json.loads(receipt.read_text(encoding="utf-8"))
+                     "verify_output": tail, "backups": made},
+                    dry_run=dry_run)
             plan["verify_rc"] = rc
             plan["verify_command"] = verify
             plan["verify_output"] = tail[-800:]
@@ -1688,12 +1691,11 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             plan["restart"] = restart_services(services, root, test_timeout)
             if any(r.get("rc") not in (0, None) or r.get("error")
                    for r in plan["restart"]):
-                receipt = write_receipt(
-                    outbox, path, "failed",
+                return _record_failure(
+                    outbox, path,
                     "files applied but a service restart failed; inspect the "
                     "receipt before retrying",
-                    {**plan, "backups": made})
-                return json.loads(receipt.read_text(encoding="utf-8"))
+                    {**plan, "backups": made}, dry_run=dry_run)
         elif services:
             plan["restart_skipped"] = (
                 "run with --allow-restart to rebuild/recreate these services")
@@ -1729,12 +1731,12 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             restored = True
         except Exception:  # noqa: BLE001
             restored = False
-        receipt = write_receipt(
-            outbox, path, "failed",
+        return _record_failure(
+            outbox, path,
             f"{type(exc).__name__}: {exc}"
             + ("" if restored else " [RESTORE FAILED - inspect backups]"),
-            {**plan, "backups": made, "restored": restored})
-        return json.loads(receipt.read_text(encoding="utf-8"))
+            {**plan, "backups": made, "restored": restored},
+            dry_run=dry_run)
 
 
 def pending_requests(outbox: Path) -> List[Path]:
@@ -1742,6 +1744,70 @@ def pending_requests(outbox: Path) -> List[Path]:
         return []
     return sorted(p for p in outbox.glob(f"*{REQUEST_SUFFIX}")
                   if p.is_file() and not p.name.startswith("."))
+
+
+#: How many times one request may FAIL verification before it is quarantined.
+#:
+#: A "failed" verdict is the one outcome this applier had no policy for. The
+#: gates distinguish a permanent refusal (quarantined: wrong forever) from a
+#: closed readiness window (kept pending: the world changes), but a verification
+#: failure was left in the pending set and simply retried -- forever.
+#:
+#: Live 2026-11-02: a request whose verify failed because the SUITE was not
+#: hermetic (a stub shared /tmp/closed_contract_realized.json) retried every
+#: three minutes. Each retry backed up production code, WROTE the payload over
+#: it, ran a ~90 s verification in a container, and restored the original -- on
+#: the live tree the collector boots from. It only stopped when the request aged
+#: past the 15-minute window and was refused as stale, i.e. by accident.
+#:
+#: Three attempts because the two things it distinguishes are real: a flaky
+#: verifier often passes on a retry, and a genuinely bad patch never does. After
+#: that the request moves to refused/ WITH its payloads, so nothing is lost and
+#: re-staging is the documented way to try again.
+MAX_FAILED_ATTEMPTS = max(1, int(os.environ.get("AGENT_DEPLOY_MAX_ATTEMPTS", "3")))
+
+
+def _failed_attempts(outbox: Path, request_path: Path) -> int:
+    """How many times this request has already failed. Never raises."""
+    try:
+        doc = json.loads((outbox / _receipt_name(request_path))
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    try:
+        return int(doc.get("attempts") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_failure(outbox: Path, request_path: Path, reason: str,
+                    extra: Optional[Dict[str, Any]] = None,
+                    dry_run: bool = False) -> Dict[str, Any]:
+    """Write a failed receipt, and quarantine the request once retries are spent.
+
+    Counting attempts is what turns an unbounded retry loop into a bounded one.
+    The count lives in the receipt it is about to overwrite, so no new state file
+    is invented and a receipt written by an older applier simply reads as zero
+    attempts.
+    """
+    attempts = _failed_attempts(outbox, request_path) + 1
+    exhausted = attempts >= MAX_FAILED_ATTEMPTS
+    detail: Dict[str, Any] = {"attempts": attempts,
+                              "max_attempts": MAX_FAILED_ATTEMPTS}
+    detail.update(extra or {})
+    if exhausted:
+        detail["quarantined"] = True
+        reason = (f"{reason}. Giving up after {attempts} attempt(s) of "
+                  f"AGENT_DEPLOY_MAX_ATTEMPTS={MAX_FAILED_ATTEMPTS}: this "
+                  f"request has failed verification every time, so retrying it "
+                  f"again would rewrite the deployment's files and restore them "
+                  f"on every pass. The request and its payloads are in "
+                  f"outbox/refused/ -- fix the cause and re-stage.")
+    receipt = write_receipt(outbox, request_path, "failed", reason, detail,
+                            dry_run=dry_run)
+    if exhausted and not dry_run:
+        _quarantine_refused(request_path, outbox)
+    return json.loads(receipt.read_text(encoding="utf-8"))
 
 
 def check_outbox_writable(outbox: Path) -> None:
