@@ -13,8 +13,10 @@ route exists. A page that 200s with an empty table fixes nothing.
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -554,6 +556,92 @@ class HandlerRouteTest(TempDirs):
                 status, body = self.get(path)
                 self.assertEqual(status, 200)
                 self.assertIn("agent-harness", body)
+
+
+class TwoVerdictsOnOneQuestionTest(unittest.TestCase):
+    """The console publishes BOTH answers to "is a run live?", because they differ.
+
+    The two are computed from different evidence and CAN disagree:
+
+      this page    a run is live while its session file was touched in the last
+                   600 s (``_recent``)
+      scheduler    a run is live while last_run has no matching finished
+
+    A run here lasts 383-470 s, so a FINISHED run keeps reading as ``running``
+    for minutes afterwards. And the dangerous direction is the other one: once
+    the 600 s window lapses this page says ``no_end_record`` (i.e. idle) while
+    the scheduler may still be mid-run -- a pass that trusts only the run row
+    would recreate the sidecar and kill it, which is the single most common
+    cause of ``no_end_record`` on this deployment.
+
+    The mission brief used to claim "ask the scheduler first; it is the same
+    verdict the console shows". It was not, so the console now serves the
+    scheduler's verdict alongside its own rather than leaving a caller to
+    discover the difference.
+    """
+
+    def test_the_scheduler_view_reports_running_with_the_run_in_flight(self):
+        fake = {"jobs": [{"id": "monitor", "running": True,
+                          "in_progress_sec": 42.5,
+                          "in_progress_since": "2026-11-02T12:00:00",
+                          "next_due": "2026-11-02T12:30:00"}],
+                "paused": False, "any_enabled": True}
+        module = types.ModuleType("scheduler")
+        module.status = lambda: fake
+        with mock.patch.dict(sys.modules, {"scheduler": module}):
+            view = webui._scheduler_view()
+        self.assertTrue(view["available"])
+        self.assertTrue(view["running"])
+        self.assertEqual(view["running_jobs"], ["monitor"])
+        self.assertEqual(view["in_progress_sec"], 42.5)
+
+    def test_an_idle_scheduler_reports_not_running(self):
+        fake = {"jobs": [{"id": "monitor", "running": False}],
+                "paused": False, "any_enabled": True}
+        module = types.ModuleType("scheduler")
+        module.status = lambda: fake
+        with mock.patch.dict(sys.modules, {"scheduler": module}):
+            view = webui._scheduler_view()
+        self.assertTrue(view["available"])
+        self.assertFalse(view["running"])
+        self.assertEqual(view["running_jobs"], [])
+
+    def test_paused_is_carried_separately_from_running(self):
+        fake = {"jobs": [{"id": "monitor", "running": False}],
+                "paused": True, "any_enabled": True}
+        module = types.ModuleType("scheduler")
+        module.status = lambda: fake
+        with mock.patch.dict(sys.modules, {"scheduler": module}):
+            view = webui._scheduler_view()
+        self.assertTrue(view["paused"])
+        self.assertFalse(view["running"],
+                         "paused is not running: a held job runs nothing")
+
+    def test_an_unavailable_scheduler_says_so_and_is_not_idle(self):
+        """'I could not ask' must never be published as 'nothing is running'."""
+        module = types.ModuleType("scheduler")
+
+        def boom():
+            raise RuntimeError("state file unreadable")
+        module.status = boom
+        with mock.patch.dict(sys.modules, {"scheduler": module}):
+            view = webui._scheduler_view()
+        self.assertFalse(view["available"])
+        self.assertIn("unreadable", view["reason"])
+        #: NOT present-and-False: a caller doing view.get("running") must not
+        #: read an outage as an idle scheduler.
+        self.assertNotIn("running", view)
+
+    def test_a_missing_scheduler_module_says_so(self):
+        with mock.patch.dict(sys.modules, {"scheduler": None}):
+            view = webui._scheduler_view()
+        self.assertFalse(view["available"])
+        self.assertIn("cannot import", view["reason"])
+
+    def test_the_runs_payload_carries_it(self):
+        src = inspect.getsource(webui)
+        self.assertIn('"scheduler": _scheduler_view()', src,
+                      "the route must publish it, or the page cannot show it")
 
 
 if __name__ == "__main__":

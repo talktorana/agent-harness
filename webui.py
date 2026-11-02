@@ -179,6 +179,41 @@ def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
     return rows
 
 
+def _scheduler_view() -> Dict[str, Any]:
+    """The scheduler's verdict on whether a run is live, or why it is unknown.
+
+    Never raises and never guesses: the page is how a human decides whether to
+    trust the agent, so a scheduler that cannot answer must say so rather than
+    leave the field out (an absent key reads as "no run in flight" to any
+    caller doing `.get()`), and must never be reported as idle.
+    """
+    try:
+        import scheduler
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False,
+                "reason": f"cannot import the scheduler: {type(exc).__name__}: {exc}"}
+    try:
+        doc = scheduler.status()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False,
+                "reason": f"scheduler.status() raised "
+                          f"{type(exc).__name__}: {exc}"}
+    jobs = doc.get("jobs") or []
+    running = [j.get("id") for j in jobs if j.get("running")]
+    current = next((j for j in jobs if j.get("running")), None) or \
+        (jobs[0] if jobs else {})
+    return {
+        "available": True,
+        "running": bool(running),
+        "running_jobs": running,
+        "in_progress_sec": current.get("in_progress_sec"),
+        "in_progress_since": current.get("in_progress_since"),
+        "next_due": current.get("next_due"),
+        "paused": bool(doc.get("paused")),
+        "any_enabled": bool(doc.get("any_enabled")),
+    }
+
+
 def _recent(path: Path, now: datetime, window_sec: float = 600.0) -> bool:
     """Was this file touched recently enough that the run may still be going?"""
     try:
@@ -952,7 +987,26 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             payload = {"runs": run_summaries(limit),
                        "sessions_dir": str(_sessions_dir()),
-                       "held": retention_facts()}
+                       "held": retention_facts(),
+                       #: THE SCHEDULER'S OWN ANSWER, next to this page's.
+                       #:
+                       #: The two are computed differently and CAN disagree:
+                       #: this page calls a run live while its session file was
+                       #: touched in the last 600 s, and the scheduler calls it
+                       #: live while last_run has no matching finished. A run
+                       #: here lasts 383-470 s, so a finished run keeps reading
+                       #: as `running` for minutes after it ended -- and the
+                       #: mission brief told a pass "ask the scheduler first; it
+                       #: is the same verdict the console shows", which was
+                       #: simply untrue.
+                       #:
+                       #: The dangerous direction is the other one: this page
+                       #: says `no_end_record` (idle) once the window lapses,
+                       #: while the scheduler may still be mid-run -- and a pass
+                       #: that trusts only this field would recreate the sidecar
+                       #: and kill it. So both are published, and their
+                       #: disagreement is stated rather than left to be noticed.
+                       "scheduler": _scheduler_view()}
             self._send(200, json.dumps(payload, default=str).encode(),
                        "application/json")
         elif route.startswith("/run/"):
