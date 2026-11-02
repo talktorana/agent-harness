@@ -225,6 +225,24 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 next_due = None
 
+        #: ``last_run`` and ``finished`` are NOT a pair while a run is going.
+        #: last_run is stamped when the job FIRES; finished is only rewritten
+        #: when it RETURNS. So during a run, finished still describes the
+        #: PREVIOUS one and is earlier than last_run -- and subtracting them
+        #: produced a large negative duration. Live 2026-11-02 the console
+        #: showed "took -1072.7s" for a healthy, in-progress mission, which
+        #: reads as a broken clock rather than a run in progress.
+        #:
+        #: So report the duration only when the two stamps actually describe the
+        #: same run, and say plainly that a run is in progress otherwise.
+        running = bool(last_run and finished and finished < last_run)
+        duration: Optional[float] = None
+        if last_run and finished and not running:
+            try:
+                duration = round((finished - last_run).total_seconds(), 1)
+            except (TypeError, ValueError):
+                duration = None
+
         jobs.append({
             "id": key,
             "interval": _interval_label(job),
@@ -245,8 +263,10 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
                               if seconds_until is not None else None),
             "due_now": _due(job, when, state, key),
             "overdue": bool(seconds_until is not None and seconds_until < 0),
-            "duration_sec": (round((finished - last_run).total_seconds(), 1)
-                             if last_run and finished else None),
+            #: A run in progress: finished has not caught up with last_run yet.
+            "running": running,
+            #: Duration of the LAST COMPLETED run, never negative.
+            "duration_sec": duration,
         })
 
     return {

@@ -211,6 +211,47 @@ class ScheduleStatusTest(TempDirs):
         self.write_job(every_min=60)
         self.assertEqual(scheduler.status()["jobs"][0]["interval"], "every 1h")
 
+    def test_a_run_in_progress_reports_no_negative_duration(self):
+        """last_run and finished are NOT a pair while a run is going.
+
+        last_run is stamped when the job FIRES; finished is only rewritten when
+        it RETURNS. So mid-run, finished still describes the PREVIOUS run and is
+        EARLIER than last_run. Live 2026-11-02 the console showed
+        "took -1072.7s" for a healthy, in-progress mission -- which reads as a
+        broken clock rather than a run in progress.
+        """
+        self.write_state(last_run="2026-11-02T05:48:45",
+                         finished="2026-11-02T05:30:52")
+        job = scheduler.status(now=datetime(2026, 11, 2, 5, 55, 0))["jobs"][0]
+        self.assertTrue(job["running"], "an incoherent pair means a run is live")
+        self.assertIsNone(job["duration_sec"],
+                          "must never report a negative duration")
+        #: The other fields must still work: this is a display detail, not a
+        #: reason to blank the whole panel.
+        self.assertEqual(job["last_run"], "2026-11-02T05:48:45")
+        self.assertIsNotNone(job["next_due"])
+
+    def test_a_completed_run_still_reports_its_duration(self):
+        """The fix must not silence the normal case."""
+        self.write_state(last_run="2026-11-02T05:18:22",
+                         finished="2026-11-02T05:30:52")
+        job = scheduler.status(now=datetime(2026, 11, 2, 5, 55, 0))["jobs"][0]
+        self.assertFalse(job["running"])
+        self.assertEqual(job["duration_sec"], 750.0)
+
+    def test_an_equal_pair_is_a_zero_length_run_not_a_live_one(self):
+        self.write_state(last_run="2026-11-02T05:18:22",
+                         finished="2026-11-02T05:18:22")
+        job = scheduler.status(now=datetime(2026, 11, 2, 5, 55, 0))["jobs"][0]
+        self.assertFalse(job["running"])
+        self.assertEqual(job["duration_sec"], 0.0)
+
+    def test_the_page_shows_running_instead_of_a_blank(self):
+        """A blank duration is ambiguous; 'running now' is not."""
+        page = webui.RUNS_PAGE
+        self.assertIn("job.running", page)
+        self.assertIn("running now", page)
+
 
 class RunHistoryTest(TempDirs):
     def test_a_run_is_summarised_with_its_prompt_and_answer(self):

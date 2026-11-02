@@ -371,7 +371,11 @@ async function loadSchedule(){
       +'<span>'+esc(job.interval)+'</span>'+statePill
       +'<span>last run <b>'+esc(job.last_run||'never')+'</b>'
       +(job.last_run?' <span class="m">('+ago(job.last_run)+')</span>':'')+'</span>'
-      +(job.finished?'<span>took <b>'+secs(job.duration_sec)+'</b></span>':'')
+      // A run in progress has no duration yet: finished still describes the
+      // PREVIOUS run, and showing a difference would print a negative number.
+      +(job.running?'<span class="warn">running now</span>'
+        :(job.duration_sec!=null?'<span>last took <b>'+secs(job.duration_sec)
+          +'</b></span>':''))
       +(job.last_run?'<span>last outcome <span class="'+cls(job.last_ok?'ok':'bad')
         +'">'+(job.last_ok===false?'FAILED':'ok')+'</span></span>':'')
       +'<span>'+next+'</span></div>';
