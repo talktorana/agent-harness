@@ -1141,6 +1141,124 @@ def _service_image(root: Path, service: str) -> str:
     return _service_images(root).get(service, "")
 
 
+def _service_build(root: Path, service: str) -> Dict[str, str]:
+    """The `build` block of a compose service: context and dockerfile. Best effort."""
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "config", "--format", "json"],
+            cwd=str(root), capture_output=True, text=True, timeout=60.0,
+            encoding="utf-8", errors="replace")
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    start = (proc.stdout or "").find("{")
+    if start < 0:
+        return {}
+    try:
+        config = json.loads(proc.stdout[start:])
+    except ValueError:
+        return {}
+    svc = (config.get("services") or {}).get(service) or {}
+    build = svc.get("build")
+    if isinstance(build, str):
+        return {"context": build}
+    return build if isinstance(build, dict) else {}
+
+
+def _image_source_dirs(root: Path, service: str) -> List[str]:
+    """Top-level directories THIS service's image actually contains.
+
+    THE AUTHORITY IS THE DOCKERFILE, not a guess. An image contains what its
+    Dockerfile COPIES, and different services in one deployment build different
+    images from different contexts.
+
+    WHY THIS EXISTS (found live 2026-11-02, one pass after the stamp was added).
+    The stamp hashed a fixed list -- ``engine``, ``strategies``, ``dashboard`` --
+    for every service. But the dashboard is a SEPARATE image built from its own
+    Dockerfile; the runtime image copies only ``engine/``, ``strategies/`` and
+    one shared calendar module. So the stamp asserted the runtime image was
+    built from dashboard files it does not contain.
+
+    The consequence is the same false-positive class this stamp was added to
+    remove: the moment a dashboard file changes -- which the dashboard's own
+    publish timer does WITHOUT any image build -- every service compares
+    unequal and reads "STALE", and a pass stages a rebuild that cannot possibly
+    fix it, because the dashboard is not in that image. A monitoring pass was
+    already comparing ``dashboard/pnl_lib.py`` this way on 2026-11-02.
+
+    Returns repo-relative directory names, or an empty list when the Dockerfile
+    cannot be read: "unknown" is honest, and the caller records it as such.
+    """
+    build = _service_build(root, service)
+    context = build.get("context") or "."
+    dockerfile = build.get("dockerfile") or "Dockerfile"
+    base = (Path(root) / context).resolve() if context not in (".", "./") \
+        else Path(root).resolve()
+    path = (base / dockerfile)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    dirs: List[str] = []
+    root_resolved = Path(root).resolve()
+    #: JOIN BACKSLASH CONTINUATIONS FIRST. A Dockerfile routinely splits one
+    #: instruction over many lines -- ``COPY pkg/a.py \`` / ``     pkg/b.py .`` --
+    #: and parsing line by line silently drops the FIRST chunk of every such
+    #: instruction. That is how the live engine Dockerfile lost its whole
+    #: ``engine/`` tree (it is listed only inside continuations) and the stamp
+    #: came back with ``strategies`` alone, looking authoritative and being
+    #: half-empty.
+    logical: List[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        stripped = raw.rstrip()
+        if stripped.endswith("\\"):
+            buf += stripped[:-1] + " "
+            continue
+        logical.append((buf + stripped).strip())
+        buf = ""
+    if buf.strip():
+        logical.append(buf.strip())
+
+    for line in logical:
+        if not line.upper().startswith(("COPY ", "ADD ")):
+            continue
+        parts = line.split()[1:]
+        # Drop flags (--from=..., --chown=...) and the destination.
+        sources = [p for p in parts if not p.startswith("--")][:-1]
+        for src in sources:
+            src = src.strip().strip('"').strip("'")
+            if not src or src.startswith("/") or "://" in src:
+                continue
+            if src.startswith("$") or src in (".", "./"):
+                continue
+            #: PATHS ARE RELATIVE TO THE BUILD CONTEXT, NOT TO ``root``. Compose
+            #: may set ``context: ..`` (a parent directory) so a Dockerfile says
+            #: ``COPY <project>/engine/...`` while the same tree is
+            #: ``engine/...`` under the deployment root. Resolving against the
+            #: context and then re-relativising to the ROOT is the only mapping
+            #: that works for both layouts -- matching on the literal first path
+            #: component finds nothing when they differ, which is what happened
+            #: on the live deployment.
+            try:
+                candidate = (base / src).resolve()
+                rel = candidate.relative_to(root_resolved)
+            except (OSError, ValueError):
+                continue
+            #: Check the DIRECTORY, not the leaf. A Dockerfile may name a file
+            #: that only exists inside the image (or that a later layer
+            #: generates), and refusing those would drop the whole instruction
+            #: -- which is how ``engine/`` vanished from the live stamp.
+            first = rel.parts[0] if rel.parts else ""
+            if not first or first in (".", "..") or first in dirs:
+                continue
+            if not (root_resolved / first).is_dir():
+                continue
+            dirs.append(first)
+    return dirs
+
+
 def _record_image_stamp(root: Path, service: str,
                         results: List[Dict[str, Any]]) -> None:
     """Record which host files the just-built image was built from.
@@ -1159,8 +1277,11 @@ def _record_image_stamp(root: Path, service: str,
                 stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 stamp = {}
+        #: ONLY the trees this image actually contains. See
+        #: :func:`_image_source_dirs` for why a fixed list is wrong.
+        dirs = _image_source_dirs(root, service)
         built_from: Dict[str, str] = {}
-        for rel in ("engine", "strategies", "dashboard"):
+        for rel in dirs:
             base = Path(root) / rel
             if not base.is_dir():
                 continue
@@ -1175,6 +1296,11 @@ def _record_image_stamp(root: Path, service: str,
         entry = {
             "built_at": datetime.now(timezone.utc).isoformat(),
             "built_from": built_from,
+            #: Empty ``sources_resolved`` means the Dockerfile could not be read,
+            #: so ``built_from`` is NOT a complete description of the image and a
+            #: reader must treat this entry as UNKNOWN rather than comparing it.
+            "sources_resolved": bool(dirs),
+            "sources": dirs,
             "commands": [r.get("cmd") for r in results
                          if r.get("service") == service],
         }

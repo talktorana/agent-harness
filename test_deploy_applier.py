@@ -292,6 +292,8 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         """
         (self.root / "engine").mkdir(parents=True, exist_ok=True)
         (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12\nCOPY engine/ ./engine/\n", encoding="utf-8")
         mapping = {"svc-a": "shared:1.0", "svc-b": "shared:1.0",
                    "svc-c": "other:2.0"}
 
@@ -367,6 +369,8 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         """Bookkeeping degradation must never lose the stamp entirely."""
         (self.root / "engine").mkdir(parents=True, exist_ok=True)
         (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12\nCOPY engine/ ./engine/\n", encoding="utf-8")
 
         def fake_run(cmd, cwd, timeout):
             return 0, "ok"
@@ -483,6 +487,11 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         """
         (self.root / "engine").mkdir(parents=True, exist_ok=True)
         (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        #: The image's contents are defined by its Dockerfile, so the fixture
+        #: must have one. Without it the stamp honestly records "sources
+        #: unresolved" instead of guessing at a fixed list of directories.
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12\nCOPY engine/ ./engine/\n", encoding="utf-8")
         seen = []
 
         def fake_run(cmd, cwd, timeout):
@@ -516,6 +525,135 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         self.assertEqual(recorded["engine/mod.py"],
                          sha256_bytes((self.root / "engine" / "mod.py")
                                       .read_bytes()))
+
+    def test_a_tree_the_image_does_not_contain_is_not_stamped(self):
+        """The stamp must describe THIS image, not the whole deployment root.
+
+        Found live 2026-11-02, one pass after the stamp was added. It hashed a
+        fixed list -- engine, strategies, dashboard -- for every service. But a
+        dashboard is usually a SEPARATE image from a separate Dockerfile, so the
+        runtime image's stamp claimed to be built from files it does not
+        contain.
+
+        The consequence is the false-positive class the stamp exists to remove:
+        a dashboard file changes on its own publish timer, with no image build
+        involved, and every service then compares unequal and reads "STALE". A
+        pass would stage a rebuild that cannot possibly help, because the
+        dashboard is not in that image.
+        """
+        for d in ("engine", "strategies", "dashboard"):
+            (self.root / d).mkdir(parents=True, exist_ok=True)
+            (self.root / d / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        #: This service's image copies engine/ and strategies/ ONLY.
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12\n"
+            "COPY engine/ ./engine/\n"
+            "COPY strategies/ ./strategies/\n"
+            "RUN echo done\n", encoding="utf-8")
+
+        original = deploy_applier.run_command
+        deploy_applier.run_command = lambda cmd, cwd, timeout: (0, "ok")
+        try:
+            rows = deploy_applier.restart_services(["svc-a"], self.root, 20.0)
+        finally:
+            deploy_applier.run_command = original
+        self.assertTrue(all(r["rc"] == 0 for r in rows))
+        stamp = json.loads((self.root / "data" / "deploy"
+                            / deploy_applier.IMAGE_STAMP_NAME).read_text(
+                                encoding="utf-8"))
+        entry = stamp["svc-a"]
+        self.assertTrue(entry["sources_resolved"])
+        self.assertEqual(sorted(entry["sources"]), ["engine", "strategies"])
+        recorded = entry["built_from"]
+        self.assertIn("engine/mod.py", recorded)
+        self.assertIn("strategies/mod.py", recorded)
+        self.assertNotIn(
+            "dashboard/mod.py", recorded,
+            "the dashboard is not in this image; recording it makes every "
+            "dashboard edit read as a stale deployment")
+
+    def test_an_unreadable_dockerfile_says_sources_unresolved(self):
+        """"I could not read the build inputs" must not look like "none".
+
+        An empty ``built_from`` with no flag would read as a complete, empty
+        description of the image -- and a comparison against it would pass
+        everything. The flag is what makes the emptiness honest.
+        """
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        #: No Dockerfile on disk at all.
+        original = deploy_applier.run_command
+        deploy_applier.run_command = lambda cmd, cwd, timeout: (0, "ok")
+        try:
+            rows = deploy_applier.restart_services(["svc-a"], self.root, 20.0)
+        finally:
+            deploy_applier.run_command = original
+
+        entry = json.loads((self.root / "data" / "deploy"
+                            / deploy_applier.IMAGE_STAMP_NAME).read_text(
+                                encoding="utf-8"))["svc-a"]
+        self.assertFalse(entry["sources_resolved"])
+        self.assertEqual(entry["built_from"], {})
+        self.assertEqual(entry["sources"], [])
+
+    def test_dockerfile_copy_flags_without_from_are_not_mistaken_for_dirs(self):
+        """``COPY --from=builder /app/x /x`` names a stage, not a repo path."""
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12 AS builder\n"
+            "COPY engine/ ./engine/\n"
+            "COPY --from=builder /app/engine /engine\n"
+            "COPY --chown=1000:1000 engine/ /opt/engine/\n", encoding="utf-8")
+        dirs = deploy_applier._image_source_dirs(self.root, "svc-a")
+        self.assertEqual(dirs, ["engine"],
+                         "flags and absolute paths must be dropped, and a "
+                         "directory must be listed once: %r" % (dirs,))
+
+    def test_a_multiline_copy_is_still_read(self):
+        """A ``COPY`` split over continuation lines must not vanish.
+
+        The live engine Dockerfile lists its whole ``engine/`` tree inside a
+        backslash continuation. Parsing line by line dropped the first chunk of
+        every such instruction, so the stamp came back naming one directory
+        where the image had two -- authoritative-looking and half-empty.
+        """
+        for d in ("engine", "strategies"):
+            (self.root / d).mkdir(parents=True, exist_ok=True)
+            (self.root / d / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (self.root / "Dockerfile").write_text(
+            "FROM python:3.12\n"
+            "COPY engine/__init__.py \\\n"
+            "     engine/collector.py \\\n"
+            "     engine/state.py ./engine/\n"
+            "COPY strategies/ ./strategies/\n", encoding="utf-8")
+        dirs = deploy_applier._image_source_dirs(self.root, "svc-a")
+        self.assertEqual(sorted(dirs), ["engine", "strategies"],
+                         "the continued COPY must contribute engine: %r" % (dirs,))
+
+    def test_a_context_above_the_root_maps_back_onto_it(self):
+        """``context: ..`` with ``COPY pkg/engine/...`` must still resolve.
+
+        Compose lets a Dockerfile sit above the deployment root, so its COPY
+        sources carry a path prefix the root does not have. Resolving against the
+        context and re-relativising to the root is what makes both layouts work;
+        matching the literal first component found nothing on the live
+        deployment and produced an empty, confident-looking stamp.
+        """
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (self.root.parent / "Dockerfile").write_text(
+            "FROM python:3.12\nCOPY %s/engine/ ./engine/\n"
+            % self.root.name, encoding="utf-8")
+
+        original = deploy_applier._service_build
+        deploy_applier._service_build = lambda root, service: {
+            "context": str(self.root.parent), "dockerfile": "Dockerfile"}
+        try:
+            dirs = deploy_applier._image_source_dirs(self.root, "svc-a")
+        finally:
+            deploy_applier._service_build = original
+        self.assertEqual(dirs, ["engine"])
 
     def test_the_stamp_accumulates_per_service_rather_than_resetting(self):
         """Building service B must not erase what was recorded for A."""
