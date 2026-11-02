@@ -210,6 +210,34 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+#: What ``staged_against_sha256`` says when the target did not exist yet.
+#:
+#: A distinct literal rather than null, so a reader can tell "there was no file
+#: and I am creating one" from "I could not read it" -- the same three-valued
+#: discipline the readiness gate uses for a skipped verdict. A null that meant
+#: three things at once is how a check quietly stops checking.
+STAGED_AGAINST_ABSENT = "absent"
+STAGED_AGAINST_UNREADABLE = "unreadable"
+
+
+def _current_sha256(target: str) -> str:
+    """Hash of the target as it stands NOW, for the request to carry.
+
+    Reads through ``_deploy_root()`` so it hashes the copy the host will
+    overwrite -- not a copy in some other checkout that happens to be nearby.
+    """
+    try:
+        path = _deploy_root() / target
+    except Exception:  # noqa: BLE001 - a bad root must not stop staging
+        return STAGED_AGAINST_UNREADABLE
+    try:
+        if not path.is_file():
+            return STAGED_AGAINST_ABSENT
+        return sha256_bytes(path.read_bytes())
+    except OSError:
+        return STAGED_AGAINST_UNREADABLE
+
+
 def _check_target(target: str) -> None:
     """Refuse the shapes the host applier would refuse anyway.
 
@@ -373,6 +401,23 @@ def compose_deploy_request(purpose: str,
         total += len(payload)
         row["sha256"] = sha256_bytes(payload)
         row["bytes"] = len(payload)
+        #: WHAT THIS REQUEST IS BASED ON: the hash of the file as it stood when
+        #: the request was staged (or the literal "absent" when there was no
+        #: file). Recorded so the host can tell "I am changing what I expected
+        #: to change" from "somebody else has rewritten this since I looked".
+        #:
+        #: Without it, a staged request is indistinguishable from an
+        #: unconditional overwrite. That was tolerable while the request window
+        #: was 30 minutes and became a real hazard when the owner widened it to
+        #: FOUR HOURS: a pass stages at 10:20, another pass fixes the same file
+        #: at 12:30, the applier applies the older payload at 13:00 and silently
+        #: reverts the newer fix -- with a receipt that says `applied` and looks
+        #: perfect. A lost fix with a clean audit trail is the worst outcome
+        #: this deployment has, so the base is recorded and reported.
+        #:
+        #: It is NOT a veto (see the owner's 2026-11-02 directive); the applier
+        #: still applies and records `staged_against` in the receipt.
+        row["staged_against_sha256"] = _current_sha256(target)
         entries.append(row)
 
     if total > config.DEPLOY_MAX_BYTES:

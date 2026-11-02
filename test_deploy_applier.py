@@ -2227,5 +2227,126 @@ class AdvisoryGateTest(ApplierTestBase):
         self.assertIs(strict["verify"]["blocking"], True)
 
 
+class StagedAgainstTest(ApplierTestBase):
+    """A request must say what it was based on, or a newer fix vanishes.
+
+    A deploy request carries the hash of the content it WANTS to write. It never
+    carried the hash of the file it was staged AGAINST, so the applier could not
+    distinguish
+
+        "the file is what I expected to change"   from
+        "someone rewrote this after I looked"
+
+    That was tolerable at a 30-minute request window. It became a real hazard
+    when the owner widened it to four hours: a pass stages at 10:20, another
+    pass fixes the same file at 12:30, the applier writes the 10:20 payload at
+    13:00, and the newer fix is gone -- with a receipt that says `applied` and
+    looks perfect. A lost fix with a clean audit trail is this deployment's
+    worst outcome, so the disagreement is recorded.
+
+    ADVISORY, NOT A VETO. The owner's directive is that a diagnosed fix lands,
+    and this check cannot know which side is right -- only that they differ. A
+    gate here would recreate the very "your fix waited" problem the relaxation
+    removed.
+    """
+
+    def stage_aware(self, target: str, payload: str, staged_against: str,
+                    rid: str = "req-base") -> Path:
+        path, req = self.stage([{"target": target, "payload": payload}])
+        for entry in req["files"]:
+            entry["staged_against_sha256"] = staged_against
+        path.write_text(json.dumps(req), encoding="utf-8")
+        return path
+
+    def live(self, target: str, content: str) -> str:
+        """Write a file and return the hash of what ACTUALLY landed.
+
+        Read back from disk, not hashed from the string: ``write_text``
+        translates ``\\n`` to ``\\r\\n`` on Windows, so hashing the input
+        describes bytes that are not on disk -- and the check under test then
+        reports a phantom mismatch on a file nobody touched.
+        """
+        p = self.root / target
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return sha256_bytes(p.read_bytes())
+
+    def test_a_file_that_changed_under_the_request_is_reported(self):
+        base = self.live("engine/mod.py", "ORIGINAL = 1\n")
+        # ...another pass fixes the same file while this request waits...
+        (self.root / "engine" / "mod.py").write_text("SOMEONE_ELSE = 2\n",
+                                                    encoding="utf-8")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", base)
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied",
+                         "an advisory observation must NOT become a veto")
+        found = receipt["staged_against"]
+        self.assertEqual(len(found), 1, receipt)
+        #: Compare RESOLVED paths: Windows reports the temp directory in 8.3
+        #: form on one side (DRAGON~1) and long form on the other, so a string
+        #: comparison fails on a path that is the same file.
+        self.assertEqual(Path(found[0]["target"]).resolve(),
+                         (self.root / "engine" / "mod.py").resolve())
+        self.assertIn("staged_against", found[0])
+        self.assertIn("found_instead", found[0])
+        self.assertNotEqual(found[0]["staged_against"],
+                            found[0]["found_instead"])
+        self.assertIn("AFTER this request was staged",
+                      receipt["staged_against_warning"])
+
+    def test_an_unchanged_file_reports_nothing(self):
+        """The common case must stay quiet, or the warning is noise."""
+        base = self.live("engine/mod.py", "ORIGINAL = 1\n")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", base)
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["staged_against"], [])
+        self.assertNotIn("staged_against_warning", receipt)
+
+    def test_a_file_someone_else_created_is_reported(self):
+        """staged_against says "absent"; by apply time the path is not.
+
+        The interesting half: the request intends to CREATE a file, and another
+        pass created it first. Writing the staged bytes is then a silent
+        overwrite of work nobody reviewed together.
+        """
+        path = self.stage_aware("engine/new.py", "NEW = 1\n", "absent")
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "new.py").write_text("THEIRS = 2\n",
+                                                     encoding="utf-8")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied",
+                         "advisory still applies the requested bytes")
+        self.assertEqual(len(receipt["staged_against"]), 1)
+        self.assertEqual(receipt["staged_against"][0]["staged_against"], "absent")
+
+    def test_creating_a_file_that_is_still_absent_reports_nothing(self):
+        """absent-then-absent is agreement, not a mismatch."""
+        path = self.stage_aware("engine/new.py", "NEW = 1\n", "absent")
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["staged_against"], [])
+
+    def test_a_request_without_the_field_is_not_given_a_clean_bill(self):
+        """Older requests cannot be checked, and "not checked" != "matched"."""
+        path, _req = self.stage([{"target": "engine/mod.py",
+                                  "payload": "STAGED = 3\n"}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["staged_against"], [],
+                         "nothing was compared, so nothing may be reported as "
+                         "compared -- the key is present and empty")
+
+    def test_the_staged_bytes_are_still_what_gets_written(self):
+        """Advisory means exactly that: the payload, not the newer file."""
+        base = self.live("engine/mod.py", "ORIGINAL = 1\n")
+        (self.root / "engine" / "mod.py").write_text("SOMEONE_ELSE = 2\n",
+                                                    encoding="utf-8")
+        path = self.stage_aware("engine/mod.py", "STAGED = 3\n", base)
+        self.handle(path)
+        self.assertEqual((self.root / "engine" / "mod.py")
+                         .read_text(encoding="utf-8"), "STAGED = 3\n")
+
+
 if __name__ == "__main__":
     unittest.main()

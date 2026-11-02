@@ -1793,6 +1793,45 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             _move_staged_siblings(path, outbox, done_dir)
         return json.loads(receipt.read_text(encoding="utf-8"))
 
+    #: WHAT CHANGED UNDER US while this request waited.
+    #:
+    #: A request carries the hash of the file it was staged against
+    #: (``staged_against_sha256``, written by tools_deploy). Comparing that to
+    #: the file as it stands at APPLY time is the only way to notice that the
+    #: deployment moved on in between -- and with a multi-hour request window
+    #: that is not hypothetical: a pass stages at 10:20, another pass fixes the
+    #: same file at 12:30, and applying the 10:20 payload silently reverts the
+    #: newer fix while the receipt says `applied`.
+    #:
+    #: ADVISORY, NOT A VETO. The owner's 2026-11-02 directive is that a
+    #: diagnosed fix must land, and this check cannot know which side is right
+    #: -- it only knows they differ. So it applies as before and RECORDS the
+    #: disagreement, which turns an invisible revert into a line in the audit
+    #: trail. Requests staged before this field existed report
+    #: ``unknown`` rather than a clean bill, because "I did not check" must
+    #: never read as "it matched".
+    staged_against: List[Dict[str, Any]] = []
+    for entry, target, (_pname, payload) in zip(
+            req.get("files") or [], targets, pairs):
+        if not isinstance(entry, dict):
+            continue
+        declared = entry.get("staged_against_sha256")
+        if not isinstance(declared, str) or not declared:
+            continue
+        try:
+            current = sha256_bytes(Path(target).read_bytes())
+        except OSError:
+            current = "absent"
+        if declared == current:
+            continue
+        staged_against.append({
+            "target": str(target),
+            "staged_against": declared[:16],
+            "found_instead": current[:16],
+            "would_overwrite": (sha256_bytes(payload)[:16]
+                                if current != "absent" else None),
+        })
+
     plan = {
         "id": rid,
         "purpose": req.get("purpose"),
@@ -1800,10 +1839,20 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         "files": [{"target": str(t), "bytes": len(payload),
                    "sha256": sha256_bytes(payload)[:16]}
                   for t, (_n, payload) in zip(targets, pairs)],
+        #: Empty means every staged file still looked exactly as it did when it
+        #: was staged, OR the request predates the field -- so the distinction
+        #: is recorded explicitly rather than left to an empty list.
+        "staged_against": staged_against,
         "services": list(req.get("services") or []),
         "verify_command": req.get("verify_command"),
         "would_restart": bool(allow_restart and (req.get("services") or [])),
     }
+    if staged_against:
+        plan["staged_against_warning"] = (
+            "the deployment changed these files AFTER this request was staged: "
+            + ", ".join(e["target"] for e in staged_against)
+            + ". They were overwritten as requested, but check whether this "
+              "undid a newer fix -- the request carried the older content.")
 
     if dry_run:
         receipt = write_receipt(outbox, path, "dry_run",
