@@ -1259,6 +1259,56 @@ class GitMirrorTest(ApplierTestBase):
                                    "mirror_dir": str(self.mirror),
                                    "remote": "origin", "branch": "main"})
 
+    # -------------------------------------------------------------- subdir map
+    def test_a_deploy_root_that_is_a_repo_subdirectory_lands_in_that_subdir(
+            self):
+        """The deploy root is usually ONE directory inside the repository.
+
+        Found on the live mirror before this ever ran: the mirror is the repo
+        root, so copying ``engine/x.py`` to the mirror root creates a NEW
+        top-level ``engine/`` and commits a duplicate tree -- silently, because
+        git is perfectly happy to add it. Every other test here used matching
+        layouts on both sides, so none of them could have caught it.
+        """
+        repo = Path(self.tmp.name) / "repo"
+        self.git("clone", str(self.origin), str(repo))
+        (repo / "app" / "engine").mkdir(parents=True)
+        (repo / "app" / "README.md").write_text("app\n", encoding="utf-8")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "add", "app",
+                 cwd=repo)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m",
+                 "app tree", cwd=repo)
+        self.git("push", "origin", "main", cwd=repo)
+
+        receipt, target = self.apply(policy=self.with_git(
+            mirror_dir=str(repo), subdir="app"))
+        self.assertEqual(receipt["git"]["state"], "pushed", receipt["git"])
+        #: The path in the commit is repo-relative...
+        self.assertEqual(receipt["git"]["files"], ["app/engine/thing.py"])
+        committed = self.git("show", "--name-only", "--format=", "HEAD",
+                             cwd=repo).split()
+        self.assertEqual(committed, ["app/engine/thing.py"])
+        #: ...and no parallel top-level tree was invented.
+        self.assertFalse((repo / "engine").exists(),
+                         "a duplicate top-level engine/ was created")
+
+    def test_a_subdir_that_is_not_in_the_clone_is_refused(self):
+        """Wrong repo or wrong subdir must be reported, not half-applied."""
+        receipt, _t = self.apply(policy=self.with_git(subdir="does-not-exist"))
+        self.assertEqual(receipt["status"], "applied",
+                         "the deploy itself must still succeed")
+        self.assertEqual(receipt["git"]["state"], "no_mirror")
+        self.assertIn("does not exist", receipt["git"]["reason"])
+        self.assertFalse((self.mirror / "does-not-exist").exists())
+
+    def test_a_subdir_cannot_escape_the_clone(self):
+        for bad in ("../etc", "/abs/path", "a/../../b"):
+            with self.subTest(subdir=bad):
+                receipt, _t = self.apply(policy=self.with_git(subdir=bad))
+                self.assertEqual(receipt["git"]["state"], "failed",
+                                 receipt["git"])
+                self.assertIn("subdir", receipt["git"]["reason"])
+
 
 class ApplySemanticsTest(ApplierTestBase):
     def test_verification_failure_restores_the_originals(self):

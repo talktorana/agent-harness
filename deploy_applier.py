@@ -1131,6 +1131,17 @@ def apply_action(kind: str, spec: Dict[str, Any], current: Dict[str, Any],
 GIT_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     "mirror_dir": "",
+    #: Where the DEPLOY ROOT sits inside the repository.
+    #:
+    #: Almost never empty in practice, and getting it wrong is silent: the
+    #: mirror is the repo root, while a deploy root is usually one directory
+    #: within it (a deployment at ``/srv/app`` whose repo keeps that tree under
+    #: ``app/``). Copying ``engine/x.py`` to the mirror root instead of
+    #: ``app/engine/x.py`` does not error -- git happily commits a NEW
+    #: top-level ``engine/`` directory, so the repository quietly gains a
+    #: duplicate tree that no one asked for. Found by inspection against a
+    #: live mirror on 2026-11-02, before it had ever run.
+    "subdir": "",
     "remote": "origin",
     "branch": "",
     "user_name": "deploy-applier",
@@ -1157,8 +1168,32 @@ def git_config(policy: "Policy") -> Dict[str, Any]:
     cfg["mirror_dir"] = str(cfg["mirror_dir"] or "").strip()
     cfg["remote"] = str(cfg["remote"] or "origin").strip() or "origin"
     cfg["branch"] = str(cfg["branch"] or "").strip()
+    #: Trailing slashes only. Stripping the LEADING one would quietly turn an
+    #: absolute path into a relative one, so "/etc" would validate as "etc" and
+    #: the safety check in _safe_subdir would never see what was configured.
+    cfg["subdir"] = str(cfg["subdir"] or "").strip().rstrip("/")
     cfg["timeout_sec"] = float(cfg["timeout_sec"] or 120.0)
     return cfg
+
+
+def _safe_subdir(subdir: str) -> Optional[str]:
+    """None when usable, else why not. Refuses anything that escapes the clone.
+
+    Deliberately not ``Path.is_absolute()``: that is platform-dependent, and
+    ``"/abs/path"`` is ABSOLUTE on the Linux host but NOT on Windows (where it
+    means "current drive"). A safety check that a rehearsal on one OS passes
+    and production on another fails is worse than no check, so the test is on
+    the string: no leading separator, no drive letter, no traversal parts.
+    """
+    if not subdir:
+        return None
+    if subdir.startswith(("/", "\\")):
+        return f"git.subdir must be relative to the repository root, got {subdir!r}"
+    if re.match(r"^[A-Za-z]:", subdir):
+        return f"git.subdir must not name a drive, got {subdir!r}"
+    if any(part in ("..", ".") for part in Path(subdir).parts):
+        return f"git.subdir may not contain '.' or '..': {subdir!r}"
+    return None
 
 
 def _truthy(value: Any) -> bool:
@@ -1230,6 +1265,22 @@ def sync_applied_files(targets: List[Path], root: Path, *,
                 "setup": (f"git clone <repo-url> {mirror} && "
                           f"cd {mirror} && git remote -v")}
 
+    #: A subdir that does not exist in the clone means the mirror points at the
+    #: wrong repository (or the wrong subtree). Report it instead of creating
+    #: a parallel tree that would never be reviewed.
+    bad_subdir = _safe_subdir(cfg["subdir"])
+    if bad_subdir:
+        return {"state": "failed", "mirror": str(mirror),
+                "reason": bad_subdir}
+    prefix = Path(cfg["subdir"]) if cfg["subdir"] else None
+    if prefix is not None and not (mirror / prefix).is_dir():
+        return {"state": "no_mirror", "mirror": str(mirror),
+                "reason": (f"git.subdir {cfg['subdir']!r} does not exist in "
+                           f"{mirror}; the mirror is not this deployment's "
+                           f"repository, or the subdir is wrong. Refusing to "
+                           f"create a parallel tree."),
+                "setup": (f"cd {mirror} && ls -d {cfg['subdir']} # must exist")}
+
     rels = [p for p in targets if _stageable(p, root, policy)]
     #: Relative and POSIX-joined on purpose: these strings go into the receipt
     #: and the commit, so an OS-specific separator would make a rehearsal on
@@ -1245,11 +1296,14 @@ def sync_applied_files(targets: List[Path], root: Path, *,
     copied: List[str] = []
     for src in rels:
         rel = src.resolve().relative_to(root.resolve())
-        dest = mirror / rel
+        #: Repo-relative, i.e. where the file belongs in the CLONE -- which is
+        #: not the same as where it sits under the deploy root.
+        in_repo = (prefix / rel) if prefix is not None else rel
+        dest = mirror / in_repo
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
-            copied.append(rel.as_posix())
+            copied.append(in_repo.as_posix())
         except OSError as exc:
             return {"state": "failed", "mirror": str(mirror),
                     "reason": f"copy {rel} failed: {type(exc).__name__}: {exc}",
