@@ -242,11 +242,17 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
       border-radius:5px;cursor:pointer;margin-right:6px;font-size:12px}
  .tab.sel{background:#2a2a2a;border-color:#555}
  .clip{max-height:3.6em;overflow:hidden}
+ .nav{margin:2px 0 10px}
+ .nav a{display:inline-block;margin-right:6px;padding:3px 10px;font-size:12px;
+        color:#7fd1ff;background:#16202c;border:1px solid #2f4f75;
+        border-radius:5px;text-decoration:none}
+ .nav a:hover{background:#1e2c3c}
 </style></head><body><div id="wrap">
-<h3>agent-harness <span class="m">schedule &amp; runs</span>
-  <a href="__AGENT_BASE__/live" style="font-size:12px">live view -&gt;</a>
-  <a href="__AGENT_BASE__/" style="font-size:12px;margin-left:10px">console</a>
-</h3>
+<h3>agent-harness <span class="m">schedule &amp; runs</span></h3>
+<div class="nav">
+  <a href="__AGENT_BASE__/live">live view</a>
+  <a href="__AGENT_BASE__/">console</a>
+</div>
 <div id="sched" class="m">loading schedule...</div>
 <div id="err"></div>
 <table><thead><tr>
@@ -418,10 +424,17 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  button{background:#2a6;background:#1f7a4d;color:#fff;border:0;
         border-radius:6px;padding:8px 16px;font:inherit;cursor:pointer}
  button:disabled{opacity:.4;cursor:default}
+ .nav{margin:2px 0 10px}
+ .nav a{display:inline-block;margin-right:6px;padding:3px 10px;font-size:12px;
+        color:#7fd1ff;background:#16202c;border:1px solid #2f4f75;
+        border-radius:5px;text-decoration:none}
+ .nav a:hover{background:#1e2c3c}
 </style></head><body><div id="wrap">
-<h3>agent-harness <span class="m" id="state"></span>
-  <a href="__AGENT_BASE__/live" style="color:#7fd1ff;font-size:12px">live view -></a>
-  <a href="__AGENT_BASE__/runs" style="color:#7fd1ff;font-size:12px;margin-left:10px">schedule &amp; runs -></a></h3>
+<h3>agent-harness <span class="m" id="state"></span></h3>
+<div class="nav">
+  <a href="__AGENT_BASE__/live">live view</a>
+  <a href="__AGENT_BASE__/runs">schedule &amp; runs</a>
+</div>
 <div id="pick" class="m">
  <select id="prov"></select><select id="mod"></select>
  <span id="routes" style="font-size:11px"></span>
@@ -532,7 +545,7 @@ LIVE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <span class="m" id="state"></span>
  <span id="chain"></span>
  <a href="__AGENT_BASE__/" class="m">simple view</a>
- <a href="__AGENT_BASE__/runs" class="m">schedule &amp; runs</a>
+ <a href="__AGENT_BASE__/runs" style="font-size:12px;color:#7fd1ff;background:#16202c;border:1px solid #2f4f75;border-radius:5px;padding:2px 9px;text-decoration:none">schedule &amp; runs</a>
 </header>
 <div id="msgs"></div>
 <form id="f"><textarea id="q" placeholder="task... (Ctrl+Enter to send)"></textarea>

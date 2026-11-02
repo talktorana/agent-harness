@@ -382,6 +382,36 @@ class PageSurfaceTest(TempDirs):
             self.assertIn("/runs", getattr(webui, name),
                           f"{name} has no link to the schedule view")
 
+    def test_every_page_can_reach_every_other_page(self):
+        """A nav that only works one way strands the operator mid-investigation.
+
+        The owner could not find the runs view from the console at all, so each
+        page must offer the others, and the runs page must link BACK -- otherwise
+        'no end record' is a dead end with no route to the console that caused it.
+        The trailing slash matters: the console root is ``__AGENT_BASE__/``, and
+        ``__AGENT_BASE__`` alone is not the same URL behind a prefix.
+        """
+        expect = {"PAGE": ("/live", "/runs"),
+                  "LIVE_PAGE": ("/", "/runs"),
+                  "RUNS_PAGE": ("/live", "/")}
+        for name, targets in expect.items():
+            page = getattr(webui, name)
+            for target in targets:
+                href = f'href="__AGENT_BASE__{target}"'
+                with self.subTest(page=name, href=href):
+                    self.assertIn(href, page, f"{name} cannot reach {target}")
+
+    def test_the_nav_is_styled_as_a_button_not_bare_text(self):
+        """A 12px inline link next to a title reads as page furniture.
+
+        The owner reported the view as missing when it was there all along, so
+        the nav is a visible control: bordered, padded, on its own row.
+        """
+        for name in ("PAGE", "RUNS_PAGE"):
+            page = getattr(webui, name)
+            self.assertIn(".nav a{", page, f"{name} has no button styling")
+            self.assertIn('class="nav"', page, f"{name} does not use it")
+
     def test_every_page_is_served_with_the_base_prefix_substituted(self):
         for name in ("PAGE", "LIVE_PAGE", "RUNS_PAGE"):
             html = webui._render(getattr(webui, name))
