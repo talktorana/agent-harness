@@ -830,5 +830,42 @@ class ReceiptCompatibilityTest(unittest.TestCase):
         self.assertEqual(tools_deploy.READINESS_KEYS[0], "readiness")
 
 
+class GitVerdictPassthroughTest(unittest.TestCase):
+    """``deploy_status`` must tell the agent whether the change reached git.
+
+    The applier records the outcome in the receipt, but that is host-side and
+    invisible to the agent: unless the summary carries it through, an agent
+    cannot say where the applied code now lives, and "deployed but never
+    pushed" -- exactly the drift this feature ends -- reads as a clean deploy.
+    """
+
+    def test_a_pushed_commit_is_reported_with_its_sha(self):
+        out = tools_deploy._summarise_outcome(
+            {"status": "applied", "reason": "ok",
+             "git": {"state": "pushed", "sha": "abc123"}})
+        self.assertIn("git: pushed abc123", out, out)
+
+    def test_an_unpushed_commit_is_reported_with_a_retry(self):
+        """A silent local-only commit is the failure mode to avoid."""
+        out = tools_deploy._summarise_outcome(
+            {"status": "applied", "reason": "ok",
+             "git": {"state": "committed_not_pushed", "sha": "def456",
+                     "reason": "push failed", "retry": "cd /opt/m && git push"}})
+        self.assertIn("git: committed_not_pushed", out)
+        self.assertIn("retry:", out)
+
+    def test_a_receipt_without_a_git_block_says_nothing_about_git(self):
+        """Silence is correct: an old receipt must not imply a push."""
+        out = tools_deploy._summarise_outcome({"status": "applied",
+                                               "reason": "ok"})
+        self.assertNotIn("git:", out, out)
+
+    def test_the_status_dict_carries_the_block_through(self):
+        """The dict callers rely on must expose it, not just the text."""
+        import inspect
+        src = inspect.getsource(tools_deploy)
+        self.assertIn('"git": receipt.get("git")', src)
+
+
 if __name__ == "__main__":
     unittest.main()

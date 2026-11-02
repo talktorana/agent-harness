@@ -520,6 +520,13 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
         #: test_deploy_tools.py.
         "readiness": _readiness_of(receipt),
         "backups": receipt.get("backups") or [],
+        #: Did the applied change reach the repository? Reported so the agent
+        #: can tell the operator WHERE the code now lives. A deploy that landed
+        #: but never got pushed is still a real deploy -- it just means the
+        #: repository is behind the host, which is exactly the drift that used
+        #: to go unnoticed. Absent on receipts written before this field
+        #: existed, so an old receipt reads as None rather than "not pushed".
+        "git": receipt.get("git"),
     }
 
 
@@ -634,6 +641,16 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
     backups = outcome.get("backups") or []
     if backups:
         lines.append(f"backups: {len(backups)} file(s) copied aside")
+    #: Whether the applied change reached the repository. Omitted entirely when
+    #: the receipt predates the field (or git is not configured), because
+    #: "git: (none)" would read as a failed push rather than "not applicable".
+    git_info = outcome.get("git")
+    if isinstance(git_info, dict) and git_info.get("state"):
+        state = git_info["state"]
+        detail = git_info.get("sha") or git_info.get("reason") or ""
+        lines.append(f"git: {state}" + (f" {detail}" if detail else ""))
+        if git_info.get("retry"):
+            lines.append(f"  retry: {git_info['retry']}")
     if outcome.get("request_path"):
         lines.append(f"request: {outcome['request_path']}")
     if outcome.get("receipt_path"):

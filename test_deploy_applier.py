@@ -1064,6 +1064,202 @@ class AgeGateTest(ApplierTestBase):
         self.assertIn("stale", receipt["reason"])
 
 
+class GitMirrorTest(ApplierTestBase):
+    """An applied change must reach the repository, without ever risking the deploy.
+
+    The mirror is a SEPARATE clone, never the deploy root: a checkout at the root
+    would delete agent-applied files that are not committed yet, which is the
+    drift this exists to end. These tests use a bare repo as ``origin`` so the
+    push is real rather than mocked -- a mocked push would pass just as happily
+    with the remote URL wrong.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import subprocess
+        self.sh = subprocess.run
+
+        def git(*args, cwd=None):
+            proc = self.sh(["git", *args], cwd=str(cwd or self.root),
+                           capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0,
+                             f"git {' '.join(args)} failed: {proc.stderr}")
+            #: Raw stdout, not stripped: these tests compare file CONTENT, and
+            #: a stripped trailing newline would make a correct commit look
+            #: like it wrote a different file.
+            return proc.stdout
+
+        self.git = git
+        self.origin = Path(self.tmp.name) / "origin.git"
+        self.git("init", "--bare", "--initial-branch=main", str(self.origin))
+        seed = Path(self.tmp.name) / "seed"
+        self.git("clone", str(self.origin), str(seed))
+        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "add", "README.md",
+                 cwd=seed)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed",
+                 cwd=seed)
+        self.git("push", "origin", "main", cwd=seed)
+
+        self.mirror = Path(self.tmp.name) / "mirror"
+        self.git("clone", str(self.origin), str(self.mirror))
+
+    def with_git(self, **over):
+        block = {"enabled": True, "mirror_dir": str(self.mirror),
+                 "remote": "origin", "branch": "main",
+                 "user_name": "applier", "user_email": "applier@test",
+                 "timeout_sec": 60}
+        block.update(over)
+        return make_policy(git=block)
+
+    def apply(self, name="engine/thing.py", payload="x = 1\n", policy=None):
+        """Stage, apply, and return (receipt, target)."""
+        path, _ = self.stage([{"target": name, "payload": payload}],
+                             purpose="fix the thing")
+        receipt = self.handle(path, policy=policy or self.with_git())
+        return receipt, self.root / name
+
+    # ---------------------------------------------------------------- defaults
+    def test_git_is_off_unless_the_policy_says_otherwise(self):
+        receipt, target = self.apply(policy=self.policy)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"], {"state": "disabled"})
+        #: Nothing was committed: the mirror still holds only the seed commit.
+        self.assertEqual(
+            len(self.git("log", "--oneline", cwd=self.mirror).splitlines()), 1)
+
+    def test_a_missing_mirror_never_fails_the_deploy(self):
+        """A deploy must not depend on a repository being reachable."""
+        receipt, _t = self.apply(policy=self.with_git(
+            mirror_dir=str(Path(self.tmp.name) / "nope")))
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"]["state"], "no_mirror")
+        self.assertIn("git clone", receipt["git"]["setup"])
+
+    def test_a_directory_that_is_not_a_checkout_is_reported_as_such(self):
+        plain = Path(self.tmp.name) / "plain"
+        plain.mkdir()
+        receipt, _t = self.apply(policy=self.with_git(mirror_dir=str(plain)))
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"]["state"], "no_mirror")
+        self.assertIn("not a git checkout", receipt["git"]["reason"])
+
+    # ------------------------------------------------------------------ happy
+    def test_an_applied_change_is_committed_and_pushed(self):
+        receipt, target = self.apply()
+        self.assertEqual(receipt["status"], "applied")
+        gitinfo = receipt["git"]
+        self.assertEqual(gitinfo["state"], "pushed", gitinfo)
+        self.assertEqual(gitinfo["files"], ["engine/thing.py"])
+        self.assertTrue(gitinfo["sha"])
+
+        #: The mirror holds the content...
+        self.assertEqual((self.mirror / "engine" / "thing.py").read_text(
+            encoding="utf-8"), "x = 1\n")
+        #: ...and so does origin, which is what "pushed" has to mean.
+        shown = self.git("show", "main:engine/thing.py", cwd=self.origin)
+        self.assertEqual(shown, "x = 1\n")
+
+    def test_the_commit_subject_names_the_request(self):
+        receipt, _t = self.apply()
+        sha = receipt["git"]["sha"]
+        subject = self.git("log", "-1", "--format=%s", sha, cwd=self.mirror)
+        self.assertIn("req-test", subject)
+        self.assertIn("fix the thing", subject)
+
+    def test_reapplying_identical_content_is_no_change_not_a_failure(self):
+        first, _t = self.apply()
+        self.assertEqual(first["git"]["state"], "pushed")
+        second, _t = self.apply()
+        self.assertEqual(second["status"], "applied")
+        self.assertEqual(second["git"]["state"], "no_change")
+        #: No empty commit was invented.
+        self.assertEqual(len(self.git("log", "--format=%s", cwd=self.mirror)
+                             .splitlines()), 2)  # seed + one deploy
+
+    # ------------------------------------------------------------ what is staged
+    def test_only_the_applied_paths_are_staged(self):
+        """A commit must not sweep in unrelated drift in the mirror."""
+        (self.mirror / "unrelated.py").write_text("dirty\n", encoding="utf-8")
+        receipt, _t = self.apply()
+        committed = self.git("show", "--name-only", "--format=",
+                             receipt["git"]["sha"], cwd=self.mirror).split()
+        self.assertEqual(committed, ["engine/thing.py"])
+        #: And it must not be STAGED either. `git add -A` would still produce
+        #: the commit above -- the commit's trailing pathspec masks it -- but it
+        #: leaves someone else's edit sitting in the index, where the next
+        #: commit about a different change would pick it up. So assert the exact
+        #: status rather than merely that the filename appears: "?? x" means
+        #: untouched, "A  x" means staged.
+        porcelain = self.git("status", "--porcelain", cwd=self.mirror)
+        self.assertIn("?? unrelated.py", porcelain, porcelain)
+        self.assertNotIn("A  unrelated.py", porcelain, porcelain)
+
+    def test_runtime_state_under_data_is_never_committed(self):
+        """data/ is the running service's state, not code."""
+        path, _ = self.stage([{"target": "data/ledger.json",
+                               "payload": '{"a": 1}'}],
+                             purpose="touch runtime state")
+        receipt = self.handle(path, policy=self.with_git())
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"]["state"], "no_change")
+        self.assertIn("data/ledger.json", receipt["git"]["skipped"])
+        self.assertNotIn("ledger.json",
+                         self.git("show", "--name-only", "--format=",
+                                  "HEAD", cwd=self.mirror))
+
+    # ------------------------------------------------------------------ failure
+    def test_a_failed_push_keeps_the_commit_and_still_reports_applied(self):
+        """The deploy landed and was verified; a push problem must not undo it."""
+        self.git("remote", "set-url", "origin",
+                 str(Path(self.tmp.name) / "gone.git"), cwd=self.mirror)
+        receipt, _t = self.apply(policy=self.with_git(remote="origin"))
+        self.assertEqual(receipt["status"], "applied",
+                         "a push failure must never overturn a verified deploy")
+        gitinfo = receipt["git"]
+        self.assertEqual(gitinfo["state"], "committed_not_pushed", gitinfo)
+        #: The commit survives -- it is the only copy of the record.
+        self.assertEqual(
+            self.git("show", "--name-only", "--format=", "HEAD",
+                     cwd=self.mirror).split(), ["engine/thing.py"])
+        self.assertIn("git push origin", gitinfo["retry"])
+
+    def test_a_push_that_fails_leaves_the_change_retrievable(self):
+        """The retry hint must actually work, once the remote is fixed."""
+        self.git("remote", "set-url", "origin",
+                 str(Path(self.tmp.name) / "gone.git"), cwd=self.mirror)
+        self.apply()
+        self.git("remote", "set-url", "origin", str(self.origin), cwd=self.mirror)
+        self.git("push", "origin", "main", cwd=self.mirror)
+        self.assertEqual(
+            self.git("show", "main:engine/thing.py", cwd=self.origin), "x = 1\n")
+
+    def test_the_applier_never_raises_when_git_is_unusable(self):
+        """Bookkeeping must not be able to break the apply path."""
+        with mock.patch("deploy_applier.run_command",
+                        side_effect=FileNotFoundError("no git")):
+            receipt, _t = self.apply()
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["git"]["state"], "failed")
+        self.assertIn("git is not installed", receipt["git"]["reason"])
+
+    # ------------------------------------------------------------------ wiring
+    def test_the_receipt_on_disk_carries_the_git_verdict(self):
+        receipt, _t = self.apply()
+        on_disk = json.loads(
+            (self.outbox / _receipt_name(
+                self.outbox / "applied" / f"req-test{REQUEST_SUFFIX}"))
+            .read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["git"]["state"], "pushed")
+        self.assertEqual(on_disk["git"]["sha"], receipt["git"]["sha"])
+
+    def test_policy_to_dict_reports_the_git_configuration(self):
+        payload = self.with_git().to_dict()["git"]
+        self.assertEqual(payload, {"enabled": True,
+                                   "mirror_dir": str(self.mirror),
+                                   "remote": "origin", "branch": "main"})
+
+
 class ApplySemanticsTest(ApplierTestBase):
     def test_verification_failure_restores_the_originals(self):
         target = self.root / "engine" / "keep.py"

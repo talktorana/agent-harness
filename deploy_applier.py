@@ -209,6 +209,12 @@ class Policy:
             self.forbidden_names = frozenset(
                 self.forbidden_names | {Path(self.status_file).name})
 
+        #: Where an applied change should be COMMITTED. Optional and disabled by
+        #: default: a deployment may have no repository, and a deploy must not
+        #: depend on one. Shape is documented at GIT_DEFAULTS.
+        git_doc = doc.get("git")
+        self.git: Dict[str, Any] = git_doc if isinstance(git_doc, dict) else {}
+
     @property
     def readiness_enabled(self) -> bool:
         return bool(self.status_file)
@@ -236,6 +242,14 @@ class Policy:
             "max_age_sec": self.max_age_sec,
             "forbidden_names": sorted(self.forbidden_names),
             "forbidden_dirs": list(self.forbidden_dirs),
+            # Say whether an applied change reaches the repository, and where.
+            # A receipt claiming a commit with no mirror configured would be
+            # the same class of silent lie as a gate reporting itself passed
+            # when it never ran.
+            "git": {"enabled": _truthy(self.git.get("enabled")),
+                    "mirror_dir": str(self.git.get("mirror_dir") or ""),
+                    "remote": str(self.git.get("remote") or ""),
+                    "branch": str(self.git.get("branch") or "")},
         }
 
     @classmethod
@@ -1092,6 +1106,210 @@ def apply_action(kind: str, spec: Dict[str, Any], current: Dict[str, Any],
     return merged, "verified by re-read"
 
 
+# ======================================================= git mirror sync
+#
+# An applied deploy changes files the repository never hears about. The deploy
+# root is deliberately NOT a git checkout (a `git checkout` there would delete
+# every agent-applied, not-yet-committed file -- the exact drift this is meant
+# to end), and the sidecar's copy of it is read-only. So the commit is made in a
+# SEPARATE clone and only the applied paths are copied across.
+#
+# Design rules, each one earned:
+#
+# * BEST EFFORT, NEVER FATAL. A missing mirror, an absent deploy key or a
+#   rejected push must not turn a successful deploy into a failed one. The
+#   trading change already landed and was verified; refusing it now would be
+#   worse than an un-pushed commit. Every outcome is recorded in the receipt.
+# * ONLY THE APPLIED PATHS ARE STAGED. Never `git add -A`: the mirror is a
+#   working tree that may hold unrelated drift, and sweeping it into a commit
+#   would attribute someone else's edit to this request id.
+# * THE COMMIT IS NEVER DISCARDED. If the push fails, the commit stays so the
+#   next successful push carries it. Rolling back would destroy the only copy.
+# * NOTHING HERE KNOWS THE PRODUCT. Paths, remote, branch and identity all come
+#   from the policy's ``git`` block, exactly like every other domain decision.
+
+GIT_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "mirror_dir": "",
+    "remote": "origin",
+    "branch": "",
+    "user_name": "deploy-applier",
+    "user_email": "deploy-applier@localhost",
+    "timeout_sec": 120.0,
+}
+
+#: Paths that must never enter a commit, whatever the policy says. The applier
+#: already refuses to WRITE these, so an applied target can never be one of
+#: them; this is the second lock on the same door, because a mirror is a
+#: different machine surface from the deploy root.
+GIT_NEVER_STAGE_NAMES = (".env", ".git-credentials", "id_rsa", "id_ed25519")
+
+
+def git_config(policy: "Policy") -> Dict[str, Any]:
+    """The policy's ``git`` block, normalised. Absent means disabled."""
+    doc = getattr(policy, "git", None)
+    doc = doc if isinstance(doc, dict) else {}
+    cfg = dict(GIT_DEFAULTS)
+    for key in GIT_DEFAULTS:
+        if key in doc and doc[key] not in (None, ""):
+            cfg[key] = doc[key]
+    cfg["enabled"] = _truthy(doc.get("enabled"))
+    cfg["mirror_dir"] = str(cfg["mirror_dir"] or "").strip()
+    cfg["remote"] = str(cfg["remote"] or "origin").strip() or "origin"
+    cfg["branch"] = str(cfg["branch"] or "").strip()
+    cfg["timeout_sec"] = float(cfg["timeout_sec"] or 120.0)
+    return cfg
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _git(mirror: Path, args: List[str], timeout: float,
+         ident: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    """Run git inside the mirror. ``-c`` identity keeps it off global config."""
+    cmd = ["git"]
+    if ident:
+        cmd += ["-c", f"user.name={ident['user_name']}",
+                "-c", f"user.email={ident['user_email']}"]
+    cmd += list(args)
+    try:
+        return run_command(cmd, mirror, timeout)
+    except FileNotFoundError:
+        return 127, "git is not installed on this host"
+    except subprocess.TimeoutExpired:
+        return 124, f"git {args[0]} timed out after {timeout:.0f}s"
+
+
+def _mirror_ready(mirror: Path, cfg: Dict[str, Any]) -> Optional[str]:
+    """None when usable, else the reason it is not."""
+    if not mirror.is_dir():
+        return f"mirror directory does not exist: {mirror}"
+    if not (mirror / ".git").exists():
+        return (f"{mirror} is not a git checkout (no .git) -- cloned with "
+                f"--depth would still have one, so this is not a clone at all")
+    return None
+
+
+def _stageable(path: Path, root: Path, policy: "Policy") -> bool:
+    """Is this applied target allowed into a commit? Belt and braces."""
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    parts = [p.lower() for p in rel.parts]
+    if parts and parts[0] == "data":
+        return False
+    if rel.name.lower() in GIT_NEVER_STAGE_NAMES:
+        return False
+    if rel.name in getattr(policy, "forbidden_names", ()):
+        return False
+    return True
+
+
+def sync_applied_files(targets: List[Path], root: Path, *,
+                       policy: "Policy", rid: str,
+                       purpose: Optional[str] = None) -> Dict[str, Any]:
+    """Mirror the applied files into the git clone, commit and push.
+
+    Returns a dict for the receipt. NEVER raises and never signals failure by
+    return value -- the caller has already applied the change, so this is
+    bookkeeping, and bookkeeping must not overturn a verified deploy.
+    """
+    cfg = git_config(policy)
+    if not cfg["enabled"]:
+        return {"state": "disabled"}
+
+    mirror = Path(cfg["mirror_dir"]).expanduser()
+    problem = _mirror_ready(mirror, cfg)
+    if problem:
+        return {"state": "no_mirror", "mirror": str(mirror),
+                "reason": problem,
+                "setup": (f"git clone <repo-url> {mirror} && "
+                          f"cd {mirror} && git remote -v")}
+
+    rels = [p for p in targets if _stageable(p, root, policy)]
+    #: Relative and POSIX-joined on purpose: these strings go into the receipt
+    #: and the commit, so an OS-specific separator would make a rehearsal on
+    #: Windows describe a different path from the one the Linux host commits.
+    skipped = [p.relative_to(root.resolve()).as_posix()
+               for p in targets if p not in rels]
+    if not rels:
+        return {"state": "no_change", "mirror": str(mirror),
+                "reason": "no applied target is stageable (all runtime state)",
+                "skipped": skipped}
+
+    ident = {"user_name": cfg["user_name"], "user_email": cfg["user_email"]}
+    copied: List[str] = []
+    for src in rels:
+        rel = src.resolve().relative_to(root.resolve())
+        dest = mirror / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied.append(rel.as_posix())
+        except OSError as exc:
+            return {"state": "failed", "mirror": str(mirror),
+                    "reason": f"copy {rel} failed: {type(exc).__name__}: {exc}",
+                    "copied": copied}
+
+    rc, out = _git(mirror, ["add", "--"] + copied, cfg["timeout_sec"], ident)
+    if rc != 0:
+        return {"state": "failed", "mirror": str(mirror),
+                "reason": f"git add failed (rc={rc}): {out[-300:]}",
+                "copied": copied}
+
+    #: Nothing to commit is a SUCCESS, not a failure: re-applying an identical
+    #: file is a normal outcome and must not read as a broken mirror.
+    rc, _out = _git(mirror, ["diff", "--cached", "--quiet"], cfg["timeout_sec"],
+                    ident)
+    if rc == 0:
+        return {"state": "no_change", "mirror": str(mirror),
+                "reason": "applied files already match the mirror",
+                "copied": copied, "skipped": skipped}
+
+    subject = f"agent deploy {rid}: {_one_line(purpose) or 'applied change'}"
+    body = (f"Applied by the deploy applier behind the readiness gate.\n\n"
+            f"Request: {rid}\nFiles: {len(copied)}\n")
+    rc, out = _git(mirror, ["commit", "-m", subject, "-m", body,
+                            "--"] + copied, cfg["timeout_sec"], ident)
+    if rc != 0:
+        return {"state": "failed", "mirror": str(mirror),
+                "reason": f"git commit failed (rc={rc}): {out[-300:]}",
+                "copied": copied}
+
+    rc, out = _git(mirror, ["rev-parse", "HEAD"], cfg["timeout_sec"], ident)
+    sha = out.strip().splitlines()[-1] if rc == 0 and out.strip() else ""
+    result: Dict[str, Any] = {"state": "committed", "mirror": str(mirror),
+                              "sha": sha, "files": copied,
+                              "subject": subject, "skipped": skipped}
+
+    push_args = ["push", cfg["remote"]]
+    if cfg["branch"]:
+        push_args.append(cfg["branch"])
+    rc, out = _git(mirror, push_args, cfg["timeout_sec"], ident)
+    if rc == 0:
+        result["state"] = "pushed"
+        result["remote"] = cfg["remote"]
+        return result
+
+    #: Keep the commit. The change is real and this is the only copy of the
+    #: record, so discarding it to make the receipt tidy would be backwards.
+    result["state"] = "committed_not_pushed"
+    result["reason"] = (f"push failed (rc={rc}): {out[-400:]}. The commit is "
+                        f"kept locally and the next successful push carries it.")
+    result["retry"] = f"cd {mirror} && git push {cfg['remote']}"
+    return result
+
+
+def _one_line(text: Optional[str], limit: int = 72) -> str:
+    """A commit subject line: one line, no controls, bounded."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "\u2026"
+
+
 # ============================================================== receipts
 
 def _receipt_name(request_path: Path) -> str:
@@ -1357,7 +1575,17 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
 
         receipt = write_receipt(outbox, path, "applied",
                                 "all gates passed and payloads written",
-                                {**plan, "backups": made})
+                                {**plan, "backups": made,
+                                 # Recorded BEFORE the receipt is written, so the
+                                 # audit trail carries the commit as applied.
+                                 # Best effort by design: it cannot change the
+                                 # status above, because the deploy really did
+                                 # land and reverting it to satisfy a git
+                                 # problem would be worse than an un-pushed
+                                 # commit.
+                                 "git": sync_applied_files(
+                                     targets, root, policy=policy, rid=rid,
+                                     purpose=req.get("purpose"))})
         # The request has been consumed; move it aside so it is never applied
         # twice, but keep it for the audit trail.
         done_dir = outbox / "applied"
