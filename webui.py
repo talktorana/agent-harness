@@ -217,14 +217,19 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <table><thead><tr>
  <th style="width:150px">started (UTC)</th><th style="width:90px">status</th>
  <th style="width:56px">steps</th><th style="width:70px">took</th>
- <th>prompt (scheduled runs only)</th><th>answer</th>
+ <th>prompt / task</th><th>answer</th>
 </tr></thead><tbody id="runs"></tbody></table>
 <div id="detail"></div>
 <script>
 const NICE={ok:'ok',success:'ok',running:'running',no_end_record:'no end record',
-            error:'error',failed:'failed',timeout:'timeout'};
+            error:'error',failed:'failed',timeout:'timeout',
+            step_limit_with_answer:'step limit (partial)',
+            step_limit:'step limit (no answer)'};
+// 'step_limit_with_answer' really occurs: the agent ran out of steps but still
+// produced a report. Colouring that red would train an operator to ignore red,
+// which is the opposite of what a status column is for.
 function cls(s){return s==='ok'||s==='success'?'ok':
-                    (s==='running'?'warn':'bad');}
+                    (s==='running'||s==='step_limit_with_answer'?'warn':'bad');}
 function ago(iso){
   if(!iso)return '';
   const t=Date.parse(iso); if(isNaN(t))return iso;

@@ -302,6 +302,27 @@ class PageSurfaceTest(TempDirs):
         self.assertIn("disabled", page)
         self.assertIn("overdue", page)
 
+    def test_a_step_limited_run_is_not_coloured_as_a_failure(self):
+        """``step_limit_with_answer`` really occurs on this deployment.
+
+        The agent hits its step budget but still produces a report. Painting
+        that the same red as a crash teaches an operator to ignore red, which
+        defeats the status column.
+        """
+        page = webui.RUNS_PAGE
+        self.assertIn("step_limit_with_answer", page)
+        #: It must be in the warn branch, not the failure branch. The function
+        #: spans two lines, so take the whole body up to the closing brace.
+        body = page[page.index("function cls("):]
+        body = body[:body.index("}")]
+        self.assertIn("step_limit_with_answer", body)
+        self.assertIn("warn", body)
+
+    def test_the_run_table_labels_prompt_and_task_domain_free(self):
+        """Manual console runs appear here too, not only scheduled ones."""
+        self.assertIn("prompt / task", webui.RUNS_PAGE)
+        self.assertNotIn("scheduled runs only", webui.RUNS_PAGE)
+
     def test_the_page_escapes_values_it_renders(self):
         """A prompt or answer carrying HTML must not be injected."""
         page = webui.RUNS_PAGE
