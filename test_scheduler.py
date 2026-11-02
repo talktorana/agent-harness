@@ -523,5 +523,125 @@ class TestOperatorHoldPausesTheLoop(SchedulerPaths):
         self.assertEqual(self.ran, ["run a pass"])
 
 
+class TestRunKilledWithTheProcess(SchedulerPaths):
+    """A pass that dies mid-run must not cost a whole cycle.
+
+    ``last_run`` is stamped BEFORE the mission and ``finished`` only when it
+    returns -- the ordering that stops an overlapping poll from double-starting
+    it. The consequence is a signature nothing used to interpret: a stamp with
+    no finishing stamp means the run DIED. Live 2026-11-02 the 06:13 pass was
+    killed by a recreate five minutes in, its slot was treated as served, the
+    next pass waited until 06:49, and the console showed ``running`` for 36
+    minutes because ``finished`` still described the run before it.
+
+    The detection is exact rather than a timeout because jobs run in this
+    process: at startup no run can be live, so a stranded stamp can only have
+    been left by a process that is gone. The tests pin that boundary too --
+    reclaiming MID-loop would steal the slot of a run that is still working.
+    """
+
+    def stranded(self, started_min_ago: float = 5.0) -> None:
+        """State as a killed run leaves it: last_run, no finishing stamp.
+
+        The default is 5 minutes into a 30-minute cycle -- the real shape of the
+        06:13 kill. A stamp OLDER than the interval would already be due again
+        and would prove nothing, which is exactly how the first version of this
+        fixture passed for the wrong reason.
+        """
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+        started = (datetime.now()
+                   - timedelta(minutes=started_min_ago)).isoformat()
+        previous = (datetime.now()
+                    - timedelta(minutes=started_min_ago + 30)).isoformat()
+        #: MERGED into whatever is already there, not replaced: a second
+        #: interruption must accumulate on the first, which is the whole point
+        #: of interrupted_count. Replacing the document wiped it and made the
+        #: accumulation test pass by reading a fresh 1.
+        try:
+            doc = json.loads(self.state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            doc = {}
+        doc.setdefault("jobs", {}).setdefault("monitor", {}).update({
+            "last_run": started,
+            "last_ok": True,
+            "finished": previous,
+        })
+        self.state.write_text(json.dumps(doc), encoding="utf-8")
+
+    def test_a_stranded_slot_is_re_opened(self):
+        _write(self.declaration, [_job(every_min=30)])
+        self.stranded()
+        self.assertEqual(scheduler.due_jobs(), [],
+                         "precondition: the slot is consumed, which is the bug")
+        self.assertEqual(scheduler.reclaim_interrupted(), ["monitor"])
+        self.assertEqual(len(scheduler.due_jobs()), 1,
+                         "the lost pass must be due immediately")
+
+    def test_the_interruption_is_recorded_not_silently_retried(self):
+        """A deploy that keeps eating missions should be visible."""
+        _write(self.declaration, [_job(every_min=30)])
+        self.stranded()
+        scheduler.reclaim_interrupted()
+        entry = json.loads(self.state.read_text(encoding="utf-8"))["jobs"]["monitor"]
+        self.assertNotIn("last_run", entry, "the slot must be re-opened")
+        self.assertIn("started", entry["interrupted"])
+        self.assertIn("re-opened", entry["interrupted"]["reason"])
+        self.assertEqual(entry["interrupted_count"], 1)
+
+    def test_the_count_accumulates_across_interruptions(self):
+        _write(self.declaration, [_job(every_min=30)])
+        self.stranded()
+        scheduler.reclaim_interrupted()
+        self.stranded(started_min_ago=3)
+        scheduler.reclaim_interrupted()
+        entry = json.loads(self.state.read_text(encoding="utf-8"))["jobs"]["monitor"]
+        self.assertEqual(entry["interrupted_count"], 2)
+
+    def test_a_completed_run_is_left_alone(self):
+        """finished >= last_run means it ended; there is nothing to reclaim."""
+        _write(self.declaration, [_job(every_min=30)])
+        self.stub_task()
+        scheduler.run_due_jobs()
+        self.assertEqual(scheduler.reclaim_interrupted(), [])
+        self.assertEqual(scheduler.due_jobs(), [],
+                         "a completed run must still wait for its interval")
+
+    def test_the_reclaimed_pass_actually_runs(self):
+        _write(self.declaration, [_job(every_min=30)])
+        self.stranded()
+        self.stub_task()
+        scheduler.reclaim_interrupted()
+        records = scheduler.run_due_jobs()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(self.ran, ["run a pass"])
+
+    def test_the_console_stops_saying_running_once_reclaimed(self):
+        """The 36-minute 'running' was the same defect seen from the console."""
+        _write(self.declaration, [_job(every_min=30)])
+        self.stranded()
+        self.assertTrue(scheduler.status()["jobs"][0]["running"],
+                        "precondition: a stranded stamp reads as in progress")
+        scheduler.reclaim_interrupted()
+        job = scheduler.status()["jobs"][0]
+        self.assertFalse(job["running"])
+        self.assertIsNotNone(job["interrupted"],
+                             "the view must say the pass was killed, not lost")
+        self.assertEqual(job["interrupted_count"], 1)
+
+    def test_a_failed_run_is_not_mistaken_for_an_interrupted_one(self):
+        """A failure CONSUMES its slot on purpose (no 30-second retry loop)."""
+        _write(self.declaration, [_job(every_min=30)])
+        self.stub_task(raises=RuntimeError("provider 429"))
+        scheduler.run_due_jobs()
+        self.assertEqual(scheduler.reclaim_interrupted(), [],
+                         "a recorded failure must not be re-queued as if the "
+                         "process had died")
+        self.assertEqual(scheduler.due_jobs(), [])
+
+    def test_nothing_to_reclaim_when_the_state_is_empty(self):
+        _write(self.declaration, [_job()])
+        self.assertEqual(scheduler.reclaim_interrupted(), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

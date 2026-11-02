@@ -267,6 +267,11 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             "running": running,
             #: Duration of the LAST COMPLETED run, never negative.
             "duration_sec": duration,
+            #: A run that died with a previous process. Shown so an operator
+            #: can see the pass was KILLED, not skipped: a deploy that eats
+            #: missions should be visible in the view that reports schedules.
+            "interrupted": entry.get("interrupted"),
+            "interrupted_count": entry.get("interrupted_count"),
         })
 
     return {
@@ -362,6 +367,68 @@ def due_jobs(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         if _due(job, now, state, key):
             due.append({**job, "_key": key})
     return due
+
+
+def reclaim_interrupted(now: Optional[datetime] = None) -> List[str]:
+    """Re-open the slot of any run that died with the PREVIOUS process.
+
+    ``last_run`` is stamped BEFORE a job runs, and ``finished`` is written only
+    when it RETURNS. That ordering is correct -- it is what stops an overlapping
+    poll from starting the same mission twice -- but it leaves a signature that
+    nothing used to interpret:
+
+        last_run stamped, finished never brought forward  ==  the run died.
+
+    On this deployment that is not a rare event: recreating the sidecar kills
+    whatever is running, and rebuilding the image is how a fix is deployed, so
+    every deploy risks one. Live 2026-11-02 the 06:13 pass was killed 5 minutes
+    in; its slot was treated as served, the next pass waited until 06:49, and
+    the console showed the job as ``running`` for 36 minutes because
+    ``finished`` still described the run before it.
+
+    THE DETECTION IS EXACT, not a timeout heuristic. Jobs run in THIS process,
+    so at startup there is no live run to protect: a persisted stamp with no
+    finishing stamp can only have been left by a process that is gone. That is
+    why this runs once at startup and never mid-loop -- mid-loop the same
+    signature means a run in progress, and stealing that slot would double-run
+    the mission.
+
+    The slot is RE-OPENED (``last_run`` removed) and the fact is RECORDED
+    (``interrupted``), so the next poll fires immediately AND an operator can
+    see the pass was killed rather than lost. A silent re-run would hide a
+    deploy that keeps eating missions; a silent loss is what we had.
+    """
+    when = now or datetime.now()
+    reclaimed: List[str] = []
+    with _LOCK:
+        state = _load_state()
+        jobs = state.get("jobs") or {}
+        for key, entry in jobs.items():
+            if not isinstance(entry, dict):
+                continue
+            last = _parse_stamp(entry.get("last_run"))
+            finished = _parse_stamp(entry.get("finished"))
+            if last is None:
+                continue
+            if finished is not None and finished >= last:
+                continue          # that run ended; nothing to reclaim
+            entry["interrupted"] = {
+                "started": entry.get("last_run"),
+                "detected": when.isoformat(timespec="seconds"),
+                "reason": "the process ended before this run finished, so its "
+                          "slot is re-opened and the pass runs again",
+            }
+            #: ``count`` is cumulative for the operator, not per interruption.
+            try:
+                entry["interrupted_count"] = int(
+                    entry.get("interrupted_count") or 0) + 1
+            except (TypeError, ValueError):
+                entry["interrupted_count"] = 1
+            entry.pop("last_run", None)
+            reclaimed.append(key)
+        if reclaimed:
+            _save_state(state)
+    return reclaimed
 
 
 def run_due_jobs(verbose: bool = False) -> List[Dict[str, Any]]:
@@ -501,6 +568,21 @@ def daemon(poll_sec: float = 30.0) -> None:
         print(f"[scheduler] WARNING: {_state_path()} is not writable; jobs will "
               f"NOT run until AGENT_SCHEDULE_STATE_FILE points somewhere "
               f"writable.", flush=True)
+    #: A run killed by a recreate must not cost a whole cycle. This is the one
+    #: moment the signature is unambiguous -- see reclaim_interrupted.
+    try:
+        for key in reclaim_interrupted():
+            entry = (_load_state().get("jobs") or {}).get(key) or {}
+            interrupted = entry.get("interrupted") or {}
+            print(f"[scheduler] {key}: the previous run started "
+                  f"{interrupted.get('started')} and never finished -- this "
+                  f"process is new, so it died with the old one. Its slot is "
+                  f"re-opened and the pass will run now "
+                  f"(interruptions so far: "
+                  f"{entry.get('interrupted_count')}).", flush=True)
+    except SchedulerStateError as exc:
+        print(f"[scheduler] could not reclaim an interrupted run: {exc}",
+              flush=True)
     #: [message, last_printed_monotonic, first_seen_monotonic]
     last_error: List[Any] = []
     while True:
