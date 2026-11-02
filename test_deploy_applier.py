@@ -39,6 +39,7 @@ from deploy_applier import (  # noqa: E402
     _receipt_name,
     check_outbox_writable,
     gate_paths,
+    gate_readiness,
     gate_schema,
     handle_request,
     main,
@@ -2075,6 +2076,155 @@ class OutboxWritabilityTest(ApplierTestBase):
         blocker.write_text("x", encoding="utf-8")
         with self.assertRaises(DeployError):
             check_outbox_writable(blocker / "outbox")
+
+
+class AdvisoryGateTest(ApplierTestBase):
+    """A deployment may ask the gate for EVIDENCE without a VETO.
+
+    Why the switch exists: a gate that blocks is not free. On a paper-trading
+    host the owner's stated priority is that every fix lands during the pass
+    that found it, and a request deferred until the account happens to be in a
+    particular state is a fix that waits for a condition the pass cannot
+    schedule -- so it is re-staged next pass, or forgotten. The deployment
+    therefore wants the gate's observations kept and its veto dropped.
+
+    What must NOT change is the evidence. These tests pin both halves:
+
+    * the default is still to ENFORCE, so no deployment relaxes itself by
+      omission -- only by saying so in its own reviewed policy;
+    * when relaxed, the receipt still says what the gate saw and the exact
+      sentence it would have refused with, so "applied anyway" is never
+      indistinguishable from "the gate was happy".
+    """
+
+    def relaxed(self, readiness=None, **over):
+        spec = {"status_file": "data/readiness.json", "field": "state",
+                "label": "readiness", "safe_states": list(SAFE_STATES),
+                "max_age_sec": 900, "enforce": False}
+        spec.update(readiness or {})
+        return make_policy(readiness=spec, **over)
+
+    def deploy_one(self, policy=None):
+        path, _req = self.stage([{"target": "engine/mod.py",
+                                  "payload": "NEW = 1\n"}])
+        return self.handle(path, policy=policy or self.relaxed())
+
+    # ---- the default has not moved -----------------------------------------
+    def test_the_default_is_to_enforce(self):
+        """Silence means veto: a relaxation must be written down to happen."""
+        self.assertTrue(make_policy().readiness_enforce)
+        self.assertFalse(Policy({}).readiness_enforce is False)
+
+    def test_the_spellings_a_json_file_really_uses_are_understood(self):
+        """bool("false") is True; a stringly-typed policy must not fail open."""
+        for raw, want in ((False, False), ("false", False), ("no", False),
+                          (0, False), (True, True), ("true", True), (1, True)):
+            with self.subTest(raw=raw):
+                self.assertIs(self.relaxed({"enforce": raw}).readiness_enforce,
+                              want)
+
+    def test_a_strict_policy_still_defers_a_busy_system(self):
+        self.write_status(_status_doc(state="busy"))
+        path, _ = self.stage([{"target": "engine/mod.py",
+                               "payload": "NEW = 2\n"}])
+        receipt = self.handle(path, policy=make_policy())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertTrue(receipt.get("pending_window"))
+        self.assertFalse((self.root / "engine" / "mod.py").exists())
+
+    # ---- relaxed: the deploy lands, the evidence survives ------------------
+    def test_an_incoherent_state_is_recorded_and_the_change_still_lands(self):
+        self.write_status(_status_doc(state="busy"))
+        receipt = self.deploy_one()
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual((self.root / "engine" / "mod.py")
+                         .read_text(encoding="utf-8"), "NEW = 1\n")
+        gate = receipt["readiness"]
+        self.assertIs(gate["enforced"], False)
+        # The observation, not just the omission: which state, and the sentence
+        # a strict gate would have used.
+        self.assertEqual(gate["state"], "busy")
+        self.assertFalse(gate.get("skipped"),
+                         "a relaxed gate EVALUATED; it must not read as skipped")
+        self.assertIn("busy", gate["would_refuse"])
+        self.assertTrue(gate["pending_window"],
+                        "a busy system is a closed window, not a malformed one")
+
+    def test_a_stale_verdict_is_recorded_and_the_change_still_lands(self):
+        """The 2026-10-31 case: a touched file carrying an hour-old verdict."""
+        self.write_status(_status_doc(), stale_sec=3600)
+        receipt = self.deploy_one()
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertIn("min old", receipt["readiness"]["would_refuse"])
+        self.assertGreater(receipt["readiness"]["age_sec"], 900)
+
+    def test_a_missing_status_file_is_recorded_and_the_change_still_lands(self):
+        self.status.unlink()
+        receipt = self.deploy_one()
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertIn("no readiness status file",
+                      receipt["readiness"]["would_refuse"])
+        self.assertNotIn("state", receipt["readiness"],
+                         "there was no state to report, so none may be invented")
+
+    def test_an_unparsable_stamp_is_recorded_and_the_change_still_lands(self):
+        self.write_status(_status_doc(checked_at="an hour ago"))
+        receipt = self.deploy_one(
+            self.relaxed({"timestamp_field": "checked_at"}))
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertIn("no parsable", receipt["readiness"]["would_refuse"])
+
+    def test_a_skipped_gate_is_still_skipped_not_relaxed(self):
+        """Relaxing a veto must not make an unevaluated gate look evaluated."""
+        no_states = self.relaxed({"safe_states": []})
+        gate = gate_readiness(self.root, no_states, status_path=self.status)
+        self.assertTrue(gate.get("skipped"))
+
+    # ---- verification: warning, not rollback -------------------------------
+    def test_a_failing_verifier_keeps_the_files_when_verification_is_advisory(self):
+        path, _ = self.stage([{"target": "engine/mod.py",
+                               "payload": "NEW = 3\n"}],
+                             verify_command="exit 7")
+        receipt = self.handle(path, policy=self.relaxed(verify={"blocking": False}))
+        self.assertEqual(receipt["status"], "applied", receipt.get("reason"))
+        self.assertEqual((self.root / "engine" / "mod.py")
+                         .read_text(encoding="utf-8"), "NEW = 3\n",
+                         "an advisory failure must not restore the original")
+        self.assertIs(receipt["verify_advisory"], True)
+        self.assertEqual(receipt["verify_rc"], 7)
+        self.assertIn("KEPT", receipt["verify_warning"])
+        self.assertNotIn("quarantined", receipt,
+                         "the request succeeded; nothing to give up on")
+
+    def test_a_failing_verifier_still_rolls_back_by_default(self):
+        """The safety net is the DEFAULT; only a policy may take it away."""
+        path, _ = self.stage([{"target": "engine/mod.py",
+                               "payload": "NEW = 4\n"}],
+                             verify_command="exit 7")
+        receipt = self.handle(path, policy=make_policy())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertFalse((self.root / "engine" / "mod.py").exists(),
+                         "the original file did not exist, so rollback removes "
+                         "the new one")
+
+    def test_a_passing_verifier_is_unchanged_under_advisory(self):
+        path, _ = self.stage([{"target": "engine/mod.py",
+                               "payload": "NEW = 5\n"}],
+                             verify_command="exit 0")
+        receipt = self.handle(path, policy=self.relaxed(verify={"blocking": False}))
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["verify_rc"], 0)
+        self.assertNotIn("verify_advisory", receipt,
+                         "advisory only describes a FAILURE that was kept")
+
+    def test_the_policy_report_says_which_gates_can_veto(self):
+        """A receipt reader must not have to open the policy to know."""
+        self.assertIs(self.relaxed(verify={"blocking": False})
+                      .to_dict()["verify"]["blocking"], False)
+        self.assertIs(self.relaxed().to_dict()["readiness"]["enforce"], False)
+        strict = make_policy().to_dict()
+        self.assertIs(strict["readiness"]["enforce"], True)
+        self.assertIs(strict["verify"]["blocking"], True)
 
 
 if __name__ == "__main__":

@@ -349,17 +349,39 @@ class RetiredVocabularyTest(unittest.TestCase):
         checker that cannot see the difference certifies nothing. (This test was
         written as exactly that, and mutating the gate proved it: the assertion
         stayed green against a hardcoded field.)
+
+        The subject is the gate's own CALL GRAPH, not one function body. The
+        checks were split into ``_readiness_verdict`` so a non-enforcing caller
+        could keep what the gate had already learned before a refusal; that is
+        a move, not a change of who reads the policy. Scanning only the outer
+        function would have made the assertion fail on correct code, and
+        scanning the whole file would have made it pass on incorrect code --
+        so the functions are named here, and every one of them is held to the
+        same rule. A NEW helper in this path must be added deliberately.
+
+        ``safe_states`` is asserted BEHAVIOURALLY as well: it must be compared
+        against, not merely mentioned, or a gate could read the list and then
+        ignore it.
         """
-        source = inspect.getsource(deploy_applier.gate_readiness)
+        subjects = (deploy_applier.gate_readiness,
+                    deploy_applier._readiness_verdict)
+        sources = {fn.__name__: inspect.getsource(fn) for fn in subjects}
         for attr in ("status_label", "status_field", "safe_states",
                      "max_status_age_sec"):
-            self.assertIn(f"policy.{attr}", source,
-                          f"{attr} is not read from the policy inside the "
-                          f"gate, so the gate hardcodes consumer vocabulary")
-        self.assertNotIn('data.get("state"', source,
-                         "a hardcoded status field: a policy naming another "
-                         "field would be silently ignored while the gate "
-                         "still looked policy-driven")
+            self.assertTrue(
+                any(f"policy.{attr}" in src for src in sources.values()),
+                f"{attr} is not read from the policy inside the gate "
+                f"({', '.join(sources)}), so the gate hardcodes consumer "
+                f"vocabulary")
+        for name, source in sources.items():
+            self.assertNotIn(
+                'data.get("state"', source,
+                f"a hardcoded status field in {name}: a policy naming another "
+                f"field would be silently ignored while the gate still looked "
+                f"policy-driven")
+        self.assertIn("policy.safe_states", sources["_readiness_verdict"],
+                      "the declared safe set must be the thing the state is "
+                      "compared against, not a value the gate merely logs")
 
     def test_a_consumer_with_its_own_vocabulary_is_gated_by_its_own_policy(
             self):

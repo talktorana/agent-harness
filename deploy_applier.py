@@ -99,6 +99,29 @@ def _argv_list(raw: Any) -> Tuple[str, ...]:
 DEFAULT_MAX_STATUS_AGE_SEC = 900.0
 
 
+def _flag(raw: Any, default: bool) -> bool:
+    """A policy boolean, accepting the spellings a JSON file really uses.
+
+    ``false`` written as the string ``"false"`` is a mistake that would turn a
+    relaxation back into a veto, and this applier's whole failure mode is a
+    gate that reports one thing and does another -- so the accepted spellings
+    are enumerated rather than left to ``bool()``, where ``bool("false")`` is
+    True.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 class Policy:
     """Every DOMAIN-SPECIFIC decision this applier makes, in one place.
 
@@ -140,6 +163,38 @@ class Policy:
         #: to demand recent evidence. Found on a live rehearsal 2026-10-31.
         self.timestamp_field = str(
             readiness.get("timestamp_field") or "").strip()
+        #: Whether the readiness verdict DECIDES or merely INFORMS.
+        #:
+        #: Default true, because a gate that fails open is not a gate. But a
+        #: deployment may legitimately want the evidence without the veto: on a
+        #: paper-trading host the owner's stated priority is that every fix
+        #: lands, and a request deferred until the account happens to be flat is
+        #: a fix that waits for a condition that may never arrive in the pass.
+        #:
+        #: ``enforce: false`` keeps EVERY observation -- the state, the file and
+        #: verdict ages, the exact reason it would have refused -- and drops only
+        #: the refusal. The receipt then says ``enforced: false`` next to
+        #: ``would_refuse``, so a reader can still see that the book was open or
+        #: the verdict stale. Nothing is hidden; only the veto is optional.
+        self.readiness_enforce = _flag(readiness.get("enforce"), True)
+
+        #: Whether a failing verification ROLLS BACK the applied files.
+        #:
+        #: Same reasoning one level down. Verification is the most valuable gate
+        #: this applier has -- it is the only one that inspects the RESULT -- but
+        #: it runs the deployment's own suite, and a suite that is red for a
+        #: reason unrelated to the payload refuses work that is correct. Live
+        #: 2026-11-02: a request was rolled back three times because a stub
+        #: shared a temp file, not because the change was wrong.
+        #:
+        #: ``verify.blocking: false`` still RUNS the verifier and still records
+        #: ``verify_rc`` and its output; it only declines to undo a change that
+        #: is otherwise gated, checksummed and backed up. The receipt carries
+        #: ``verify_advisory: true`` and the failure text, so the verdict travels
+        #: with the change instead of silently disappearing.
+        verify_doc = doc.get("verify")
+        verify_doc = verify_doc if isinstance(verify_doc, dict) else {}
+        self.verify_blocking = _flag(verify_doc.get("blocking"), True)
 
         limits = doc.get("limits")
         limits = limits if isinstance(limits, dict) else {}
@@ -238,7 +293,11 @@ class Policy:
                 "safe_states": list(self.safe_states),
                 "max_status_age_sec": self.max_status_age_sec,
                 "timestamp_field": self.timestamp_field or None,
+                # Say whether the verdict can veto, so a receipt reader never
+                # has to infer it from a deployment's policy file.
+                "enforce": self.readiness_enforce,
             },
+            "verify": {"blocking": self.verify_blocking},
             "max_age_sec": self.max_age_sec,
             "forbidden_names": sorted(self.forbidden_names),
             "forbidden_dirs": list(self.forbidden_dirs),
@@ -614,6 +673,19 @@ def gate_readiness(root: Path, policy: Policy,
 
     A policy with no status file records the gate as skipped, so the receipt
     shows which gates actually ran instead of implying coverage it lacks.
+
+    ``readiness.enforce: false`` turns the veto into a report. Every observation
+    the gate makes is still gathered -- the state, both ages, and the exact
+    sentence it would have refused with -- and the verdict is returned with
+    ``enforced: false``. The gate is then an INSTRUMENT, not an obstacle: a
+    deployment that would rather land a fix and read the warning than defer the
+    fix to a moment it cannot schedule says so once, in its policy, where it is
+    reviewable -- rather than the agent learning to re-stage around it.
+
+    The observations are collected by ``_readiness_verdict`` through a dict the
+    caller owns, so a refusal hands back whatever was learned BEFORE it failed.
+    A receipt that says only ``would_refuse`` and loses the state that caused it
+    is a receipt nobody can act on.
     """
     if not policy.readiness_enabled and status_path is None:
         return {"gate": policy.status_label, "skipped": True,
@@ -627,7 +699,43 @@ def gate_readiness(root: Path, policy: Policy,
         return {"gate": label, "skipped": True,
                 "reason": "policy declares no safe_states, so the readiness "
                           "gate cannot evaluate"}
+    seen: Dict[str, Any] = {}
+    try:
+        verdict = _readiness_verdict(root, policy, status_path, seen)
+    except (PendingWindow, Refused) as exc:
+        if policy.readiness_enforce:
+            raise
+        withheld: Dict[str, Any] = {
+            "gate": label,
+            "enforced": False,
+            "would_refuse": str(exc),
+            # Distinguishes the two kinds of refusal for a reader: a closed
+            # window is a fact about the moment, a malformed verdict is a fact
+            # about the deployment.
+            "pending_window": isinstance(exc, PendingWindow),
+        }
+        withheld.update(seen)
+        return withheld
+    verdict["enforced"] = policy.readiness_enforce
+    return verdict
+
+
+def _readiness_verdict(root: Path, policy: Policy,
+                       status_path: Optional[Path],
+                       seen: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
+    """Evaluate the readiness verdict, raising on refusal.
+
+    Split out of ``gate_readiness`` so the non-enforcing caller can keep
+    whatever was already learned. ``seen`` is filled in as the checks proceed and
+    is never read by this function.
+    """
+    seen = seen if seen is not None else {}
+    label = policy.status_label
     path = status_path or _resolve_status(root, policy.status_file)
+    seen.update({"field": policy.status_field,
+                 "stamp_field": policy.timestamp_field or None,
+                 "status_file": str(path)})
     if not path.is_file():
         raise PendingWindow(
             f"no {label} status file at {path}; cannot prove the system is "
@@ -637,6 +745,9 @@ def gate_readiness(root: Path, policy: Policy,
         raise PendingWindow(f"{label} status unreadable: {err}")
     state = str(data.get(policy.status_field) or "")
     age = time.time() - path.stat().st_mtime
+    seen.update({"state": state, "age_sec": round(age, 1)})
+    if policy.timestamp_field:
+        seen["stamp"] = data.get(policy.timestamp_field)
     if age > policy.max_status_age_sec:
         raise PendingWindow(
             f"{label} status is {age / 60:.1f} min old (limit "
@@ -1711,7 +1822,34 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             rc, tail = run_command(
                 ["bash", "-lc", VERIFY_SHELL_PREFIX + verify], root,
                 test_timeout)
-            if rc != 0:
+            if rc != 0 and not policy.verify_blocking:
+                #: ADVISORY VERIFICATION: the verifier ran, and its failure is
+                #: recorded in full -- but it does not undo an otherwise gated,
+                #: checksummed, backed-up change. The reason a deployment asks
+                #: for this is that the VERIFIER is often the broken thing: on
+                #: 2026-11-02 a request was rolled back three times by a suite
+                #: whose stub shared a temp file between tests, which says
+                #: nothing about the payload. Rolling back correct work to
+                #: satisfy an unrelated red test is the same class of failure as
+                #: refusing it at a gate, so the policy chooses once.
+                #:
+                #: Nothing is softened silently: ``verify_advisory`` and the rc
+                #: are in the receipt, and the deployment's own brief is what
+                #: must decide whether an advisory red can be reported as
+                #: "closed". Two files are already written here, so the
+                #: alternative -- restore -- is presented as the unusual choice.
+                plan["verify_rc"] = rc
+                plan["verify_command"] = verify
+                plan["verify_output"] = tail[-800:]
+                plan["verify_advisory"] = True
+                plan["verify_warning"] = (
+                    f"verification returned rc={rc} and the files were KEPT: "
+                    f"verify.blocking is false in this deployment's policy. The "
+                    f"failure is recorded here and in verify_output -- it is "
+                    f"evidence about the deployment, not a verdict on this "
+                    f"change. Confirm the payload itself before calling it "
+                    f"closed.")
+            elif rc != 0:
                 restore_backup(made)
                 # 126/127 mean the shell could not RUN the verifier (not found,
                 # not executable). That is a configuration error in the request,
@@ -1736,9 +1874,10 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
                     {**plan, "verify_rc": rc, "verify_command": verify,
                      "verify_output": tail, "backups": made},
                     dry_run=dry_run)
-            plan["verify_rc"] = rc
-            plan["verify_command"] = verify
-            plan["verify_output"] = tail[-800:]
+            else:
+                plan["verify_rc"] = rc
+                plan["verify_command"] = verify
+                plan["verify_output"] = tail[-800:]
 
         services = list(req.get("services") or [])
         if services and allow_restart:
