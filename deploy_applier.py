@@ -1086,6 +1086,44 @@ def restart_services(services: List[str], root: Path,
 IMAGE_STAMP_NAME = "image_state.json"
 
 
+def _service_image(root: Path, service: str) -> str:
+    """The image reference a compose service runs, or "" if it cannot be read.
+
+    WHY THIS EXISTS (found live 2026-11-02). The build stamp was keyed by
+    SERVICE, but ``docker compose build`` replaces an IMAGE TAG -- and two
+    services can share one tag. In the deployment where this was found, an API
+    service and the worker that shares its code both ran the SAME image, so
+    rebuilding the worker refreshed the code BOTH containers start from while
+    leaving the API's stamp on the previous revision.
+
+    A monitoring pass then compared the API's stamp against the disk, called it
+    "STALE by one revision", and staged a rebuild -- twice. Nothing was stale:
+    both containers already ran the rebuilt image. The stamp was reporting the
+    last time that SERVICE was named in a build, which is a different question,
+    and the brief teaches passes to read it as "is this service's code current".
+
+    Best-effort by design: a failed compose call returns "" and the caller falls
+    back to the service-only key, which is what older stamps have anyway.
+    """
+    try:
+        rc, out = run_command(["docker", "compose", "config", "--format",
+                               "json"], Path(root), 60.0)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if rc not in (0, None):
+        return ""
+    start = out.find("{")
+    if start < 0:
+        return ""
+    try:
+        config = json.loads(out[start:])
+    except ValueError:
+        return ""
+    svc = (config.get("services") or {}).get(service) or {}
+    image = svc.get("image")
+    return image if isinstance(image, str) else ""
+
+
 def _record_image_stamp(root: Path, service: str,
                         results: List[Dict[str, Any]]) -> None:
     """Record which host files the just-built image was built from.
@@ -1117,12 +1155,23 @@ def _record_image_stamp(root: Path, service: str,
                         sha256_bytes(path.read_bytes())
                 except OSError:
                     continue
-        stamp[service] = {
+        entry = {
             "built_at": datetime.now(timezone.utc).isoformat(),
             "built_from": built_from,
             "commands": [r.get("cmd") for r in results
                          if r.get("service") == service],
         }
+        stamp[service] = entry
+        #: ALSO key by IMAGE. ``build <svc>`` replaces a TAG, and several
+        #: services may run that tag, so the image entry is the one that answers
+        #: "is the code this service starts from current?" for every one of
+        #: them. The service entry stays for readers of older stamps and for
+        #: deployments where the mapping cannot be resolved.
+        image = _service_image(root, service)
+        if image:
+            stamp["image:" + image] = dict(entry, services=sorted(
+                name for name, svc in _service_images(root).items()
+                if svc == image))
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = stamp_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(stamp, indent=2, sort_keys=True),
@@ -1130,6 +1179,30 @@ def _record_image_stamp(root: Path, service: str,
         os.replace(tmp, stamp_path)
     except Exception:  # noqa: BLE001 - bookkeeping must never fail a build
         pass
+
+
+def _service_images(root: Path) -> Dict[str, str]:
+    """service -> image reference for every compose service. Best effort."""
+    try:
+        rc, out = run_command(["docker", "compose", "config", "--format",
+                               "json"], Path(root), 60.0)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if rc not in (0, None):
+        return {}
+    start = out.find("{")
+    if start < 0:
+        return {}
+    try:
+        config = json.loads(out[start:])
+    except ValueError:
+        return {}
+    out_map: Dict[str, str] = {}
+    for name, svc in (config.get("services") or {}).items():
+        image = (svc or {}).get("image")
+        if isinstance(image, str):
+            out_map[str(name)] = image
+    return out_map
 
 
 # ============================================================== typed actions

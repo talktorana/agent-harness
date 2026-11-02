@@ -275,6 +275,82 @@ class RebuildOnlyRequestTest(ApplierTestBase):
                       "the build leg is the whole point of this request: %r"
                       % (cmds,))
 
+    def test_a_shared_image_is_stamped_once_for_every_service_that_runs_it(self):
+        """Building ONE service must refresh the stamp for its SIBLINGS.
+
+        Found live 2026-11-02. `docker compose build <svc>` replaces an IMAGE
+        TAG, and two services in one deployment can run the SAME image -- an API
+        and the worker beside it. Rebuilding the worker therefore refreshed the
+        code both containers start from while leaving the API's SERVICE-keyed
+        stamp on the previous revision.
+
+        A monitoring pass compared that stale stamp to the disk, reported the
+        API "STALE by one revision", and staged a rebuild -- TWICE. Nothing was
+        stale: both containers already ran the rebuilt image. The question the
+        reader was told to ask ("is this service's code current?") is about the
+        IMAGE, so the answer must be keyed by the image.
+        """
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        compose = {
+            "services": {
+                "svc-a": {"image": "shared:1.0"},
+                "svc-b": {"image": "shared:1.0"},
+                "svc-c": {"image": "other:2.0"},
+            }
+        }
+
+        def fake_run(cmd, cwd, timeout):
+            if cmd[:3] == ["docker", "compose", "config"]:
+                return 0, json.dumps(compose)
+            return 0, "ok"
+
+        original = deploy_applier.run_command
+        deploy_applier.run_command = fake_run
+        try:
+            rows = deploy_applier.restart_services(["svc-a"], self.root, 20.0)
+        finally:
+            deploy_applier.run_command = original
+
+        self.assertTrue(all(r["rc"] == 0 for r in rows))
+        stamp = json.loads((self.root / "data" / "deploy"
+                            / deploy_applier.IMAGE_STAMP_NAME).read_text(
+                                encoding="utf-8"))
+        self.assertIn("image:shared:1.0", stamp,
+                      "the stamp must be keyed by IMAGE, or a sibling service "
+                      "reads a stale build time for code it already has")
+        self.assertEqual(stamp["image:shared:1.0"]["services"],
+                         ["svc-a", "svc-b"],
+                         "both services running that image share the build")
+        #: The service key stays, for readers of older stamps and for
+        #: deployments whose compose mapping cannot be resolved.
+        self.assertIn("svc-a", stamp)
+        self.assertNotIn("image:other:2.0", stamp,
+                         "an unrelated image must not be stamped")
+
+    def test_an_unresolvable_image_mapping_still_writes_the_service_key(self):
+        """Bookkeeping degradation must never lose the stamp entirely."""
+        (self.root / "engine").mkdir(parents=True, exist_ok=True)
+        (self.root / "engine" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+
+        def fake_run(cmd, cwd, timeout):
+            if cmd[:3] == ["docker", "compose", "config"]:
+                return 1, "boom"
+            return 0, "ok"
+
+        original = deploy_applier.run_command
+        deploy_applier.run_command = fake_run
+        try:
+            deploy_applier.restart_services(["svc-a"], self.root, 20.0)
+        finally:
+            deploy_applier.run_command = original
+
+        stamp = json.loads((self.root / "data" / "deploy"
+                            / deploy_applier.IMAGE_STAMP_NAME).read_text(
+                                encoding="utf-8"))
+        self.assertIn("svc-a", stamp)
+        self.assertIn("engine/mod.py", stamp["svc-a"]["built_from"])
+
     def test_a_failed_build_is_never_reported_as_applied(self):
         """The failure has to surface, or the pass thinks the image is fresh.
 
@@ -385,8 +461,9 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         finally:
             deploy_applier.run_command = original
 
-        self.assertEqual(seen, ["docker compose build svc-a",
-                                "docker compose up -d --no-deps svc-a"],
+        self.assertEqual(seen[:2],
+                         ["docker compose build svc-a",
+                          "docker compose up -d --no-deps svc-a"],
                          "order is load-bearing: up before build starts the OLD "
                          "image")
         self.assertTrue(all(r["rc"] == 0 for r in rows))
