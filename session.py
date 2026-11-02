@@ -36,6 +36,47 @@ def _one_line(text: str, limit: int = 160) -> str:
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
+#: How much of one ARGUMENT appears in the human-readable ``detail`` line.
+#:
+#: Deliberately not the whole thing: a timeline row has to stay readable, and a
+#: patch-sized argument would swamp it.
+DETAIL_ARG_CHARS = 90
+
+#: Length of the stable fingerprint of a call's arguments.
+#:
+#: ``detail`` is for READING and is truncated; this is for COMPARING and is not.
+#: See ``_args_hash``.
+ARGS_HASH_CHARS = 12
+
+
+def _args_hash(args: Any) -> str:
+    """A stable fingerprint of a tool call's arguments.
+
+    WHY BOTH A DETAIL LINE AND A HASH: the mission tells a monitoring pass to
+    count repeated identical tool calls, and ``detail`` cannot support that.
+    It shows each argument truncated to 90 characters, so two calls that differ
+    only later -- the same command with a different test module, flag or line
+    range -- render identically and both end in ``…``. Live 2026-11-02 I read
+    two dashboard-suite runs as one duplicate pair for exactly this reason:
+    the second was a verbose re-run, and the flags that distinguished it fell
+    past the cut.
+
+    Canonical and order-independent: arguments are a mapping, so key order must
+    not change the answer, and ``sort_keys`` plus a fixed separator gives the
+    same hash for the same call on any machine. Non-serialisable values fall
+    back to their ``repr`` rather than raising -- a diagnostic field must never
+    be the reason a run crashes.
+    """
+    import hashlib
+    try:
+        blob = json.dumps(args or {}, sort_keys=True, default=repr,
+                          separators=(",", ":"))
+    except (TypeError, ValueError):
+        blob = repr(args)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[
+        :ARGS_HASH_CHARS]
+
+
 def _failed(result: str) -> bool:
     """Did this action fail? Drives the ⚠️ markers in the timeline.
 
@@ -121,7 +162,7 @@ class SessionLog:
     def action(self, step: int, name: str, args: Dict[str, Any],
                result: str, seconds: float) -> None:
         """Record one tool call. This is the spine of the timeline."""
-        detail = " ".join(f"{k}={_one_line(v, 90)}"
+        detail = " ".join(f"{k}={_one_line(v, DETAIL_ARG_CHARS)}"
                           for k, v in (args or {}).items()) or "(no arguments)"
         ok = not _failed(result)
         if not ok:
@@ -130,6 +171,11 @@ class SessionLog:
             "step": step,
             "tool": name,
             "detail": detail,
+            #: Identity of the CALL, not a rendering of it. `detail` is
+            #: truncated to DETAIL_ARG_CHARS per argument, so it cannot tell
+            #: two similar commands apart; this can, which is what "count the
+            #: repeated identical calls" needs.
+            "args_hash": _args_hash(args),
             "result": result,
             "seconds": round(float(seconds), 2),
             "ok": ok,

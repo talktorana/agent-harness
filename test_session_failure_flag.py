@@ -121,5 +121,75 @@ class TheCounterFollowsTheFlagTest(unittest.TestCase):
         log._jsonl.close()
 
 
+class ActionIdentityTest(unittest.TestCase):
+    """A call's identity must be exact; its rendering may be truncated.
+
+    The mission tells a monitoring pass to "count the repeated identical calls
+    -- same tool + same arguments". It can only do that if identity is
+    recoverable from the record, and ``detail`` cannot supply it: each argument
+    is cut at 90 characters, so two invocations differing only later render
+    identically and both end in an ellipsis.
+
+    Live 2026-11-02 I read two dashboard-suite runs as a duplicate pair for
+    exactly this reason -- the second was a verbose re-run and the flag that
+    distinguished it fell past the cut. The waste figure I reported was wrong,
+    in the direction that makes an agent look wasteful when it was not.
+
+    ``args_hash`` is the fix, and it is a FINGERPRINT, not a copy: 12 hex
+    characters per action, so the whole jsonl grows negligibly.
+    """
+
+    def test_calls_differing_only_past_the_display_cut_are_distinguishable(self):
+        #: A generic path on purpose: this repository holds no deployment's
+        #: vocabulary, and a fixture that quotes one turns the real command into
+        #: the shape the code is tested against. test_genericity enforces it.
+        base = ("cd /project/app/widgets && "
+                "PYTHONPYCACHEPREFIX=/agent-data/work/pyc python3 -m unittest "
+                "discover -s . -p test_*.py -t .")
+        a = {"command": base}
+        b = {"command": base + " -v"}
+        self.assertEqual(session._one_line(a["command"], 90),
+                         session._one_line(b["command"], 90),
+                         "precondition: the rendered forms collide")
+        self.assertNotEqual(session._args_hash(a), session._args_hash(b),
+                            "two different commands must not share a hash")
+
+    def test_the_same_call_hashes_the_same(self):
+        a = {"command": "ls -la", "reason": "look"}
+        self.assertEqual(session._args_hash(a), session._args_hash(dict(a)))
+
+    def test_key_order_does_not_matter(self):
+        """Arguments are a mapping; insertion order is not information."""
+        self.assertEqual(session._args_hash({"x": 1, "y": 2}),
+                         session._args_hash({"y": 2, "x": 1}))
+
+    def test_different_arguments_hash_differently(self):
+        self.assertNotEqual(session._args_hash({"command": "ls"}),
+                            session._args_hash({"command": "ls -l"}))
+
+    def test_no_arguments_is_a_stable_hash(self):
+        self.assertEqual(session._args_hash(None), session._args_hash({}))
+        self.assertEqual(len(session._args_hash({})),
+                         session.ARGS_HASH_CHARS)
+
+    def test_a_non_serialisable_argument_does_not_raise(self):
+        """A diagnostic field must never be why a run crashes."""
+        self.assertTrue(session._args_hash({"weird": {1, 2, 3}}))
+
+    def test_the_record_carries_the_hash(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = session.SessionLog("probe", sessions_dir=Path(tmp.name))
+        self.addCleanup(log._jsonl.close)
+        log.action(1, "run_command", {"command": "ls -la"}, "exit=0\nok", 0.1)
+        log.action(2, "run_command", {"command": "ls -la"}, "exit=0\nok", 0.1)
+        log.action(3, "run_command", {"command": "ls -la -v"}, "exit=0\nok", 0.1)
+        keys = [(a["tool"], a["args_hash"]) for a in log._actions]
+        self.assertEqual(keys[0], keys[1], "an identical repeat must be visible")
+        self.assertNotEqual(keys[0], keys[2],
+                            "a different call must not look like a repeat")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
