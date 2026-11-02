@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import shutil
 import os
 import sys
 import tempfile
@@ -183,8 +184,11 @@ class ComposeTest(DeployTestBase):
         self.assertIn("purpose", str(ctx.exception))
 
     def test_an_empty_or_oversized_request_is_refused(self):
-        with self.assertRaises(tools_deploy.DeployError):
+        with self.assertRaises(tools_deploy.DeployError) as ctx:
             tools_deploy.compose_deploy_request(purpose="p", files=[])
+        #: The message must name the third legal shape, or a pass that COULD
+        #: have used a rebuild-only request is told only that it is wrong.
+        self.assertIn("service", str(ctx.exception))
         with mock.patch.object(config, "DEPLOY_MAX_FILES", 2):
             with self.assertRaises(tools_deploy.DeployError) as ctx:
                 tools_deploy.compose_deploy_request(
@@ -967,6 +971,54 @@ class StagedAgainstReachesTheAgentTest(unittest.TestCase):
         text = tools_deploy._summarise_outcome(dict(self.RECEIPT))
         self.assertIn("changed AFTER this request was staged", text)
         self.assertNotIn("NOT checked", text)
+
+
+class RebuildOnlyStagingTest(unittest.TestCase):
+    """The agent must be able to COMPOSE what the host will ACCEPT.
+
+    Found live on 2026-11-02, after the applier had already been taught to take
+    a fileless rebuild request: staging it still failed with "a deploy request
+    must name at least one file, or carry an 'action'". The host would have
+    applied it; the agent could not create it. Fixing one end of a seam and not
+    the other leaves the same dead end, just harder to see -- and the pass that
+    hits it reads the error as "this repair is not permitted".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "project"
+        self.outbox = self.root / ".deploy" / "outbox"
+        self.outbox.mkdir(parents=True)
+        self._patches = [
+            mock.patch.object(config, "PROJECT_ROOT", str(self.root)),
+            mock.patch.object(config, "DEPLOY_ROOT", str(self.root)),
+            mock.patch.object(config, "DEPLOY_MODE", "direct"),
+        ]
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_a_fileless_rebuild_request_can_be_staged(self):
+        req = tools_deploy.compose_deploy_request(
+            purpose="rebuild the stale image", files=[], services=["svc-a"])
+        doc = json.loads(Path(req["_request_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(doc["files"], [])
+        self.assertEqual(doc["services"], ["svc-a"])
+        self.assertEqual(doc["purpose"], "rebuild the stale image")
+
+    def test_the_summary_says_rebuild_only_rather_than_showing_nothing(self):
+        """An empty target list must be explained, not left blank."""
+        text = tools_deploy.deploy_request(
+            purpose="rebuild the stale image", files=[], services=["svc-a"])
+        self.assertIn("rebuild only", text)
+        self.assertIn("svc-a", text)
+        self.assertNotIn("targets: \n", text)
+
+    def test_no_files_no_action_no_services_is_still_refused(self):
+        """The relaxation stops at "asks for nothing"."""
+        with self.assertRaises(tools_deploy.DeployError):
+            tools_deploy.compose_deploy_request(purpose="p")
 
 
 if __name__ == "__main__":

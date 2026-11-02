@@ -311,9 +311,16 @@ def compose_deploy_request(purpose: str,
             "a request is either a file deploy or an action, not both: two "
             "kinds of change in one receipt cannot be reviewed or rolled back "
             "as one unit")
-    if action is None and not files:
-        raise DeployError("a deploy request must name at least one file, or "
-                          "carry an 'action'")
+    if action is None and not files and not services:
+        #: ...BUT ``services`` ALONE is a complete request: "rebuild these and
+        #: change no file". That is the stale-image repair, and refusing to
+        #: COMPOSE it was the other half of the gap fixed in the applier on
+        #: 2026-11-02 -- the host would have accepted the request while the
+        #: agent could not create one, which is the same dead end seen from the
+        #: other side. Nothing is relaxed for the empty case: no files, no
+        #: action and no services still means the request asks for nothing.
+        raise DeployError("a deploy request must name at least one file, an "
+                          "'action', or at least one service to rebuild")
 
     outbox = outbox_dir()
     outbox.mkdir(parents=True, exist_ok=True)
