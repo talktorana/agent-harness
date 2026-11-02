@@ -43,6 +43,24 @@ def _failed(result: str) -> bool:
     prefix, so it needs its own signal -- otherwise a block that raised looks
     identical to one that printed a number, and the timeline lies about what
     worked.
+
+    BUT AN EXIT CODE IS A VERDICT, and text-matching must never overrule it.
+
+    ``run_command`` returns ``exit=<rc>`` as its first line, so when that line
+    is present the shell has already decided. Scanning the body anyway marked a
+    command failed whenever its OUTPUT happened to contain the phrase
+    "Traceback (most recent call last)" -- and on this deployment that is the
+    normal, correct output of the most valuable command there is:
+
+        grep -nE 'CRITICAL|ERROR|Traceback' watchdog.log     # exit=0
+
+    Live 2026-11-02 the 11:21 pass was scored with 5 failed calls while three of
+    them were exactly that: successful greps whose findings were tracebacks.
+    Everything downstream inherits the lie -- the console paints ⚠️ on correct
+    work, ``self._errors`` inflates, and a pass judging its own efficiency
+    concludes it wasted turns it did not waste. The mission text tells a pass to
+    quantify its failures; a counter that counts the act of LOOKING FOR errors
+    as an error cannot be used for that.
     """
     s = str(result)
     head = s[:200].lstrip()
@@ -50,6 +68,12 @@ def _failed(result: str) -> bool:
                         "NOT FOUND", "BAD ARGUMENTS", "DECLINED", "EMPTY",
                         "IS A DIRECTORY", "EMPTY RANGE")):
         return True
+    #: The shell already answered. Trust it, and stop reading the body.
+    if head.startswith("exit="):
+        try:
+            return int(head[len("exit="):].split(None, 1)[0].split("\n")[0]) != 0
+        except (ValueError, IndexError):
+            return False          # unparsable rc: not evidence of failure
     return ("[exception]" in s[:2000]
             or "Traceback (most recent call last)" in s[:2000])
 
