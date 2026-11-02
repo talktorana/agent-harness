@@ -285,7 +285,14 @@ class RebuildOnlyRequestTest(ApplierTestBase):
         path = self.stage_rebuild(["svc-a"])
         receipt = self.handle(path, allow_restart=True)
         self.assertEqual(receipt["status"], "failed", receipt)
-        self.assertIn("service restart failed", receipt["reason"])
+        #: Assert the MEANING, not a phrase. An earlier version of this test
+        #: pinned the literal "service restart failed" and then failed when the
+        #: wording was corrected -- a test can pin a defect in place, and this
+        #: repo has paid for that three times.
+        reason = (receipt["reason"] or "").lower()
+        self.assertTrue(
+            ("fail" in reason),
+            "the failure must be stated: %r" % (receipt["reason"],))
         rows = receipt.get("restart") or []
         self.assertTrue(rows and rows[0].get("rc") not in (0, None),
                         "the failing rc must be on the receipt: %r" % (rows,))
@@ -409,6 +416,66 @@ class RebuildOnlyRequestTest(ApplierTestBase):
                             / deploy_applier.IMAGE_STAMP_NAME).read_text(
                                 encoding="utf-8"))
         self.assertEqual(sorted(stamp), ["svc-a", "svc-b"])
+
+    def test_a_rebuild_receipt_does_not_claim_payloads_were_written(self):
+        """The reason must describe what happened, not a constant.
+
+        Found live 2026-11-02 on the first real rebuild-only receipt: it read
+        "applied: all gates passed and payloads written" while its own ``files``
+        list was empty. A pass that trusts the reason believes a file landed
+        and stops looking for it.
+        """
+        def fake_run(cmd, cwd, timeout):
+            return 0, "ok"
+
+        original = deploy_applier.run_command
+        deploy_applier.run_command = fake_run
+        try:
+            path = self.stage_rebuild(["svc-a"])
+            receipt = self.handle(path, allow_restart=True)
+        finally:
+            deploy_applier.run_command = original
+        reason = receipt["reason"]
+        self.assertNotIn("payloads written", reason,
+                         "no payload was written for a fileless request: %r"
+                         % (reason,))
+        self.assertIn("NO FILES WERE WRITTEN", reason)
+        self.assertIn("svc-a", reason)
+
+    def test_a_failed_rebuild_does_not_claim_files_were_applied(self):
+        """The failure path had the same untruth, and it matters more.
+
+        "files applied but a service restart failed" on a request with no files
+        tells the reader half the change landed. Nothing did: the image is
+        still old, which is the whole reason the pass staged the request.
+        """
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=True)   # fixture has no compose
+        self.assertEqual(receipt["status"], "failed", receipt)
+        reason = receipt["reason"]
+        self.assertNotIn("files applied", reason)
+        self.assertIn("image is unchanged", reason)
+
+    def test_a_skipped_rebuild_says_nothing_was_deployed(self):
+        """No --allow-restart and no files means NOTHING happened.
+
+        Reporting that as a plain success is how an agent closes an item that
+        was never closed.
+        """
+        path = self.stage_rebuild(["svc-a"])
+        receipt = self.handle(path, allow_restart=False)
+        reason = receipt["reason"]
+        self.assertIn("SKIPPED", reason)
+        self.assertIn("nothing was deployed", reason)
+        self.assertNotIn("payloads written", reason)
+
+    def test_an_ordinary_file_deploy_keeps_its_reason(self):
+        """The common path must not be reworded into obscurity."""
+        path, _req = self.stage([{"target": "engine/mod.py",
+                                  "payload": "X = 1\n"}])
+        receipt = self.handle(path)
+        self.assertEqual(receipt["reason"],
+                         "all gates passed and payloads written")
 
     def test_without_allow_restart_a_rebuild_request_says_so(self):
         """Never a silent success: the receipt must state the restart was skipped."""

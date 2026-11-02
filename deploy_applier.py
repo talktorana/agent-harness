@@ -2079,17 +2079,53 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             plan["restart"] = restart_services(services, root, test_timeout)
             if any(r.get("rc") not in (0, None) or r.get("error")
                    for r in plan["restart"]):
-                return _record_failure(
-                    outbox, path,
+                #: Same honesty rule as the success reason below: a
+                #: rebuild-only request applies no files, so "files applied but
+                #: a service restart failed" describes a step that never
+                #: happened. The reader needs to know the IMAGE is still old.
+                failed_reason = (
+                    "the service rebuild FAILED; no files were involved, so the "
+                    "running image is unchanged -- inspect the receipt's "
+                    "restart rc before retrying"
+                    if not targets else
                     "files applied but a service restart failed; inspect the "
-                    "receipt before retrying",
+                    "receipt before retrying")
+                return _record_failure(
+                    outbox, path, failed_reason,
                     {**plan, "backups": made}, dry_run=dry_run)
         elif services:
             plan["restart_skipped"] = (
                 "run with --allow-restart to rebuild/recreate these services")
 
+        #: WHAT ACTUALLY HAPPENED, said plainly.
+        #:
+        #: The reason used to be one constant string for every successful
+        #: request, describing a payload write. A REBUILD-ONLY request writes
+        #: no files at all (``files: []``, ``services: [...]``), so its receipt
+        #: claimed a payload had been written when nothing was. Found live
+        #: 2026-11-02 on the first such receipt: ``deploy_status`` reported a
+        #: payload write for a request whose own ``files`` list was empty. A
+        #: pass that trusts the reason then believes a file landed and stops
+        #: looking for it -- the confident-wrong-line failure this deployment
+        #: keeps paying for.
+        if not targets and services:
+            rebuilt = [r.get("service") for r in (plan.get("restart") or [])]
+            if rebuilt:
+                reason = ("all gates passed and the RUNNING IMAGE of "
+                          + ", ".join(str(s) for s in rebuilt)
+                          + " was rebuilt and recreated; NO FILES WERE WRITTEN "
+                            "(rebuild-only request)")
+            else:
+                reason = ("all gates passed; no files to write and the service "
+                          "rebuild was SKIPPED (no --allow-restart) -- nothing "
+                          "was deployed")
+        elif not targets:
+            reason = "all gates passed; nothing to write"
+        else:
+            reason = "all gates passed and payloads written"
+
         receipt = write_receipt(outbox, path, "applied",
-                                "all gates passed and payloads written",
+                                reason,
                                 {**plan, "backups": made,
                                  # Recorded BEFORE the receipt is written, so the
                                  # audit trail carries the commit as applied.
