@@ -123,7 +123,7 @@ class SessionLog:
     """One run of one task: the actions, in order, with their outcomes."""
 
     def __init__(self, task: str, sessions_dir: Path = None,
-                 model: str = "", base_url: str = ""):
+                 model: str = "", base_url: str = "", origin: str = ""):
         root = Path(sessions_dir or SESSIONS_DIR)
         root.mkdir(parents=True, exist_ok=True)
 
@@ -139,6 +139,16 @@ class SessionLog:
         self.model = model
         self.base_url = base_url
         self.task = task
+        #: WHO started this run: ``schedule`` (a timed job sent its mission),
+        #: ``chat`` (an operator or a script posted to the console), ``cli``
+        #: (a person ran the command line), or "" when the caller did not say.
+        #: Every entry point writes into the SAME sessions directory, so a run
+        #: list that does not carry the origin cannot answer "did the scheduled
+        #: mission run?" -- a six-second console smoke test and a forty-minute
+        #: mission are then the same row, and the smoke test reads as a mission
+        #: that did no work. That false reading has already cost a monitoring
+        #: pass a finding of its own invention.
+        self.origin = origin
 
         self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
         self._actions: List[Dict[str, Any]] = []
@@ -146,7 +156,15 @@ class SessionLog:
         self._answer: Optional[str] = None
         self._errors = 0
 
-        self.event("session_start", task=task, model=model, base_url=base_url)
+        #: The origin key is written ONLY when the caller supplied one, so an
+        #: older reader sees the record shape it always did and a session
+        #: written before this field existed reports as "unknown" downstream
+        #: rather than being guessed at as a mission run.
+        start_fields: Dict[str, Any] = {"task": task, "model": model,
+                                        "base_url": base_url}
+        if origin:
+            start_fields["origin"] = origin
+        self.event("session_start", **start_fields)
         self._write_markdown()  # so the file exists even if we crash instantly
 
     # ------------------------------------------------------------- low level

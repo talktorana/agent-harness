@@ -144,6 +144,10 @@ def assemble_stream(chunks, emit=None, on_think=None, on_usage=None) -> SimpleNa
     #: NOT a completed answer. Recorded rather than ignored because a capped
     #: turn and a finished turn are otherwise indistinguishable downstream.
     finish_reason = None
+    #: Signature of the usage measurement already handed to ``on_usage``, so a
+    #: provider that sends the same block twice is not recorded twice. See the
+    #: emit site inside the loop for why a signature and not a boolean.
+    usage_signature: Optional[Any] = None
     for chunk in chunks:
         #: Read usage BEFORE the choices guard below. The chunk that carries
         #: usage is the final one and it has EMPTY choices by design, so a
@@ -152,10 +156,31 @@ def assemble_stream(chunks, emit=None, on_think=None, on_usage=None) -> SimpleNa
         #: call that reasoned for nothing.
         usage = getattr(chunk, "usage", None)
         if usage is not None and on_usage is not None:
-            try:
-                on_usage(usage)
-            except Exception:  # noqa: BLE001
-                pass
+            #: ONCE PER DISTINCT MEASUREMENT, not once per chunk. This used to
+            #: assume the usage-bearing chunk is unique and final; one provider
+            #: sent two chunks with IDENTICAL counts 0.2 ms apart, so a single
+            #: call wrote two ``model_usage`` records and every per-run token
+            #: total read double -- a silent doubling in exactly the evidence
+            #: used to audit what a run cost.
+            #:
+            #: Comparing a SIGNATURE rather than remembering "already emitted"
+            #: keeps both provider styles honest: a stream that repeats one
+            #: block is recorded once, and a stream that sends cumulative
+            #: counts still records each distinct value, so the last record is
+            #: always the total. Emitting as soon as the value appears (rather
+            #: than after the loop) preserves the old behaviour of surviving an
+            #: exception raised later in the stream.
+            details = (getattr(usage, "completion_tokens_details", None)
+                       or getattr(usage, "completion_tokens_detail", None))
+            sig = (getattr(usage, "prompt_tokens", None),
+                   getattr(usage, "completion_tokens", None),
+                   getattr(details, "reasoning_tokens", None))
+            if sig != usage_signature:
+                usage_signature = sig
+                try:
+                    on_usage(usage)
+                except Exception:  # noqa: BLE001
+                    pass
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -273,7 +298,8 @@ class Agent:
     def __init__(self, verbose: bool = True, on_token=None,
                  on_event=None,
                  provider: Optional[str] = None,
-                 model: Optional[str] = None):
+                 model: Optional[str] = None,
+                 origin: Optional[str] = None):
         # max_retries=0 because _complete() does its own backoff. The SDK's
         # internal retries stacked on top of ours turned one hung call into
         # many minutes of silence with nothing in the transcript to explain it.
@@ -298,6 +324,10 @@ class Agent:
         # Optional sink for structured lifecycle events (tool calls, route
         # switches, retries) so a UI can render agent activity as it happens.
         self.on_event = on_event
+        #: Who asked for this run. Recorded on the session at start so that the
+        #: run history -- which every entry point shares -- can still say which
+        #: rows were the timed mission. See SessionLog.origin.
+        self.origin = origin or ""
         # Cooperative cancellation: the web UI's Stop button sets this and the
         # step loop exits before the next model call. Set, never kill.
         self.stop_requested = False
@@ -770,7 +800,8 @@ class Agent:
         # notes before it acts, and the record of what it did should exist even
         # if this dies on the very first API call.
         self.session = SessionLog(task=task, model=self.resolved.label(),
-                                  base_url=self.resolved.base_url)
+                                  base_url=self.resolved.base_url,
+                                  origin=self.origin)
         set_memory_session(self.session.session_id)
         self._bound_storage()
 
@@ -936,7 +967,14 @@ def run_task(task: str, verbose: bool = True,
              images: Optional[List[str]] = None,
              on_token=None,
              provider: Optional[str] = None,
-             model: Optional[str] = None) -> str:
-    """Convenience entry point."""
+             model: Optional[str] = None,
+             origin: Optional[str] = None) -> str:
+    """Convenience entry point.
+
+    ``origin`` names the entry point (``schedule``, ``chat``, ``cli``). It is
+    optional so an existing caller keeps working, and it is recorded on the
+    session: the run history is shared by every entry point, and without the
+    tag a console smoke test is indistinguishable from a scheduled mission.
+    """
     return Agent(verbose=verbose, on_token=on_token, provider=provider,
-                 model=model).run(task, images=images)
+                 model=model, origin=origin).run(task, images=images)

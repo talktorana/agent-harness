@@ -344,7 +344,7 @@ def main() -> int:
     print()
 
     answer = run_task(task, verbose=not args.quiet, images=args.image or None,
-                      provider=args.provider, model=args.model)
+                      provider=args.provider, model=args.model, origin="cli")
     print("\n" + "=" * 72)
     print(answer)
     return 0

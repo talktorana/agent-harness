@@ -172,6 +172,11 @@ def run_summaries(limit: int = 60) -> List[Dict[str, Any]]:
             "prompt_preview": _one_line(start.get("task"), 140),
             "answer_preview": _one_line((answer or {}).get("text"), 200),
             "has_answer": bool(answer),
+            #: Sessions written before `origin` existed carry no key and are
+            #: reported as "unknown" rather than guessed at: defaulting them to
+            #: "schedule" would plant fake mission runs in exactly the history
+            #: an operator (or a later automated pass) audits.
+            "origin": start.get("origin") or "unknown",
         }
         if not end:
             row.update(_last_activity(path, tail))
@@ -362,7 +367,8 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div id="keep" class="m"></div>
 <table><thead><tr>
  <th style="width:150px">started (UTC)</th><th style="width:90px">status</th>
- <th style="width:56px">steps</th><th style="width:70px">took</th>
+ <th style="width:74px">origin</th>
+ <th style="width:86px">steps</th><th style="width:70px">took</th>
  <th>prompt / task</th><th>answer</th>
 </tr></thead><tbody id="runs"></tbody></table>
 <div id="detail"></div>
@@ -492,7 +498,7 @@ async function loadRuns(){
          +(held.over_budget?' \u2014 byte budget is the binding limit':''))
       : '';
   }
-  if(!rows.length){tb.innerHTML='<tr><td colspan="6" class="m">'
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="m">'
     +'no runs on disk yet</td></tr>';return;}
   tb.innerHTML=rows.map(function(r){
     // An unfinished run says what it was DOING when the file stopped growing:
@@ -522,7 +528,24 @@ async function loadRuns(){
       +'<div class="m">'+ago(r.started)+'</div></td>'
       +'<td class="'+cls(r.status)+'">'+esc(NICE[r.status]||r.status)+died
       +'</td>'
-      +'<td>'+(r.steps==null?'':r.steps)+'</td>'
+      // ORIGIN says which rows were the timed mission at all. Without this
+      // column a console smoke test that finished in six seconds with zero
+      // tool calls sits in the same list, green, and reads as a scheduled
+      // mission that did no work. Non-schedule rows are coloured so they are
+      // the first thing the eye discards when auditing cadence.
+      +'<td class="m"'+(r.origin==='schedule'?'':' title="not started by the '
+          +'scheduler"')+'>'
+      +(r.origin==='schedule'?'schedule'
+        :(r.origin==='unknown'?'<span class="m">unknown</span>'
+          :'<span class="warn">'+esc(r.origin||'')+'</span>'))+'</td>'
+      // A SCHEDULED run that made no tool calls delivered nothing, whatever
+      // its status says -- that is the row an auditor must not walk past. Only
+      // scheduled runs get the marker: a chat question legitimately needs no
+      // tools, and marking it would train the eye to ignore the marker.
+      +'<td>'+(r.steps==null?'':String(r.steps)
+          +(r.origin==='schedule'&&r.steps===0
+            ?' <span class="warn" title="the mission asked for work and not '
+            +'one tool call was made">no work</span>':''))+'</td>'
       +'<td>'+(r.elapsed_sec==null?'':secs(r.elapsed_sec))+'</td>'
       +'<td class="m">'+(r.prompt_preview?'<span class="clip">'
           +esc(r.prompt_preview)+'</span>':'<span class="bad">(no prompt)</span>')
@@ -1098,7 +1121,8 @@ document.getElementById('clear').onclick=()=>{msgs.innerHTML='';
 </script></div></body></html>"""
 
 
-def _start_task(text: str, provider=None, model=None) -> str:
+def _start_task(text: str, provider=None, model=None,
+                origin: str = "chat") -> str:
     from agent import Agent
 
     task_id = uuid.uuid4().hex[:10]
@@ -1130,7 +1154,7 @@ def _start_task(text: str, provider=None, model=None) -> str:
         agent = None
         try:
             agent = Agent(verbose=False, on_token=on_token, on_event=on_event,
-                          provider=provider, model=model)
+                          provider=provider, model=model, origin=origin)
             record["agent"] = agent
             answer = agent.run(text)
             record["answer"] = answer

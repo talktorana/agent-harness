@@ -510,7 +510,12 @@ def run_due_jobs(verbose: bool = False) -> List[Dict[str, Any]]:
         record: Dict[str, Any] = {"id": job["_key"],
                                   "started": datetime.now().isoformat()}
         try:
-            record["answer"] = run_task(job.get("message", ""), verbose=verbose)
+            #: Tagged so the run these sessions share can still say which rows
+            #: the scheduler produced. Untagged, a six-second console smoke
+            #: test sits in the same list, green, and reads as a mission that
+            #: did no work -- see SessionLog.origin.
+            record["answer"] = run_task(job.get("message", ""),
+                                        verbose=verbose, origin="schedule")
             record["ok"] = True
         except Exception as exc:  # noqa: BLE001
             record["ok"] = False

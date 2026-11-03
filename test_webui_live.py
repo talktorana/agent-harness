@@ -43,12 +43,19 @@ class FakeAgent:
     instances: list = []
 
     def __init__(self, verbose=True, on_token=None, on_event=None,
-                 provider=None, model=None):
+                 provider=None, model=None, origin=None):
+        #: This fixture must mirror the REAL Agent signature. It is not
+        #: cosmetic: a keyword the production code passes but this one does not
+        #: accept raises TypeError inside the worker thread, which the server
+        #: turns into a task whose status is `error` -- so the symptom is
+        #: "'error' != 'done'" in six unrelated tests and an error record that
+        #: looks like a runtime fault rather than a stale stub.
         self.verbose = verbose
         self.on_token = on_token
         self.on_event = on_event
         self.provider = provider
         self.model = model
+        self.origin = origin
         self.stop_requested = False
         self.started = threading.Event()
         FakeAgent.instances.append(self)
