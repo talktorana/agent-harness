@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -315,6 +317,21 @@ class AgentStopSemanticsTest(unittest.TestCase):
                                               return_value=object()))
         stack.enter_context(mock.patch.object(config, "STREAM", False))
         stack.enter_context(mock.patch.object(config, "REPO_MAP_ENABLED", False))
+        #: Isolation, spelled out because getting it wrong reached production.
+        #: A real Agent writes a session file and appends to the shared global
+        #: transcript. Two things had to be true for those to stay here:
+        #: session.py resolving its directory from config at CALL time, and
+        #: this class pinning that config value. Only the second was missing
+        #: here, and the first was missing in session.py -- together they sent
+        #: fixture sessions ("do something", model prov:alias) and transcript
+        #: lines into the deployment's live run history whenever the suite ran
+        #: inside the container. test_live_data_isolation.py fails if a class
+        #: that builds an Agent ever stops pinning these.
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        stack.enter_context(mock.patch.object(
+            config, "SESSIONS_DIR", scratch / "sessions"))
+        stack.enter_context(mock.patch.object(config, "TRANSCRIPT", ""))
         for key, val in cfg_over.items():
             stack.enter_context(mock.patch.object(config, key, val))
         return agent_mod.Agent(verbose=False)

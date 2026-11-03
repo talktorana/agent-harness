@@ -11,11 +11,13 @@ import re
 from pathlib import Path
 from typing import List
 
-from config import SESSIONS_DIR
+#: Read lazily so a patched or overridden configuration is honoured; see the
+#: note in session.py for what an import-time binding costs.
+import config
 
 
 def _files(suffix: str) -> List[Path]:
-    root = Path(SESSIONS_DIR)
+    root = Path(config.SESSIONS_DIR)
     if not root.is_dir():
         return []
     return sorted(root.glob(f"*{suffix}"),
@@ -30,7 +32,7 @@ def session_list(limit: int = 20) -> str:
     """
     files = _files(".md")[:max(1, int(limit))]
     if not files:
-        return f"(no sessions yet in {SESSIONS_DIR})"
+        return f"(no sessions yet in {config.SESSIONS_DIR})"
     rows = []
     for p in files:
         st = p.stat()
@@ -45,7 +47,7 @@ def session_read(name: str, max_chars: int = 8000) -> str:
     attempted, the tail says how it ended. The middle is reachable with
     session_search.
     """
-    root = Path(SESSIONS_DIR)
+    root = Path(config.SESSIONS_DIR)
     p = root / name if name.endswith((".md", ".jsonl")) else root / f"{name}.md"
     if not p.is_file():
         return f"NOT FOUND: {p}"

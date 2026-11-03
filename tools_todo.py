@@ -12,7 +12,10 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from config import SESSIONS_DIR
+#: Read lazily so a patched or overridden configuration is honoured; see the
+#: note in session.py. A todo file written into a live sessions directory is
+#: the same leak with a different filename.
+import config
 
 VALID = ("not-started", "in-progress", "completed")
 
@@ -31,7 +34,7 @@ def _path() -> Optional[Path]:
     sid = _state.get("session_id")
     if not sid:
         return None
-    return Path(SESSIONS_DIR) / f"todo_{sid}.json"
+    return Path(config.SESSIONS_DIR) / f"todo_{sid}.json"
 
 
 def _load() -> List[Dict[str, object]]:

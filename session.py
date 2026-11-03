@@ -19,7 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from config import SESSIONS_DIR
+#: Resolved LAZILY, as ``config.SESSIONS_DIR`` at call time, never imported as
+#: a module constant. An ``from config import SESSIONS_DIR`` here binds the
+#: value once, at import, and then NOTHING that patches the configuration can
+#: redirect a session write -- not a test's scratch directory, not a deployment
+#: override applied after start. That is not hypothetical: inside a deployed
+#: container the import-time value pointed at the LIVE sessions directory, so a
+#: test class that builds a real Agent wrote its fixture sessions (and its lines
+#: in the shared global transcript) into production run history.
+import config
 
 
 def _fence(text: str, lang: str = "") -> str:
@@ -124,7 +132,7 @@ class SessionLog:
 
     def __init__(self, task: str, sessions_dir: Path = None,
                  model: str = "", base_url: str = "", origin: str = ""):
-        root = Path(sessions_dir or SESSIONS_DIR)
+        root = Path(sessions_dir or config.SESSIONS_DIR)
         root.mkdir(parents=True, exist_ok=True)
 
         now = datetime.now(timezone.utc)

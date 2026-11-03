@@ -257,7 +257,12 @@ class TodoTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patcher = mock.patch.object(tools_todo, "SESSIONS_DIR",
+        #: config, not the module. tools_todo used to bind SESSIONS_DIR at
+        #: import, which made THIS the only patch that worked and left
+        #: config.SESSIONS_DIR -- what a deployment sets and what every other
+        #: test patches -- silently ineffective. It now resolves lazily, so
+        #: there is one place to aim a patch and no stale copy to find.
+        patcher = mock.patch.object(config, "SESSIONS_DIR",
                                     Path(self.tmp.name))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -292,7 +297,8 @@ class SessionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patcher = mock.patch.object(tools_session, "SESSIONS_DIR",
+        #: See TodoTest: config is the single place to redirect session data.
+        patcher = mock.patch.object(config, "SESSIONS_DIR",
                                     Path(self.tmp.name))
         patcher.start()
         self.addCleanup(patcher.stop)
