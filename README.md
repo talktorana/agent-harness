@@ -277,6 +277,24 @@ volumes:
 
 `--memory-export` / `--memory-import` move the tree between hosts.
 
+**Recreating the container kills whatever run is in progress** — and a
+recreate is how every fix is deployed, so the step that ships a fix is also
+the step that can destroy a pass. `recreate_guard.py` is the host-side gate
+for that step: it asks the console's scheduler whether a run is in flight,
+waits (bounded) if so, re-probes seconds before the destructive command,
+recreates only when idle, and then proves from *inside* the new container
+that it was actually replaced. Exit codes are a stable contract (0 ok, 1
+config, 2 scheduler unknown, 3 busy, 4 command failed) so scripts and agent
+passes can branch on the verdict instead of parsing prose:
+
+```bash
+python3 recreate_guard.py --mount /agent-data=/srv/agent-data            # probe only
+python3 recreate_guard.py --mount /agent-data=/srv/agent-data \
+    --image my-agent:1.0.0 --build-context /srv/agent-src \
+    --compose-dir /srv/deploy --compose-file agent.yml \
+    --container my-agent --build --apply                                  # the real thing
+```
+
 ## Copilot-parity layers
 
 The loop above is what an editor agent feels like from the inside. These are
@@ -399,6 +417,7 @@ memory.py          three-scope memory
 session.py         per-task action log
 config.py          settings, provenance, memory discovery
 llm.py             generic provider catalogue: resolve, keys, web-UI catalog
+recreate_guard.py  host-side gate: recreate the container without killing a run
 ```
 
 ## What this is not
