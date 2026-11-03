@@ -267,14 +267,34 @@ def confirm_still_idle(probe_fn, log=print,
     return action, reason
 
 
-def sh(cmd: str, log=print, cwd: Optional[str] = None) -> Tuple[int, str]:
+def sh(cmd: str, log=print, cwd: Optional[str] = None,
+       quiet_out: bool = False) -> Tuple[int, str]:
     log("+ %s" % cmd)
     proc = subprocess.run(cmd, shell=True, cwd=cwd,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out = (proc.stdout or "").strip()
-    if out:
+    if out and not quiet_out:
         log(out)
     return proc.returncode, out
+
+
+#: Name fragments that mark an environment variable as a secret. A name-based
+#: rule (not an allow-list of known variable names) because a deployment's
+#: credentials arrive under provider-chosen names the guard cannot enumerate.
+SECRET_NAME_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def mask_if_secret(name: str, value: str) -> str:
+    """The variable's value, or a redaction marker if its NAME looks secret.
+
+    Redacts on the NAME, never heuristics over the value: guessing from the
+    value both over-redacts (a path containing "token") and -- worse -- misses
+    a credential that looks like ordinary text.
+    """
+    upper = name.upper()
+    if any(hint in upper for hint in SECRET_NAME_HINTS):
+        return "<masked %d chars>" % len(value)
+    return value
 
 
 def container_started(docker: str, container: str, log=print) -> Optional[str]:
@@ -301,7 +321,13 @@ def verify(docker: str, container: str, before: Optional[str],
             "(StartedAt %s unchanged) -- the new code is NOT running" % after)
         return 4
     log("container replaced: StartedAt %s (was %s)" % (after, before))
-    rc, out = sh("%s exec %s env" % (docker, container), log=log)
+    # quiet_out: `env` prints EVERY variable including credentials (provider
+    # API keys are ordinary env names). The raw dump must never reach a log --
+    # an earlier version of this function streamed it, and watched a real
+    # provider key land in the operator's transcript. The command line IS
+    # logged (that is not secret); only the body is withheld, and what gets
+    # re-reported below is masked on the variable NAME.
+    rc, out = sh("%s exec %s env" % (docker, container), log=log, quiet_out=True)
     if rc != 0:
         log("VERIFY FAILED: could not exec into %s" % container)
         return 4
@@ -311,7 +337,7 @@ def verify(docker: str, container: str, before: Optional[str],
             key, _, val = line.partition("=")
             seen[key.strip()] = val.strip()
     for key in sorted(seen):
-        log("  in-container %s=%s" % (key, seen[key]))
+        log("  in-container %s=%s" % (key, mask_if_secret(key, seen[key])))
     if not seen:
         log("  (no %s* variables in the container env)" % env_prefix)
     return 0

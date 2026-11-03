@@ -303,6 +303,63 @@ class VerifyProvesTheReplacementTest(unittest.TestCase):
         self.assertIn("AGENT_MAX_STEPS=72", out.getvalue())
         self.assertIn("exec agent env", sh.call_args_list[1][0][0])
 
+    def test_a_secret_env_value_is_never_logged_masked_on_the_name(self):
+        """`env` prints EVERY variable, credentials included.
+
+        A real deployment watched a provider API key stream from this function
+        into an operator transcript. The dump is withheld from the log and the
+        re-reported value is masked; non-secret values stay readable, because
+        "MAX_STEPS=72 took" is the entire point of the report.
+        """
+        raw = "AGENT_MAX_STEPS=72\nAGENT_API_KEY=sk-live-supersecret\nPATH=/usr/bin"
+        with mock.patch.object(RG, "sh",
+                               side_effect=[(0, "ts-new"), (0, raw)]) as sh:
+            out = io.StringIO()
+            rc = RG.verify("docker", "agent", "ts-old", log=out.write)
+        logged = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("sk-live-supersecret", logged)
+        self.assertIn("AGENT_API_KEY=<masked", logged)
+        self.assertIn("AGENT_MAX_STEPS=72", logged)
+        # The mock above cannot exercise sh()'s own suppression, so pin the
+        # CONTRACT instead: verify must ASK for quiet output on the env call.
+        env_call = sh.call_args_list[1]
+        self.assertTrue(env_call.kwargs.get("quiet_out", False) or
+                        (len(env_call.args) > 3 and env_call.args[3] is True),
+                        "verify read env without quiet_out -- the raw dump would "
+                        "stream every secret straight into the log")
+
+    def test_sh_with_quiet_out_logs_the_command_but_never_the_body(self):
+        """The suppression itself, at its own level."""
+        done = mock.Mock(returncode=0, stdout="INFERHUB_API_KEY=sk-provider\n")
+        with mock.patch.object(RG.subprocess, "run", return_value=done):
+            out = io.StringIO()
+            rc, body = RG.sh("docker exec agent env", log=out.write, quiet_out=True)
+        self.assertEqual((rc, body), (0, "INFERHUB_API_KEY=sk-provider"))
+        self.assertIn("+ docker exec agent env", out.getvalue(),
+                      "the command line is not secret and stays visible")
+        self.assertNotIn("sk-provider", out.getvalue())
+
+    def test_sh_without_quiet_out_still_logs_the_body(self):
+        """Suppression is opt-in: ordinary commands keep their output."""
+        done = mock.Mock(returncode=0, stdout="done\n")
+        with mock.patch.object(RG.subprocess, "run", return_value=done):
+            out = io.StringIO()
+            RG.sh("docker build -t x .", log=out.write)
+        self.assertIn("done", out.getvalue())
+
+    def test_non_prefixed_variables_are_not_reported_at_all(self):
+        """The env prefix is a filter, not a redaction hint: an unprefixed
+        provider key (the shape that actually leaked) never appears."""
+        raw = "INFERHUB_API_KEY=sk-provider-leak\nPATH=/usr/bin"
+        with mock.patch.object(RG, "sh",
+                               side_effect=[(0, "ts-new"), (0, raw)]):
+            out = io.StringIO()
+            RG.verify("docker", "agent", "ts-old", log=out.write)
+        logged = out.getvalue()
+        self.assertNotIn("sk-provider-leak", logged)
+        self.assertNotIn("INFERHUB", logged)
+
     def test_an_uninspectable_container_fails_closed(self):
         with mock.patch.object(RG, "sh", return_value=(1, "No such object")):
             out = io.StringIO()
