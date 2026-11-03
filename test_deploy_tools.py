@@ -493,6 +493,31 @@ class ToolOutputTest(DeployTestBase):
 class RegistrationTest(unittest.TestCase):
     """The tools must be reachable by the model with a valid schema."""
 
+    def setUp(self):
+        """Scratch isolation, even though these tests only expect a refusal.
+
+        Three of them call ``compose_deploy_request`` inside ``assertRaises``:
+        the refusal is meant to happen before anything is staged, and today it
+        does. That is an implementation detail of the validator, not a property
+        of this test class -- and the moment a check is reordered so that
+        staging happens first, these calls write into whatever
+        ``config.DEPLOY_OUTBOX`` points at, which inside a deployed container is
+        the live outbox. A class that can stage is a class that must be
+        isolated; ``test_outbox_isolation`` enforces exactly that.
+        """
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        root = Path(self.tmpdir.name)
+        outbox = root / ".deploy" / "outbox"
+        outbox.mkdir(parents=True)
+        for attr, value in (("PROJECT_ROOT", str(root)),
+                            ("DEPLOY_ROOT", str(root)),
+                            ("DEPLOY_OUTBOX", str(outbox)),
+                            ("DEPLOY_MODE", "direct")):
+            patcher = mock.patch.object(config, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _schema(self, name):
         for entry in tools.TOOLS:
             fn = entry.get("function") or {}
@@ -993,6 +1018,19 @@ class RebuildOnlyStagingTest(unittest.TestCase):
             mock.patch.object(config, "PROJECT_ROOT", str(self.root)),
             mock.patch.object(config, "DEPLOY_ROOT", str(self.root)),
             mock.patch.object(config, "DEPLOY_MODE", "direct"),
+            #: MANDATORY, and its absence was not a cosmetic gap.
+            #: `outbox_dir()` prefers `config.DEPLOY_OUTBOX` over anything
+            #: derived from PROJECT_ROOT/DEPLOY_ROOT. Locally that value is
+            #: empty so the scratch outbox above was reached and every test
+            #: passed; inside the sidecar AGENT_DEPLOY_OUTBOX points at the
+            #: DEPLOYMENT'S LIVE OUTBOX, so these tests staged real requests
+            #: there -- and the host applier applied them (it wrote a fixture
+            #: `engine/x.py` into the live tree and attempted a rebuild of a
+            #: service that does not exist). Same file, same tests, green on one
+            #: box and destructive on the other. Pinning the outbox makes the
+            #: environment irrelevant: see test_outbox_isolation.py, which
+            #: fails if ANY staging test class forgets it.
+            mock.patch.object(config, "DEPLOY_OUTBOX", str(self.outbox)),
         ]
         for p in self._patches:
             p.start()
