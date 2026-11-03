@@ -2,7 +2,7 @@
   "jobs": [
     {
       "id": "example-interval",
-      "every_min": 30,
+      "every_min": 45,
       "enabled": false,
       "message": "Run a full monitoring pass on the project and report findings."
     },
