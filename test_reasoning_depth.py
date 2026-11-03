@@ -170,6 +170,11 @@ class ReasoningSpendIsRecordedTest(unittest.TestCase):
         inst._transcript = None
         inst.on_event = events.append
         inst._log = lambda record: events.append(record)
+        #: Modelled explicitly, and left as None by default. `_record_usage`
+        #: writes BOTH sinks, so a helper that omits this attribute does not
+        #: produce a passing test -- it produces an AttributeError that the
+        #: suite reports as three unrelated failures.
+        inst.session = None
         return inst
 
     def _usage(self, reasoning, completion=300, prompt=120):
@@ -238,6 +243,55 @@ class ReasoningSpendIsRecordedTest(unittest.TestCase):
         ]
         agent.assemble_stream(chunks, on_usage=seen.append)
         self.assertEqual(seen, [usage])
+
+    def test_the_record_reaches_the_SESSION_FILE_not_only_the_transcript(self):
+        """THE BUG THIS ACTUALLY SHIPPED WITH.
+
+        `_log()` writes the transcript. The session `.jsonl` is a DIFFERENT file,
+        written by `SessionLog.event()`, and it is the one `/agent/run/<id>` and
+        every run-quality analysis read. The first version of this recorded
+        model_usage through `_log` alone, so it never appeared in a session and
+        the console showed no usage at all -- the record was being written and
+        was invisible, which looks exactly like the fix not working.
+
+        A test that stubs only `_log` cannot see the difference, which is why
+        this one gives the agent a fake SessionLog and asserts on THAT.
+        """
+        class FakeSession:
+            def __init__(self):
+                self.events = []
+
+            def event(self, kind, **fields):
+                self.events.append({"event": kind, **fields})
+
+        events = []
+        inst = self._agent(events)
+        inst.session = FakeSession()
+        inst._record_usage(self._usage(153), "prov/alias")
+
+        self.assertEqual(len(inst.session.events), 1,
+                         "the session log never received a model_usage event")
+        rec = inst.session.events[0]
+        self.assertEqual(rec["event"], "model_usage")
+        self.assertEqual(rec["reasoning_tokens"], 153)
+        self.assertEqual(rec["route"], "prov/alias")
+        #: And the transcript copy still happens: the two sinks answer
+        #: different questions and neither replaces the other.
+        self.assertTrue(any(e.get("event") == "model_usage" for e in events),
+                        "the transcript copy was lost when the session one "
+                        "was added")
+
+    def test_a_session_that_raises_never_costs_the_call(self):
+        """Logging must not be able to break a live turn."""
+        class BoomSession:
+            def event(self, *a, **k):
+                raise RuntimeError("disk full")
+
+        events = []
+        inst = self._agent(events)
+        inst.session = BoomSession()
+        inst._record_usage(self._usage(11), "r")     # must not raise
+        self.assertTrue(any(e.get("event") == "model_usage" for e in events))
 
     def test_complete_actually_calls_the_recorder(self):
         """THE CALL SITE, not the helper.

@@ -385,7 +385,21 @@ class Agent:
             "reasoning_effort": config.REASONING_EFFORT or None,
             "max_tokens": config.MAX_TOKENS or None,
         }
-        self._log({k: v for k, v in record.items() if v is not None})
+        clean = {k: v for k, v in record.items() if v is not None}
+
+        #: TWO SINKS, because they answer different questions and neither can
+        #: stand in for the other. `_log` reaches the transcript, which is the
+        #: long stream a human greps. The SESSION file is what `/agent/run/<id>`
+        #: and every run-quality analysis read -- and a first version of this
+        #: wrote only to the transcript, so the console showed no usage at all
+        #: and the record looked absent even though it was being written.
+        if self.session is not None:
+            try:
+                fields = {k: v for k, v in clean.items() if k != "event"}
+                self.session.event("model_usage", **fields)
+            except Exception:  # noqa: BLE001
+                pass
+        self._log(clean)
 
     def _on_think(self, n_chars: int) -> None:
         """Liveness signal from a model that is still reasoning.
