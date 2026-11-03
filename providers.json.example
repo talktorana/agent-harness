@@ -10,32 +10,33 @@
     "Nothing below names a real host or a real gateway: the `gateway` block is",
     "a template to rename. Keep it that way -- this file is the one that gets",
     "published, your providers.json is gitignored, so private endpoints and",
-    "aliases belong there and never here."
+    "aliases belong there and never here.",
+    "Hosts ending in `.test` are a reserved, unreachable TLD: they are shape, not suggestions -- replace them with your endpoint before first run."
   ],
   "default": {
-    "provider": "openrouter",
-    "model": "deepseek-v4.1-flash"
+    "provider": "example-cloud",
+    "model": "vendor-model-flash"
   },
   "providers": {
-    "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
+    "example-cloud": {
+      "base_url": "https://api.example-cloud.test/v1",
+      "api_key_env": "EXAMPLE_CLOUD_API_KEY",
       "api_key": "",
       "models": {
-        "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash-1017",
-        "deepseek-v4-pro": "deepseek/deepseek-v4-pro-0813",
-        "claude-sonnet-4.6": "anthropic/claude-sonnet-4.6",
-        "gemini-3-flash": "google/gemini-3-flash-preview",
-        "provider-5-mini": "openai/google/gemma-4-31B-it-fp8-mini"
+        "vendor-model-flash": "vendor-a/model-flash-1017",
+        "vendor-model-pro": "vendor-a/model-pro-0813",
+        "cloud-large": "vendor-c/large-model",
+        "cloud-fast": "vendor-c/fast-model",
+        "cloud-mini": "vendor-c/mini-model"
       }
     },
-    "openai": {
-      "base_url": "https://api.openai.com/v1",
-      "api_key_env": "OPENAI_API_KEY",
+    "second-cloud": {
+      "base_url": "https://api.second-cloud.test/v1",
+      "api_key_env": "SECOND_CLOUD_API_KEY",
       "api_key": "",
       "models": {
-        "gpt-5-mini": "google/gemma-4-31B-it-fp8-mini",
-        "gpt-5": "gpt-5"
+        "second-mini": "vendor-b/mini-model",
+        "second-large": "vendor-b/large-model"
       }
     },
     "ollama-local": {

@@ -38,11 +38,11 @@ between. `providers.json` (copy `providers.json.example`) names them:
 
 ```json
 {
-  "default": {"provider": "openrouter", "model": "vendor-model-flash"},
+  "default": {"provider": "example-cloud", "model": "vendor-model-flash"},
   "providers": {
-    "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
+    "example-cloud": {
+      "base_url": "https://api.example-cloud.test/v1",
+      "api_key_env": "EXAMPLE_CLOUD_API_KEY",
       "models": {
         "vendor-model-flash": "vendor/model-flash-1017",
         "vendor-model-pro": "vendor/model-pro-0813"
@@ -75,7 +75,7 @@ between. `providers.json` (copy `providers.json.example`) names them:
 
 ```bash
 python run.py --models                       # list the catalogue
-python run.py --provider openrouter --model vendor-model-flash "task..."
+python run.py --provider example-cloud --model vendor-model-flash "task..."
 python run.py --serve                        # pick provider+model in the browser
 ```
 
@@ -90,15 +90,15 @@ A **route** is one `(provider, model)` pair. A task carries an ordered chain of
 them and `_complete` walks it:
 
 ```
-openrouter/vendor-model-flash  ->  route 2  ->  route 3  ->  ...   (first success wins)
+example-cloud/vendor-model-flash  ->  route 2  ->  route 3  ->  ...   (first success wins)
 ```
 
 **Where the chain comes from** (first non-empty wins after the primary):
 
-1. `AGENT_ROUTES` env — `"openrouter/vendor-model-flash, gateway/fast"`. A bare
+1. `AGENT_ROUTES` env — `"example-cloud/vendor-model-flash, gateway/fast"`. A bare
    model inherits the catalogue's default provider.
 2. `routes.json` beside the harness (copy `routes.json.example`) —
-   `{"routes": [{"provider": "openrouter", "model": "vendor-model-flash"}, ...]}`.
+   `{"routes": [{"provider": "example-cloud", "model": "vendor-model-flash"}, ...]}`.
 3. The legacy `FALLBACK_MODEL` knob, appended LAST so it never pre-empts the
    chain you just configured.
 
@@ -108,9 +108,9 @@ resolve **lazily, per turn**, so one half-configured entry degrades the chain
 instead of killing the task.
 
 ```bash
-export OPENROUTER_API_KEY=...                           # the key, from your environment
+export EXAMPLE_CLOUD_API_KEY=...                           # the key, from your environment
 python run.py --models                                  # catalogue + chain
-python run.py --routes "openrouter/fast-alias, openrouter/big-alias" "task..."
+python run.py --routes "example-cloud/fast-alias, example-cloud/big-alias" "task..."
 python run.py --routes-file routes.json "task..."
 ```
 

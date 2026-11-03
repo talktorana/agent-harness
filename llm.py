@@ -10,11 +10,11 @@ multi-provider gateway but with no gateway in between -- the harness talks
 to each endpoint directly:
 
     {
-      "default": {"provider": "openrouter", "model": "vendor-model-flash"},
+      "default": {"provider": "example-cloud", "model": "vendor-model-flash"},
       "providers": {
         "provider": {
-          "base_url": "https://openrouter.ai/api/v1",
-          "api_key_env": "OPENROUTER_API_KEY",     # or "api_key": "sk-..."
+          "base_url": "https://api.example-cloud.test/v1",
+          "api_key_env": "EXAMPLE_CLOUD_API_KEY",     # or "api_key": "sk-..."
           "models": {"vendor-model-flash": "vendor/model-flash-1017"}
         },
         ...

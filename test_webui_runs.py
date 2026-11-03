@@ -105,7 +105,7 @@ class TempDirs(unittest.TestCase):
         path = self.sessions / f"{stamp}_{sid}.jsonl"
         lines = [json.dumps({"event": "session_start", "at": f"{stamp}.000000"
                              "+00:00", "task": prompt,
-                             "model": "inferhub/deepseek"})]
+                             "model": "gateway/vendor-model"})]
         lines.append(json.dumps({"event": "assistant", "at": f"{stamp}.01+00:00",
                                  "text": "thinking about it"}))
         lines.append(json.dumps({"event": "action", "at": f"{stamp}.02+00:00",
@@ -295,7 +295,7 @@ class RunHistoryTest(TempDirs):
         self.assertEqual(row["elapsed_sec"], 31.5)
         self.assertEqual(row["prompt"], "the scheduled mission")
         self.assertIn("the run summary", row["answer_preview"])
-        self.assertEqual(row["model"], "inferhub/deepseek")
+        self.assertEqual(row["model"], "gateway/vendor-model")
 
     def test_runs_are_newest_first(self):
         """Cadence is read off this order; oldest-first would invert the story."""

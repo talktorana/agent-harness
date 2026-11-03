@@ -1,13 +1,13 @@
 {
-  "_comment": "Ordered model-routing fallback chain. First entry is the preferred model; later entries are tried when a route is dead (unknown model, bad key) or exhausted (retries). Override with env AGENT_ROUTES='prov/model,prov/model'. Every name must match an entry in providers.json -- rename the `gateway` block there for your host and mirror it here. The chain below deliberately crosses providers so a whole gateway going dark still leaves a route: two OpenRouter models, then your own gateway, then a fully local model as the last resort.",
+  "_comment": "Ordered model-routing fallback chain. First entry is the preferred model; later entries are tried when a route is dead (unknown model, bad key) or exhausted (retries). Override with env AGENT_ROUTES='prov/model,prov/model'. Every name must match an entry in providers.json -- rename the `gateway` block there for your host and mirror it here. The chain below deliberately crosses providers so a whole gateway going dark still leaves a route: two models from one cloud provider, then your own gateway, then a fully local model as the last resort.",
   "routes": [
     {
-      "provider": "openrouter",
-      "model": "deepseek-v4.1-flash"
+      "provider": "example-cloud",
+      "model": "vendor-model-flash"
     },
     {
-      "provider": "openrouter",
-      "model": "deepseek-v4-pro"
+      "provider": "example-cloud",
+      "model": "vendor-model-pro"
     },
     {
       "provider": "gateway",
