@@ -293,6 +293,7 @@ the surfaces that make it feel like one from the outside:
 | Subagents | `run_subagent` | delegated research with a bounded child session |
 | Chat UI | `python run.py --serve` | the editor chat pane (stdlib HTTP, streaming tokens) |
 | Scheduler | `python run.py --schedule` (+ `--schedule-list`, `--schedule-dry-run`) | cron for unattended missions. The declaration (`schedule.json`) is read-only configuration; when each job last ran is written to `AGENT_SCHEDULE_STATE_FILE` beside the session log, because a deployment that mounts its own config read-only is the normal case and used to make every mission fail as a generic "loop error" |
+| Model for runs | the `/runs` page's panel, `GET`/`POST` `/model` | which model an unattended mission uses, selectable without shell access. Saved to `AGENT_MODEL_CHOICE_FILE`; outranks the catalogue default. A choice that cannot resolve is refused at save time, not at 3am |
 | Browser | `browser_*` tools (Playwright, optional) | the editor's browser preview: snapshot refs, click/type, screenshots the model can SEE |
 | Images | `view_image`, `run.py --image PATH` | multimodal input: charts, mocks, screenshots as evidence |
 | Streaming | on by default (`AGENT_STREAM=1`) | tokens print as they arrive; the web UI shows the answer forming |
@@ -324,6 +325,27 @@ Two rules that are only obvious after they have failed once:
    containers mounting the same memory root have no lock to share, and a lost
    note between them is undetectable afterwards: the file looks fine and the
    note is simply gone.
+
+3. **The model is configuration, and the console can set it.** A scheduled job
+   calls the runner with no provider and no model, so every unattended mission
+   lands on the default -- historically reachable only by editing
+   `providers.json` on the host and restarting. `/runs` therefore carries a
+   *model for runs* panel that saves the choice to `AGENT_MODEL_CHOICE_FILE`
+   (beside the session log, agent-writable by design, because the catalogue is
+   mounted read-only). Precedence is: that saved choice, then the catalogue's
+   `default` block, then `AGENT_MODEL`. The choice is resolved **before** it is
+   written, so an alias that does not exist or a provider with no key is refused
+   while the operator is watching, instead of becoming an unattended failure.
+   `reasoning_effort` and `max_tokens` are container environment and do NOT
+   follow a model choice -- the panel says so rather than implying otherwise.
+
+   Worth knowing when you pick a model for unattended work: `reasoning_effort`
+   is not honoured uniformly across routes on one gateway. Measured here, the
+   same prompt at a fixed 2000-token budget: one model returned 677 reasoning
+   tokens with no effort and 1171 at `effort=max`, while another returned a flat
+   900 at every setting -- inert, and identical wall time. On the inert route
+   the token budget was the only lever. So choose the effort setting by
+   measuring the model you actually selected, not by assuming.
 
 If the state file cannot be written, the scheduler refuses to run jobs and says
 why, rather than running a mission it cannot remember starting -- the next poll

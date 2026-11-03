@@ -343,6 +343,16 @@ SCHEDULE_FILE = Path(os.environ.get(
 SCHEDULE_STATE_FILE = Path(os.environ.get(
     "AGENT_SCHEDULE_STATE_FILE",
     str(SESSIONS_DIR / "schedule_state.json")))
+#: The model the console selected for runs that do not name one.
+#:
+#: Next to the schedule state, and for the same reason: the catalogue file is
+#: mounted read-only (it is reviewed configuration, and the applier refuses to
+#: write it -- an agent that can pick its own model owns part of its own
+#: guardrails). A choice made in the UI therefore has to land somewhere the
+#: agent may write, and it has to be a place the scheduler reads on every job.
+MODEL_CHOICE_FILE = Path(os.environ.get(
+    "AGENT_MODEL_CHOICE_FILE",
+    str(SESSIONS_DIR / "model_choice.json")))
 #: A HOLD file: while it exists, no scheduled job runs.
 #:
 #: An operator needs a way to stop the mission loop that does not mean editing

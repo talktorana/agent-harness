@@ -318,6 +318,16 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  #sched{background:#181818;border:1px solid #333;border-radius:6px;padding:10px;
         margin:12px 0}
  #sched .row{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline}
+ #model{background:#181818;border:1px solid #333;border-radius:6px;padding:10px;
+        margin:12px 0}
+ #model .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+ #model label{color:#888}
+ select{background:#111;color:#ddd;border:1px solid #444;border-radius:4px;
+        padding:3px 6px;font:inherit}
+ button{background:#16202c;color:#7fd1ff;border:1px solid #2f4f75;
+        border-radius:5px;padding:4px 10px;font:inherit;cursor:pointer}
+ button:hover{background:#1e2c3c}
+ #model .sub{margin-top:6px}
  .pill{padding:1px 8px;border-radius:10px;border:1px solid #444;font-size:12px}
  .pill.on{background:#1f4d2f;border-color:#2a6}
  .pill.off{background:#4d1f1f;border-color:#6a2a2a}
@@ -345,6 +355,7 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <a href="__AGENT_BASE__/live">live view</a>
   <a href="__AGENT_BASE__/">console</a>
 </div>
+<div id="model" class="m">loading model...</div>
 <div id="sched" class="m">loading schedule...</div>
 <div id="err"></div>
 <div id="keep" class="m"></div>
@@ -441,7 +452,6 @@ async function loadSchedule(){
     }
   });
   el.innerHTML=h; el.className='';
-  document.getElementById('schedh').textContent='';
 }
 function tog(el){
   const body=el.nextElementSibling;
@@ -554,6 +564,127 @@ async function showRun(id){
   });
   el.innerHTML=h;
 }
+
+// ---- model used by the remote harness -------------------------------------
+// The chat page's picker applies to ONE interactive turn. A scheduled mission
+// calls the runner with no model at all, so the model it uses is the harness
+// default -- which until now was reachable only by editing providers.json on
+// the host and restarting the container. This panel reads and writes that
+// default, and reports WHERE the current value comes from, so the page can
+// never imply a saved choice is in force when the catalogue is deciding.
+const SRC={console:'set here in the console',
+           catalogue:'catalogue default (providers.json)',
+           environment:'environment provider'};
+let MCAT=null;
+function mfill(keep){
+  const prov=document.getElementById('mprov'),mod=document.getElementById('mmod');
+  if(!prov||!mod)return;
+  const p=MCAT&&MCAT.providers[prov.value],ids=(p&&p.model_ids)||{};
+  mod.innerHTML='';
+  ((p&&p.models)||[]).forEach(function(m){
+    const o=document.createElement('option');o.value=m;
+    o.textContent=(ids[m]&&ids[m]!==m)?(m+' \\u2192 '+ids[m]):m;
+    mod.appendChild(o);});
+  if(keep)mod.value=keep;
+}
+async function loadModelChoice(){
+  const el=document.getElementById('model');
+  let st=null;
+  try{const r=await fetch('__AGENT_BASE__/model');st=await r.json();}catch(e){}
+  if(!MCAT){
+    try{const r=await fetch('__AGENT_BASE__/models');MCAT=await r.json();}
+    catch(e){MCAT=null;}
+  }
+  if(!st||typeof st!=='object'){el.className='bad';
+    el.textContent='model state unavailable (__AGENT_BASE__/model)';return;}
+  const usable=!!(MCAT&&MCAT.providers&&Object.keys(MCAT.providers).length);
+  let h='<div class="row"><label>model for runs</label>';
+  h+=usable
+    ?'<select id="mprov"></select><select id="mmod"></select>'
+     +'<button onclick="saveModel()">save as default</button>'
+     +'<button onclick="clearModelChoice()">use catalogue default</button>'
+    :'<span class="bad">catalogue unavailable -- cannot choose a model here</span>';
+  h+='</div>';
+  if(st.error)h+='<div class="sub bad">'+esc(st.error)+'</div>';
+  h+='<div class="sub">in force <b>'+(st.provider||'?')+' / '+(st.model||'?')
+    +'</b>'
+    +(st.model_id&&st.model_id!==st.model
+      ?' <span class="m">on the wire: '+esc(st.model_id)+'</span>':'')
+    +' <span class="m">('+esc(SRC[st.source]||st.source)+')</span></div>'
+    +'<div class="sub m">applies to scheduled missions and to any task that '
+    +'does not name a model. A choice made on the chat page affects only that '
+    +'one turn.</div>'
+    +'<div class="sub m">reasoning effort <b>'
+    +esc(st.reasoning_effort||'(gateway default)')+'</b>, max tokens <b>'
+    +(st.max_tokens>0?st.max_tokens:'(gateway default)')
+    +'</b> -- read from the container environment on every mission; changing '
+    +'the model here does not change them.</div>'
+    +'<div class="sub" id="mmsg"></div>';
+  el.innerHTML=h; el.className='';
+  if(usable){
+    const prov=document.getElementById('mprov');
+    Object.keys(MCAT.providers).forEach(function(n){
+      const o=document.createElement('option');o.value=n;
+      o.textContent=n+(MCAT.providers[n].key_configured?'':' (no key)');
+      prov.appendChild(o);});
+    if(st.provider&&MCAT.providers[st.provider])prov.value=st.provider;
+    mfill(st.provider===prov.value?st.model:null);
+    prov.onchange=function(){mfill(null);};
+  }
+}
+function mmsg(text,cls){
+  const el=document.getElementById('mmsg');
+  if(el){el.className='sub '+(cls||'');el.textContent=text;}
+}
+async function postModel(body){
+  let j=null;
+  try{
+    const r=await fetch('__AGENT_BASE__/model',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    j=await r.json();
+  }catch(e){mmsg('request failed: '+e,'bad');return null;}
+  return j;
+}
+async function saveModel(){
+  const prov=document.getElementById('mprov'),mod=document.getElementById('mmod');
+  // Refuse an empty selection here rather than posting it: the server would
+  // reject it, but a request that could never succeed is worse than a message
+  // -- it looks like the click did something.
+  if(!prov||!mod||!prov.value||!mod.value){
+    mmsg('choose a provider and a model first','bad');return;
+  }
+  mmsg('saving...','');
+  const j=await postModel({provider:prov.value,model:mod.value});
+  if(!j){return;}
+  if(!j.ok){
+    // The server refuses an unusable choice and says why. Reporting "saved"
+    // here would be a lie the operator discovers when a mission fails. The
+    // message is re-applied AFTER the reload, because the reload rebuilds the
+    // panel (and therefore empties the message element) from the server state.
+    const why='NOT saved: '+(j.error||'unknown error')
+      +' -- the previous choice is still in force';
+    await loadModelChoice();
+    mmsg(why,'bad');
+    return;
+  }
+  const note='saved: '+j.provider+' / '+j.model
+    +(j.saved_model_id?' ('+j.saved_model_id+')':'')
+    +' -- now the default for scheduled missions';
+  await loadModelChoice();
+  mmsg(note,'ok');
+}
+async function clearModelChoice(){
+  mmsg('clearing...','');
+  const j=await postModel({clear:true});
+  if(!j)return;
+  if(!j.ok){mmsg('NOT cleared: '+(j.error||'unknown error'),'bad');return;}
+  const note=j.cleared?'console choice cleared -- catalogue default is in force'
+                      :'no console choice was set; the catalogue default was '
+                       +'already in force';
+  await loadModelChoice();
+  mmsg(note,'ok');
+}
+loadModelChoice();
 
 loadSchedule(); loadRuns();
 setInterval(loadSchedule,15000); setInterval(loadRuns,30000);
@@ -907,6 +1038,37 @@ def _start_task(text: str, provider=None, model=None) -> str:
     return task_id
 
 
+def _model_state() -> Dict[str, Any]:
+    """The model that runs without an explicit choice, and WHO decided it.
+
+    ``source`` is not decoration: the page must be able to say "the catalogue
+    default is in force" rather than showing a stale saved value as if it were
+    live. ``reasoning_effort``/``max_tokens`` are reported because they are
+    process-wide environment settings a per-run model choice does NOT change --
+    an operator who switches models is entitled to see what else still applies.
+    """
+    import llm
+    state: Dict[str, Any] = {
+        "provider": None, "model": None, "model_id": None,
+        "source": "environment", "error": None,
+        "reasoning_effort": config.REASONING_EFFORT,
+        "max_tokens": config.MAX_TOKENS,
+        "choice_file": str(config.MODEL_CHOICE_FILE),
+    }
+    try:
+        provider, model = llm.default_choice()
+        resolved = llm.resolve(provider, model)
+        state.update({"provider": resolved.provider,
+                      "model": resolved.model,
+                      "model_id": resolved.model_id,
+                      "source": llm.choice_source()})
+    except Exception as exc:  # noqa: BLE001
+        # Reported, never swallowed: an unresolvable default means scheduled
+        # missions are about to fail, and the page has to say so.
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    return state
+
+
 def _stop_task(task_id: str) -> bool:
     """Request a cooperative stop. The agent finishes the current tool call
     and exits before its next model turn -- never mid-write."""
@@ -1040,6 +1202,9 @@ class Handler(BaseHTTPRequestHandler):
                            "error": str(exc)[:300]}
             self._send(200, json.dumps(payload).encode(),
                        "application/json")
+        elif route == "/model":
+            self._send(200, json.dumps(_model_state()).encode(),
+                       "application/json")
         elif route == "/health":
             self._send(200, json.dumps({"ok": True,
                                         "tasks": len(_TASKS)}).encode(),
@@ -1053,6 +1218,52 @@ class Handler(BaseHTTPRequestHandler):
             task_id = route.split("/stop/", 1)[1]
             ok = _stop_task(task_id)
             self._send(200, json.dumps({"stopped": ok}).encode(),
+                       "application/json")
+            return
+        if route == "/model":
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("body must be an object")
+            except ValueError as exc:
+                self._send(400, json.dumps(
+                    {"ok": False, "error": f"bad JSON: {exc}"}).encode(),
+                    "application/json")
+                return
+            import llm
+            try:
+                if body.get("clear"):
+                    cleared = llm.clear_default_choice()
+                    payload = {"ok": True, "cleared": cleared,
+                               **_model_state()}
+                else:
+                    provider = str(body.get("provider") or "").strip()
+                    model = str(body.get("model") or "").strip()
+                    if not provider or not model:
+                        raise llm.ProviderError(
+                            "both 'provider' and 'model' are required.")
+                    saved = llm.save_default_choice(provider, model)
+                    payload = {"ok": True, "saved": True,
+                               "saved_model_id": saved.model_id,
+                               **_model_state()}
+            except Exception as exc:  # noqa: BLE001
+                # 400, not 500: the request was unusable and the operator is
+                # looking at the page. The previous choice is still in force,
+                # and the payload says which one that is.
+                #
+                # `error` is assigned AFTER the spread, and must stay that way:
+                # _model_state() carries its own `error` key, so spreading it
+                # last overwrote the refusal reason with None -- the page then
+                # showed a failure with no cause, which is indistinguishable
+                # from the save having silently done nothing.
+                payload = {"ok": False, **_model_state()}
+                payload["error"] = f"{type(exc).__name__}: {exc}"
+                self._send(400, json.dumps(payload, default=str).encode(),
+                           "application/json")
+                return
+            self._send(200, json.dumps(payload, default=str).encode(),
                        "application/json")
             return
         if route != "/chat":

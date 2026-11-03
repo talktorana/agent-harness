@@ -126,9 +126,143 @@ class CatalogTest(unittest.TestCase):
         source = Path(webui.__file__).read_text(encoding="utf-8")
         self.assertIn("model_ids", source,
                       "webui never reads model_ids from the catalogue")
-        # Both the console and the live view build their own dropdown.
-        self.assertEqual(source.count("p.model_ids"), 2,
-                         "expected the mapping wired into BOTH dropdowns")
+        # Three dropdowns now: the console, the live view, and the runs page's
+        # "model for scheduled runs" panel. The count is asserted so that a
+        # future dropdown added without the alias->real-id mapping is caught
+        # rather than shipping alias-only and looking like the model is absent.
+        self.assertEqual(source.count("p.model_ids"), 3,
+                         "expected the mapping wired into all three dropdowns")
+
+
+class ConsoleModelChoiceTest(unittest.TestCase):
+    """The model the remote harness uses, as set from the console.
+
+    A checkbox on a page is only worth anything if it reaches the code that
+    starts a mission. Scheduled runs call the runner with no provider and no
+    model, so the whole feature rests on default_choice() -- which is what
+    these tests drive directly, without a scheduler, a network or an HTTP
+    server.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.file = Path(self.tmp.name) / "providers.json"
+        self.file.write_text(json.dumps(CATALOG), encoding="utf-8")
+        self.choice = Path(self.tmp.name) / "model_choice.json"
+        for patcher in (
+            mock.patch.object(llm, "PROVIDERS_FILE", self.file),
+            # Patched through config, not llm: the module reads the path at
+            # call time precisely so a test can point it somewhere harmless.
+            mock.patch.object(config, "MODEL_CHOICE_FILE", self.choice),
+            mock.patch.dict(os.environ, {"TEST_ALPHA_KEY": "env-secret"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_with_nothing_saved_the_catalogue_default_is_used(self):
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+        self.assertEqual(llm.choice_source(), "catalogue")
+
+    def test_a_saved_choice_outranks_the_catalogue_default(self):
+        llm.save_default_choice("alpha", "smart")
+        self.assertEqual(llm.default_choice(), ("alpha", "smart"))
+        self.assertEqual(llm.choice_source(), "console")
+        # And it is what a caller that names nothing actually resolves to --
+        # the property a scheduled mission depends on.
+        res = llm.resolve()
+        self.assertEqual((res.provider, res.model, res.model_id),
+                         ("alpha", "smart", "alpha-smart-2"))
+
+    def test_the_saved_file_records_the_wire_id(self):
+        llm.save_default_choice("alpha", "smart")
+        saved = json.loads(self.choice.read_text(encoding="utf-8"))
+        self.assertEqual(saved["model_id"], "alpha-smart-2",
+                         "the file must show the id the wire will see, not "
+                         "just the alias")
+        self.assertNotIn("env-secret", self.choice.read_text(encoding="utf-8"),
+                         "no key material may be written beside the choice")
+
+    def test_saving_a_bad_choice_leaves_the_previous_one_in_force(self):
+        """The failure that would matter: a typo quietly bricking the mission.
+
+        Rejecting at SAVE time is the whole reason this is not a free-text
+        field. If the bad value were written first, the next unattended run
+        would die on it with nobody watching, and the console would still be
+        displaying the selected name as if it were working.
+        """
+        llm.save_default_choice("alpha", "fast")
+        with self.assertRaises(llm.ProviderError):
+            llm.save_default_choice("alpha", "no-such-alias")
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+
+    def test_a_provider_without_a_key_cannot_be_saved(self):
+        """Same rule for the other half of a route: a keyless provider is a
+        configuration error, so it must never become the persisted default."""
+        with self.assertRaises(llm.ProviderError):
+            llm.save_default_choice("nokey", "m")
+        self.assertFalse(self.choice.exists(),
+                         "a rejected choice must not create the file")
+
+    def test_clearing_returns_to_the_catalogue_default(self):
+        llm.save_default_choice("alpha", "smart")
+        self.assertTrue(llm.clear_default_choice())
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+        self.assertEqual(llm.choice_source(), "catalogue")
+        # Idempotent, and honest about it: the second clear reports False so
+        # the page can say "nothing was set" instead of claiming success.
+        self.assertFalse(llm.clear_default_choice())
+
+    def test_an_empty_saved_choice_is_ignored_not_fatal(self):
+        """A truncated or templated file must not stop every run.
+
+        This is the one case where falling back is right: the file carries no
+        choice at all, so there is nothing to contradict.
+        """
+        self.choice.write_text(json.dumps({"provider": "", "model": ""}),
+                               encoding="utf-8")
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+
+    def test_an_unreadable_saved_choice_raises_instead_of_reverting(self):
+        """SILENT fallback here would be the worst outcome available.
+
+        The console would keep showing the saved model, scheduled missions
+        would quietly run on a different one, and no log would mention it.
+        """
+        self.choice.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(llm.ProviderError) as ctx:
+            llm.default_choice()
+        self.assertIn(str(self.choice), str(ctx.exception),
+                      "the error must name the file to delete")
+
+    def test_the_page_state_reports_the_effective_model_and_its_source(self):
+        """The panel is rendered from this payload, so a stale or absent
+        source here becomes a page that lies about which model is in force."""
+        llm.save_default_choice("alpha", "smart")
+        state = webui._model_state()
+        self.assertEqual(state["source"], "console")
+        self.assertEqual(state["model"], "smart")
+        self.assertEqual(state["model_id"], "alpha-smart-2")
+        self.assertIsNone(state["error"])
+
+    def test_the_page_state_exposes_the_process_wide_settings(self):
+        """A model choice does NOT change reasoning effort or the token
+        budget -- both are container environment. The panel says so, and it
+        can only say so if the payload carries them."""
+        with mock.patch.object(config, "REASONING_EFFORT", "max"), \
+             mock.patch.object(config, "MAX_TOKENS", 32000):
+            state = webui._model_state()
+        self.assertEqual(state["reasoning_effort"], "max")
+        self.assertEqual(state["max_tokens"], 32000)
+
+    def test_the_page_state_reports_a_broken_default_instead_of_hiding_it(self):
+        """An unresolvable default means missions are about to fail. The page
+        must be able to say that; swallowing it would present a healthy
+        panel over a dead scheduler."""
+        self.choice.write_text("{not json", encoding="utf-8")
+        state = webui._model_state()
+        self.assertIsNotNone(state["error"])
+        self.assertIn("model_choice.json", state["error"])
 
     def test_env_provider_always_present_and_accepts_raw_ids(self):
         cat = llm.catalog()

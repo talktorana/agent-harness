@@ -45,12 +45,40 @@ class TempDirs(unittest.TestCase):
         for name, value in (("SCHEDULE_FILE", self.schedule),
                             ("SCHEDULE_STATE_FILE", self.state),
                             ("SCHEDULE_HOLD", str(self.hold)),
-                            ("SESSIONS_DIR", self.sessions)):
+                            ("SESSIONS_DIR", self.sessions),
+                            # MUST be redirected too. It is derived from
+                            # SESSIONS_DIR at IMPORT time, so patching
+                            # SESSIONS_DIR alone leaves it pointing at the real
+                            # one -- and a test that saves a model would then
+                            # write a live default into the checkout (or the
+                            # container's sessions directory).
+                            ("MODEL_CHOICE_FILE",
+                             self.root / "model_choice.json")):
             patcher = mock.patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
         self.write_job()
+
+    def write_catalog(self):
+        """A private provider catalogue, so model tests touch no real config.
+
+        Inline keys, not api_key_env: a catalogue test should not depend on an
+        environment variable being set (or not set) on the machine running it.
+        """
+        import llm
+        path = self.root / "providers.json"
+        path.write_text(json.dumps({
+            "default": {"provider": "alpha", "model": "fast"},
+            "providers": {"alpha": {
+                "base_url": "https://alpha.example/v1",
+                "api_key": "test-inline-key",
+                "models": {"fast": "alpha-fast-1", "smart": "alpha-smart-2"}}},
+        }), encoding="utf-8")
+        patcher = mock.patch.object(llm, "PROVIDERS_FILE", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
 
     def write_job(self, *, every_min=30, enabled=True, message="do the mission",
                   jobs_extra=None):
@@ -556,6 +584,97 @@ class HandlerRouteTest(TempDirs):
                 status, body = self.get(path)
                 self.assertEqual(status, 200)
                 self.assertIn("agent-harness", body)
+
+    def post(self, path: str, payload):
+        """POST bytes-or-json, returning (status, body) like get()."""
+        import urllib.error
+        import urllib.request
+        data = payload if isinstance(payload, bytes) else \
+            json.dumps(payload).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=data, method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
+    def test_the_runs_page_carries_the_model_panel(self):
+        """The panel must be on the page the operator actually opens.
+
+        A working endpoint behind a page nobody renders is the defect this
+        whole change exists to remove -- the model was reachable only by
+        editing the catalogue on the host and restarting the container.
+        """
+        status, body = self.get("/runs")
+        self.assertEqual(status, 200)
+        self.assertIn('id="model"', body)
+        self.assertIn("model for runs", body)
+
+    def test_get_model_reports_the_default_and_its_source(self):
+        self.write_catalog()
+        status, body = self.get("/model")
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual((doc["provider"], doc["model"]),
+                         ("alpha", "fast"))
+        self.assertEqual(doc["model_id"], "alpha-fast-1")
+        self.assertEqual(doc["source"], "catalogue")
+
+    def test_post_model_persists_and_the_scheduler_would_use_it(self):
+        """END TO END, past the route and into the code that starts a mission.
+
+        Asserting the HTTP response alone would pass even if the value landed
+        somewhere nothing reads. A scheduled run calls the runner with no
+        provider and no model, so default_choice() is the only thing that
+        decides which model the mission uses -- and that is what is checked.
+        """
+        import llm
+        self.write_catalog()
+        status, body = self.post("/model", {"provider": "alpha",
+                                            "model": "smart"})
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertTrue(doc["ok"])
+        self.assertEqual(doc["saved_model_id"], "alpha-smart-2")
+        self.assertEqual(doc["source"], "console",
+                         "the response does not say the console is now "
+                         "deciding, so the page cannot report it")
+        self.assertEqual(llm.default_choice(), ("alpha", "smart"))
+
+    def test_post_model_refuses_an_unknown_alias_and_keeps_the_old_choice(self):
+        import llm
+        self.write_catalog()
+        self.post("/model", {"provider": "alpha", "model": "fast"})
+        status, body = self.post("/model", {"provider": "alpha",
+                                            "model": "typo"})
+        self.assertEqual(status, 400,
+                         "an unusable choice is the caller's error, not a "
+                         "server fault")
+        doc = json.loads(body)
+        self.assertFalse(doc["ok"])
+        self.assertIn("typo", doc["error"])
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"),
+                         "the rejected choice displaced a working one")
+
+    def test_post_model_rejects_a_missing_field_and_bad_json(self):
+        self.write_catalog()
+        status, _body = self.post("/model", {"provider": "alpha"})
+        self.assertEqual(status, 400)
+        status, body = self.post("/model", b"{not json")
+        self.assertEqual(status, 400)
+        self.assertIn("bad JSON", body)
+
+    def test_clearing_from_the_console_falls_back_to_the_catalogue(self):
+        import llm
+        self.write_catalog()
+        self.post("/model", {"provider": "alpha", "model": "smart"})
+        status, body = self.post("/model", {"clear": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["cleared"])
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+        self.assertEqual(json.loads(body)["source"], "catalogue")
 
 
 class TwoVerdictsOnOneQuestionTest(unittest.TestCase):

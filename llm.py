@@ -33,6 +33,10 @@ Design rules, learned from running several providers at once:
 * ENVIRONMENT WINS. ``AGENT_BASE_URL``/``AGENT_API_KEY``/``AGENT_MODEL`` still
   work and override the file, so existing deployments change nothing. An
   explicit ``--providermodel`` (or the web UI's dropdowns) wins over both.
+* THE CONSOLE CAN PICK THE DEFAULT. A choice saved from the UI is written to
+  ``config.MODEL_CHOICE_FILE`` -- agent-writable by design, because the
+  catalogue is mounted read-only. It outranks the catalogue's ``default``
+  block, which outranks the environment; see :func:`default_choice`.
 * RESOLUTION FAILS LOUDLY AND EARLY. A missing key or unknown alias is a
   configuration error, not a runtime surprise four tool calls in.
 """
@@ -130,14 +134,97 @@ def _key_for(pcfg: Dict[str, Any], name: str) -> str:
         f"provider {name!r}: no api_key_env or api_key configured.")
 
 
+def _load_choice_file() -> Optional[Tuple[str, str]]:
+    """The console-saved choice, or None when nobody has saved one.
+
+    A read failure RAISES instead of falling back. Silently reverting to the
+    catalogue default when the override is corrupt is the exact failure this
+    module exists to prevent: the console would keep displaying the saved
+    model while scheduled missions ran on a different one, and nothing in any
+    log would say so.
+    """
+    path = config.MODEL_CHOICE_FILE
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProviderError(
+            f"{path} is not readable JSON: {exc}. Delete it to fall back to "
+            f"{PROVIDERS_FILE.name}, or re-save a model in the console.")
+    if not isinstance(data, dict):
+        raise ProviderError(f"{path} must hold a JSON object.")
+    provider = str(data.get("provider") or "").strip()
+    model = str(data.get("model") or "").strip()
+    if not provider or not model:
+        # Structurally valid but empty: treat as "no choice saved" so a
+        # template or a truncating editor does not brick every run.
+        return None
+    return provider, model
+
+
 def default_choice() -> Tuple[str, str]:
-    """(provider, model) used when the caller does not say: file default,
-    else the environment provider and its model."""
+    """(provider, model) used when the caller does not say.
+
+    Precedence: the console's saved choice, then the catalogue's ``default``
+    block, then the environment provider and its model. The saved choice wins
+    because it is the only one an operator can change without shell access and
+    a redeploy -- which is the entire point of having a dropdown.
+    """
+    saved = _load_choice_file()
+    if saved is not None:
+        return saved
     data = _load_file()
     d = data.get("default") or {}
     if isinstance(d, dict) and d.get("provider") and d.get("model"):
         return str(d["provider"]), str(d["model"])
     return "env", config.MODEL
+
+
+def save_default_choice(provider: str, model: str) -> Resolved:
+    """Persist the console's choice for runs that do not name a model.
+
+    RESOLVES BEFORE WRITING. Persisting an alias that does not exist, or a
+    provider whose key is missing, would poison every later run -- including
+    the unattended ones nobody is watching. A bad choice is therefore rejected
+    here, while the operator is still looking at the page, and the previous
+    choice stays in force. The write itself is atomic, so a crash mid-save can
+    never leave a half-written file that breaks the next mission.
+    """
+    res = resolve(provider, model)      # raises ProviderError when unusable
+    path = config.MODEL_CHOICE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps({"provider": res.provider, "model": res.model,
+                               "model_id": res.model_id}, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return res
+
+
+def clear_default_choice() -> bool:
+    """Forget the saved choice, falling back to the catalogue default.
+
+    Returns True when something was actually cleared, so the caller can tell
+    the operator the truth instead of reporting a no-op as success.
+    """
+    try:
+        config.MODEL_CHOICE_FILE.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def choice_source() -> str:
+    """Which layer is currently deciding the default: 'console', 'catalogue'
+    (its ``default`` block), or 'environment'. Reported to the UI so the page
+    can never claim a saved model is in force when it is not."""
+    if _load_choice_file() is not None:
+        return "console"
+    d = _load_file().get("default") or {}
+    if isinstance(d, dict) and d.get("provider") and d.get("model"):
+        return "catalogue"
+    return "environment"
 
 
 def resolve(provider: Optional[str] = None,
