@@ -264,24 +264,75 @@ class ConsoleModelChoiceTest(unittest.TestCase):
         self.assertIsNotNone(state["error"])
         self.assertIn("model_choice.json", state["error"])
 
-    def test_env_provider_always_present_and_accepts_raw_ids(self):
-        cat = llm.catalog()
-        self.assertIn("env", cat["providers"])
-        with mock.patch.dict(os.environ, {"AGENT_API_KEY": "k"}):
+    def test_the_generic_repo_ships_no_vendor_endpoint(self):
+        """A fresh checkout must not point at somebody else's provider.
+
+        ``config.BASE_URL`` used to DEFAULT to a real vendor URL and a real
+        model id, which registered an "env" provider on every install whether
+        or not anyone had configured it -- the same class of leak the
+        genericity guard exists for, wearing a model id instead of a name.
+
+        Asserted on the SOURCE, not on the resolved value: a developer's own
+        ``.env`` (untracked, and deliberately allowed to hold anything) sets
+        these variables, so a test reading ``config.BASE_URL`` would be
+        describing this machine rather than what the repo ships -- and would
+        pass on a laptop while shipping a vendor default to everyone else.
+        """
+        import inspect
+        import config
+        src = inspect.getsource(config)
+        self.assertIn('os.environ.get("AGENT_BASE_URL", "")', src,
+                      "config ships a default endpoint")
+        self.assertIn('os.environ.get("AGENT_MODEL", "")', src,
+                      "config ships a default model id")
+        #: And the behaviour that follows: unconfigured means no "env" provider.
+        with mock.patch.object(config, "BASE_URL", ""), \
+                mock.patch.object(config, "MODEL", ""):
+            self.assertNotIn("env", llm.providers(),
+                             "an unconfigured install must not offer 'env'")
+
+    def test_env_provider_appears_only_when_configured(self):
+        """With an endpoint named it exists, and accepts a raw id.
+
+        Kept as the positive case so the test above cannot pass by the feature
+        having been deleted.
+        """
+        with mock.patch.object(config, "BASE_URL", "https://env.example/v1"), \
+                mock.patch.object(config, "MODEL", "env-model-1"), \
+                mock.patch.dict(os.environ, {"AGENT_API_KEY": "k"}):
+            self.assertIn("env", llm.providers())
+            self.assertIn("env", llm.catalog()["providers"])
             res = llm.resolve("env", "some-raw-model-id")
-        self.assertEqual(res.model_id, "some-raw-model-id")
+            self.assertEqual(res.model_id, "some-raw-model-id")
+
+    def test_an_env_provider_with_no_named_model_still_accepts_a_raw_id(self):
+        """AGENT_BASE_URL without AGENT_MODEL is a legal raw-id setup.
+
+        The blank alias must not appear in the catalogue, and resolve() must not
+        refuse the provider for "declaring no models" -- that escape hatch is
+        the whole reason the env provider exists.
+        """
+        with mock.patch.object(config, "BASE_URL", "https://env.example/v1"), \
+                mock.patch.object(config, "MODEL", ""), \
+                mock.patch.dict(os.environ, {"AGENT_API_KEY": "k"}):
+            self.assertNotIn("", llm.providers()["env"]["models"],
+                             "an empty AGENT_MODEL became a blank alias")
+            res = llm.resolve("env", "typed-straight-in")
+            self.assertEqual(res.model_id, "typed-straight-in")
 
 
 class EnvOverrideTest(unittest.TestCase):
     def test_environment_provider_survives_without_a_file(self):
         with mock.patch.object(llm, "PROVIDERS_FILE",
                                Path("/nonexistent/providers.json")), \
+                mock.patch.object(config, "BASE_URL", "https://env.example/v1"), \
+                mock.patch.object(config, "MODEL", "env-model-1"), \
                 mock.patch.dict(os.environ, {"AGENT_API_KEY": "k"}):
             table = llm.providers()
             self.assertIn("env", table)
             res = llm.resolve()
             self.assertEqual(res.provider, "env")
-            self.assertEqual(res.base_url, config.BASE_URL)
+            self.assertEqual(res.base_url, "https://env.example/v1")
 
 
 class DotenvProviderKeyTest(unittest.TestCase):

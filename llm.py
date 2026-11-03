@@ -10,12 +10,12 @@ multi-provider gateway but with no gateway in between -- the harness talks
 to each endpoint directly:
 
     {
-      "default": {"provider": "openrouter", "model": "provider-v4.1-flash"},
+      "default": {"provider": "openrouter", "model": "vendor-model-flash"},
       "providers": {
         "provider": {
           "base_url": "https://openrouter.ai/api/v1",
           "api_key_env": "OPENROUTER_API_KEY",     # or "api_key": "sk-..."
-          "models": {"deepseek-v4.1-flash": "providerepseek-v4.1-flash-1017"}
+          "models": {"vendor-model-flash": "vendor/model-flash-1017"}
         },
         ...
       }
@@ -101,12 +101,16 @@ def providers() -> Dict[str, Dict[str, Any]]:
         if not isinstance(pcfg, dict):
             continue
         table[str(name)] = pcfg
-    # The legacy single-endpoint configuration, as provider "env".
+    # The legacy single-endpoint configuration, as provider "env". It exists
+    # only when an endpoint is actually configured, and it declares a model
+    # ONLY when one is named -- an empty ``AGENT_MODEL`` must not become a
+    # blank alias in the catalogue, and the provider still accepts a raw id
+    # from the caller (see resolve()).
     if config.BASE_URL:
         table.setdefault("env", {
             "base_url": config.BASE_URL,
             "api_key_env": "AGENT_API_KEY",
-            "models": {config.MODEL: config.MODEL},
+            "models": ({config.MODEL: config.MODEL} if config.MODEL else {}),
         })
     return table
 
@@ -247,8 +251,8 @@ def resolve(provider: Optional[str] = None,
             f"Add it to {PROVIDERS_FILE.name} or use --provider.")
     pcfg = table[provider]
     models = pcfg.get("models") or {}
-    if not isinstance(models, dict) or not models:
-        raise ProviderError(f"provider {provider!r} declares no models.")
+    if not isinstance(models, dict):
+        models = {}
     if model in models:
         model_id = str(models[model])
     elif model in models.values():
@@ -258,7 +262,13 @@ def resolve(provider: Optional[str] = None,
     elif provider == "env":
         # The environment provider is the legacy escape hatch: a raw model id
         # on AGENT_BASE_URL must keep working without being listed anywhere.
+        # Checked BEFORE the "declares no models" refusal below, because an
+        # env endpoint may legitimately declare none -- that is the whole point
+        # of a raw-id escape hatch, and the generic config ships no default
+        # model to put in the table.
         model_id = model
+    elif not models:
+        raise ProviderError(f"provider {provider!r} declares no models.")
     else:
         known = ", ".join(sorted(models))[:400]
         raise ProviderError(
@@ -298,10 +308,10 @@ def catalog() -> Dict[str, Any]:
             "models": aliases,
             # alias -> the provider's real model id on the wire. Served because
             # the UI otherwise shows ONLY the alias, so an operator had no way
-            # to confirm which model a selection actually reaches -- they
-            # looked for "alicn/deepseek-v4.1-flash-1017" in the dropdown,
-            # saw "inferhub-deepseek-v4.1-flash", and concluded it was missing.
-            # Model ids are not secret; keys still never leave the process.
+            # to confirm which model a selection actually reaches: they looked
+            # for the wire id in the dropdown, saw the alias, and concluded the
+            # model was missing. Model ids are not secret; keys still never
+            # leave the process.
             "model_ids": {a: str(models[a]) for a in aliases},
             "key_configured": _has_key(pcfg),
         }

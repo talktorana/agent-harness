@@ -120,15 +120,24 @@ def source_of(key: str) -> str:
     return SOURCES.get(key, "built-in default")
 
 # --- model endpoint (must be OpenAI-compatible) ---------------------------
-BASE_URL = os.environ.get("AGENT_BASE_URL", "https://api.deepinfra.com/v1/openai")
+#: The LEGACY single-endpoint route, surfaced as provider "env". Empty by
+#: default on purpose: this repo is generic, so it must not ship one vendor's
+#: endpoint and model id as a built-in default. A deployment that wants this
+#: route names it (``AGENT_BASE_URL`` + ``AGENT_MODEL``); a deployment that uses
+#: a provider catalogue (``AGENT_PROVIDERS_FILE``) never needs it. While a real
+#: endpoint sat here, a fresh checkout silently pointed at somebody else's
+#: provider and the "env" provider appeared in the model list even though
+#: nothing had configured it.
+BASE_URL = os.environ.get("AGENT_BASE_URL", "")
 API_KEY = os.environ.get("AGENT_API_KEY", "")
-MODEL = os.environ.get("AGENT_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+MODEL = os.environ.get("AGENT_MODEL", "")
 
-# DeepSeek-V4.1-Flash-1017, the agentic model behind this default:
-#   1,048,576-token context, JSON function calling, multimodal.
-#   $0.098 in / $0.294 out / $0.003 cached per 1M tokens (51% promo off).
-# Cheap enough that a 40-step monitoring pass costs cents, which is the whole
-# point of an unattended harness.
+# Why the choice of model matters at all: an unattended harness runs a
+# forty-step pass every half hour, so cost per pass is what decides whether it
+# can be left running. Pick a model that calls tools reliably and is cheap
+# enough to run all day, MEASURE it (``run.py --check``) rather than trusting a
+# leaderboard, and keep the choice in the provider catalogue so it stays
+# configuration rather than code.
 
 # --- api resilience -------------------------------------------------------
 # A busy engine answers 429 "engine_overloaded", and a dropped connection
@@ -152,11 +161,12 @@ FALLBACK_MODEL = os.environ.get("AGENT_FALLBACK_MODEL", "").strip()
 # ``REASONING_EFFORT`` is sent as ``reasoning_effort``. The field is TYPE
 # validated by the gateway ("must be an object with 'effort' field or a
 # String") but NOT enum validated -- it accepts the string "banana" -- and on
-# ``ali/deepseek-v4-pro-0813`` it was measured to have NO effect: with the same
-# prompt and a 900-token budget, reasoning_tokens was 900 for none, "low" and
-# "max" alike, and wall time differed by under 2 s. So this setting is
-# expressed explicitly for providers that DO honour it, and must not be relied
-# on for this one. An empty value sends nothing at all.
+# one model measured against it the setting had NO effect: with the same prompt
+# and a 900-token budget, reasoning_tokens was 900 for none, "low" and "max"
+# alike, and wall time differed by under 2 s. So this setting is expressed
+# explicitly for providers that DO honour it, and must not be relied on for one
+# that does not. Whether a given model honours it is a property of THAT model,
+# so measure it rather than assuming. An empty value sends nothing at all.
 REASONING_EFFORT = os.environ.get("AGENT_REASONING_EFFORT", "").strip()
 # The knob that ACTUALLY governs depth on this model: a reasoning model spends
 # its completion budget thinking before it writes anything, so reasoning

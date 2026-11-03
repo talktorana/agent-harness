@@ -86,24 +86,22 @@ SCHEDULE = {"paused": False, "schedule_file": "ops/agent-schedule.json",
 #: Shaped like /agent/model: what the harness will use for a run that names no
 #: model, and which layer decided it. Two aliases, so "did the page preselect
 #: the right one" is answerable -- with a single-alias provider it cannot be.
-MODEL_STATE = {"provider": "inferhub",
-               "model": "inferhub-deepseek-v4.1-flash",
-               "model_id": "alicn/deepseek-v4.1-flash-1017",
+MODEL_STATE = {"provider": "gateway",
+               "model": "gateway-fast",
+               "model_id": "vendor/model-fast-1017",
                "source": "console",
                "reasoning_effort": "max", "max_tokens": 32000,
                "choice_file": "/agent-data/sessions/model_choice.json",
                "error": None}
 
-CATALOG = {"providers": {"inferhub": {
-               "base_url": "https://api.inferhub.dev/v1",
-               "models": ["inferhub-deepseek-v4.1-flash",
-                          "inferhub-deepseek-v4-pro-0813"],
-               "model_ids": {"inferhub-deepseek-v4.1-flash":
-                                 "alicn/deepseek-v4.1-flash-1017",
-                             "inferhub-deepseek-v4-pro-0813":
-                                 "ali/deepseek-v4-pro-0813"},
+CATALOG = {"providers": {"gateway": {
+               "base_url": "https://gateway.example/v1",
+               "models": ["gateway-fast",
+                          "gateway-deep"],
+               "model_ids": {"gateway-fast": "vendor/model-fast-1017",
+                             "gateway-deep": "vendor/model-deep-0813"},
                "key_configured": True}},
-           "default": ["inferhub", "inferhub-deepseek-v4.1-flash"]}
+           "default": ["gateway", "gateway-fast"]}
 
 #: A DOM stub that records what the page WROTE. Deliberately explicit: a Proxy
 #: that swallows everything would let a script throw into a void and still
@@ -286,14 +284,14 @@ class RunsPageModelChoiceTest(unittest.TestCase):
 
     def test_the_panel_reports_the_model_in_force_and_where_it_came_from(self):
         html = self.rendered["model"] or ""
-        self.assertIn("inferhub-deepseek-v4.1-flash", html)
+        self.assertIn("gateway-fast", html)
         self.assertIn("set here in the console", html,
                       "the source of the default is not stated; the page could "
                       "then present a catalogue value as a saved one")
 
     def test_the_panel_shows_the_wire_id_so_the_model_is_identifiable(self):
         """The operator looks for the id the provider actually receives."""
-        self.assertIn("alicn/deepseek-v4.1-flash-1017",
+        self.assertIn("vendor/model-fast-1017",
                       self.rendered["model"] or "")
 
     def test_the_dropdown_preselects_the_model_that_is_in_force(self):
@@ -303,8 +301,8 @@ class RunsPageModelChoiceTest(unittest.TestCase):
         the first alias in the catalogue instead, an operator who opened the
         page and pressed Save would switch models without being told.
         """
-        self.assertEqual(self.rendered["mprov"], "inferhub")
-        self.assertEqual(self.rendered["mmod"], "inferhub-deepseek-v4.1-flash")
+        self.assertEqual(self.rendered["mprov"], "gateway")
+        self.assertEqual(self.rendered["mmod"], "gateway-fast")
 
     def test_the_panel_says_a_model_choice_does_not_move_the_token_budget(self):
         """reasoning_effort and max_tokens are process-wide environment
@@ -321,8 +319,8 @@ class RunsPageModelChoiceTest(unittest.TestCase):
         self.assertEqual(len(posts), 1, f"expected exactly one save POST, got "
                                         f"{[r['url'] for r in out['requests']]}")
         body = json.loads(posts[0]["body"])
-        self.assertEqual(body, {"provider": "inferhub",
-                                "model": "inferhub-deepseek-v4.1-flash"})
+        self.assertEqual(body, {"provider": "gateway",
+                                "model": "gateway-fast"})
 
     def test_a_refused_save_is_reported_and_not_shown_as_saved(self):
         """A typo must not look like a success.

@@ -197,16 +197,16 @@ def build_request(model: str, messages: list, use_tools: bool) -> dict:
 
     ``reasoning_effort`` is sent for providers that honour it. WHETHER THEY DO
     IS A PROPERTY OF THE MODEL, NOT OF THIS PAYLOAD, so it has to be measured
-    per model rather than assumed from the last one. Measured 2026-11-03:
+    per model rather than assumed from the last one. Two models on one gateway,
+    measured with the budget held constant:
 
-      * ``ali/deepseek-v4-pro-0813`` -- INERT. 900 reasoning tokens at none,
-        low and max alike against a 900 budget; wall time varied under 2 s.
-      * ``alicn/deepseek-v4.1-flash-1017`` (the current default) -- HONOURED,
-        but modestly. Repeated samples on one prompt with the budget held:
-        mean reasoning_tokens 104 (none) / 134 (low) / 153 (max), so roughly
-        +50% from none to max. Adjacent settings OVERLAP at three samples each,
-        which is why a single sample per setting is not evidence and why the
-        earlier "+73%" reading was an overstatement.
+      * one was INERT: 900 reasoning tokens at none, low and max alike against
+        a 900 budget, and wall time varied under 2 s;
+      * the other HONOURED it, but modestly: mean reasoning tokens 104 (none) /
+        134 (low) / 153 (max), so roughly +50% from none to max. Adjacent
+        settings OVERLAP at three samples each, which is why a single sample per
+        setting is not evidence and why an earlier "+73%" reading of the same
+        data was an overstatement.
 
     So it is never the only thing standing between the agent and a deeper
     think, and it is omitted entirely when empty: the gateway validates the

@@ -1,13 +1,13 @@
 """Reasoning depth: the payload must carry what was configured, and nothing else.
 
-WHY THIS EXISTS (2026-11-03). The deployed model is ``ali/deepseek-v4-pro-0813``
-and a request to run it at "maximum reasoning" turned out to be two different
-questions depending on the provider:
+WHY THIS EXISTS. A request to run a model at "maximum reasoning" turned out to
+be two different questions depending on the provider:
 
   * ``reasoning_effort`` is accepted by the gateway but only TYPE validated --
-    it accepts the string "banana". On this model it was measured to do
-    NOTHING: with one prompt and a 900-token budget, ``reasoning_tokens`` was
-    900 for none, "low" and "max", and wall time differed by under two seconds.
+    it accepts the string "banana". On one model measured against it the field
+    did NOTHING: with one prompt and a 900-token budget, ``reasoning_tokens``
+    was 900 for none, "low" and "max", and wall time differed by under two
+    seconds.
   * the model thinks out of its COMPLETION budget, so ``max_tokens`` is what
     actually governs how long it reasons.
 
@@ -189,7 +189,7 @@ class ReasoningSpendIsRecordedTest(unittest.TestCase):
         inst = self._agent(events)
         with mock.patch.object(config, "REASONING_EFFORT", "max"), \
              mock.patch.object(config, "MAX_TOKENS", 32000):
-            inst._record_usage(self._usage(153), "inferhub/flash")
+            inst._record_usage(self._usage(153), "gateway/fast")
         self.assertEqual(len(events), 1)
         rec = events[0]
         self.assertEqual(rec["event"], "model_usage")
@@ -197,7 +197,7 @@ class ReasoningSpendIsRecordedTest(unittest.TestCase):
         self.assertEqual(rec["completion_tokens"], 300)
         self.assertEqual(rec["reasoning_effort"], "max")
         self.assertEqual(rec["max_tokens"], 32000)
-        self.assertEqual(rec["route"], "inferhub/flash")
+        self.assertEqual(rec["route"], "gateway/fast")
 
     def test_a_provider_reporting_ZERO_reasoning_records_zero(self):
         """Zero is a finding, not a missing value.

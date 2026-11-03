@@ -210,10 +210,10 @@ completes a real request.
 
 ### `model ... is NOT in the list`
 
-Model ids are per provider. `deepseek-ai/DeepSeek-V4.1-Flash-1017` and
-`deepseek/deepseek-v4.1-flash` are the same family on two hosts with two
-names. `--check` prints the closest matches; set `AGENT_MODEL` or use
-`--model`.
+Model ids are per provider. The same model is often published under different
+ids on different hosts (`vendor/model-flash` versus `Model-Flash-1017`), so an
+id that works against one endpoint can be unknown to another. `--check` prints
+the closest matches; set `AGENT_MODEL` or use `--model`.
 
 ### `429 engine overloaded` repeatedly
 
