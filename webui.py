@@ -666,8 +666,9 @@ async function loadRunSettings(){
     +'<button onclick="clearRunEvery()">cadence: schedule file</button>'
     +'</div>';
   if(st.error)h+='<div class="sub bad">'+esc(st.error)+'</div>';
+  if(st.note)h+='<div class="sub">'+esc(st.note)+'</div>';
   h+='<div class="sub">in force: cadence <b>'
-    +(st.every_min==null?'(schedule file says otherwise)':st.every_min+' min')
+    +(st.every_min==null?'(nothing declares one)':st.every_min+' min')
     +'</b> <span class="m">('+esc(SSET[st.every_min_source]||st.every_min_source)+')</span>, '
     +'step ceiling <b>'+(st.max_steps==null?'?':st.max_steps)+'</b> '
     +'<span class="m">('+esc(SSET[st.max_steps_source]||st.max_steps_source)+'</span>'
@@ -1178,6 +1179,46 @@ def _model_state() -> Dict[str, Any]:
     return state
 
 
+def _settings_state() -> Dict[str, Any]:
+    """Run-settings state, with the schedule's declared values supplied.
+
+    ``run_settings`` resolves an override; it owns no schedule and cannot know
+    what any job declares. Without being told, the panel reported the cadence
+    as unset while the scheduler was firing every 45 minutes from the
+    declaration -- verified live on 2026-11-03 (GET /agent/schedule said
+    every_min 45 "schedule"; GET /agent/settings said null "none"). A page that
+    misreports one live setting invites distrust of the correct ones.
+
+    A scheduler that cannot be read costs the panel its declared values only;
+    the override and the environment value still resolve, so the failure is
+    reported rather than fatal.
+    """
+    import run_settings
+    declared_every = None
+    note = None
+    try:
+        import scheduler
+        jobs = (scheduler.status() or {}).get("jobs") or []
+        values = [j.get("every_min_declared") for j in jobs
+                  if j.get("every_min_declared") is not None]
+        if len(values) == 1:
+            declared_every = values[0]
+        elif values:
+            #: More than one job declares an interval. A console override is
+            #: GLOBAL -- it applies to every job -- so showing one job's number
+            #: as "the" declaration would misdescribe what changing it does.
+            note = ("a console cadence applies to ALL %d jobs; they declare %s"
+                    % (len(jobs), ", ".join(str(v) for v in values)))
+    except Exception as exc:  # noqa: BLE001
+        note = "schedule unreadable: %s: %s" % (type(exc).__name__, exc)
+    payload = run_settings.state(every_declared=declared_every)
+    if note and not payload.get("error"):
+        payload["note"] = note
+    elif note:
+        payload["error"] = "%s | %s" % (payload["error"], note)
+    return payload
+
+
 def _stop_task(task_id: str) -> bool:
     """Request a cooperative stop. The agent finishes the current tool call
     and exits before its next model turn -- never mid-write."""
@@ -1315,8 +1356,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_model_state()).encode(),
                        "application/json")
         elif route == "/settings":
-            import run_settings
-            self._send(200, json.dumps(run_settings.state()).encode(),
+            self._send(200, json.dumps(_settings_state()).encode(),
                        "application/json")
         elif route == "/health":
             self._send(200, json.dumps({"ok": True,
@@ -1352,7 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
                     remaining = run_settings.clear(
                         None if clearing is True else str(clearing))
                     payload = {"ok": True, "cleared": str(clearing),
-                               "remaining": remaining, **run_settings.state()}
+                               "remaining": remaining, **_settings_state()}
                 else:
                     steps = body.get("max_steps")
                     every = body.get("every_min")
@@ -1361,7 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
                             "pass 'max_steps' and/or 'every_min'.")
                     saved = run_settings.save(max_steps=steps, every_min=every)
                     payload = {"ok": True, "saved": saved,
-                               **run_settings.state()}
+                               **_settings_state()}
             except Exception as exc:  # noqa: BLE001
                 # 400, not 500: the value was unusable and the operator is
                 # looking at the page. The previous setting is still in force,
@@ -1371,7 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
                 # carries its own `error` key, so spreading it last would
                 # overwrite the refusal reason with None and the page would
                 # show a failure with no cause.
-                payload = {"ok": False, **run_settings.state()}
+                payload = {"ok": False, **_settings_state()}
                 payload["error"] = f"{type(exc).__name__}: {exc}"
                 self._send(400, json.dumps(payload, default=str).encode(),
                            "application/json")

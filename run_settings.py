@@ -278,12 +278,20 @@ def clear(what: Optional[str] = None) -> Dict[str, Any]:
     return data
 
 
-def state() -> Dict[str, Any]:
+def state(every_declared: Any = None) -> Dict[str, Any]:
     """Everything the console needs to render the panel honestly.
 
     Both the live value and the declared one are included, because seeing
     "override 200 in force, environment ships 40" is the only way to tell that
     a redeploy would silently undo a console choice.
+
+    ``every_declared`` is the cadence the schedule declares. This module owns no
+    schedule -- it resolves an override, it cannot know what any job declares --
+    so the caller that does (the console, which also serves /schedule) passes
+    it in. Without it the panel reported the cadence as unset while the
+    scheduler was merrily firing every 45 minutes from the declaration, and a
+    page that misreports a live setting is a page nobody trusts for the next
+    one.
     """
     out: Dict[str, Any] = {
         "settings_file": str(SETTINGS_FILE),
@@ -293,7 +301,7 @@ def state() -> Dict[str, Any]:
     }
     try:
         steps, steps_source = effective_max_steps()
-        every, every_source = effective_every_min()
+        every, every_source = effective_every_min(every_declared)
         out.update({
             "max_steps": steps,
             "max_steps_source": steps_source,
@@ -302,6 +310,10 @@ def state() -> Dict[str, Any]:
             "every_min_source": every_source,
             "declared_max_steps": config.MAX_STEPS,
             "declared_answer_warn_steps": config.ANSWER_WARN_STEPS,
+            "declared_every_min": (float(every_declared)
+                                   if isinstance(every_declared, (int, float))
+                                   and not isinstance(every_declared, bool)
+                                   else None),
             "saved_at": _read().get("saved_at"),
         })
     except SettingsError as exc:
@@ -312,5 +324,6 @@ def state() -> Dict[str, Any]:
                     "answer_warn_steps": config.ANSWER_WARN_STEPS,
                     "every_min": None, "every_min_source": "error",
                     "declared_max_steps": config.MAX_STEPS,
-                    "declared_answer_warn_steps": config.ANSWER_WARN_STEPS})
+                    "declared_answer_warn_steps": config.ANSWER_WARN_STEPS,
+                    "declared_every_min": None})
     return out

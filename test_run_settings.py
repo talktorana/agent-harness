@@ -502,6 +502,98 @@ class AgentReadsTheLiveCeilingTest(unittest.TestCase):
                          "loop actually used")
 
 
+class DeclaredCadenceIsReportedTest(unittest.TestCase):
+    """The panel must show the cadence that is actually in force.
+
+    Verified live on 2026-11-03: ``GET /agent/schedule`` reported jobs[0]
+    ``every_min 45, every_min_source "schedule"`` while ``GET /agent/settings``
+    reported ``null / "none"`` -- the same fact, two endpoints, and the one the
+    panel reads was the wrong one. ``run_settings`` owns no schedule, so the
+    console (which serves both) has to tell it what the declaration says.
+    """
+
+    def test_state_reports_a_declared_cadence_it_is_told_about(self):
+        payload = run_settings.state(every_declared=45)
+        self.assertEqual(payload["every_min"], 45.0)
+        self.assertEqual(payload["every_min_source"], "schedule")
+        self.assertEqual(payload["declared_every_min"], 45.0)
+
+    def test_without_a_declaration_the_panel_says_unset(self):
+        payload = run_settings.state()
+        self.assertIsNone(payload["every_min"])
+        self.assertEqual(payload["every_min_source"], "none")
+
+    def test_an_override_beats_the_declaration_and_both_are_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(run_settings, "SETTINGS_FILE",
+                                   Path(tmp) / "s.json"):
+                run_settings.save(every_min=60)
+                payload = run_settings.state(every_declared=45)
+        self.assertEqual(payload["every_min"], 60.0)
+        self.assertEqual(payload["every_min_source"], "console")
+        self.assertEqual(payload["declared_every_min"], 45.0,
+                         "the declaration must stay visible next to an "
+                         "override, or recreating the sidecar looks like it "
+                         "silently changed the cadence")
+
+    def test_a_non_numeric_declaration_is_reported_as_unset_not_crashed(self):
+        payload = run_settings.state(every_declared="every 45 min")
+        self.assertIsNone(payload["declared_every_min"])
+        self.assertIsNone(payload["error"])
+
+
+class ConsoleSuppliesTheDeclarationTest(unittest.TestCase):
+    """The console wiring itself -- the part that was missing."""
+
+    def _status(self, jobs):
+        return {"now": "x", "jobs": jobs, "paused": False}
+
+    def test_the_settings_endpoint_reads_the_schedulers_declared_cadence(self):
+        import webui
+        with mock.patch("scheduler.status", return_value=self._status(
+                [{"id": "j", "every_min": 45.0, "every_min_declared": 45,
+                  "enabled": True}])):
+            payload = webui._settings_state()
+        self.assertEqual(payload["every_min"], 45.0)
+        self.assertEqual(payload["every_min_source"], "schedule")
+        self.assertEqual(payload["declared_every_min"], 45.0)
+        self.assertIsNone(payload.get("note"))
+
+    def test_several_jobs_say_so_instead_of_showing_one_number(self):
+        """An override is GLOBAL; one job's declaration must not stand in for
+        all of them."""
+        import webui
+        with mock.patch("scheduler.status", return_value=self._status(
+                [{"id": "a", "every_min": 30, "every_min_declared": 30},
+                 {"id": "b", "every_min": 60, "every_min_declared": 60}])):
+            payload = webui._settings_state()
+        self.assertIn("ALL 2 jobs", payload.get("note") or "")
+        self.assertIsNone(payload["declared_every_min"],
+                          "picking one of two differing declarations to show "
+                          "as 'the' cadence misdescribes what the override does")
+
+    def test_an_unreadable_schedule_is_reported_not_fatal(self):
+        """The override and the environment value must still resolve."""
+        import webui
+        with mock.patch("scheduler.status", side_effect=RuntimeError("no file")):
+            payload = webui._settings_state()
+        self.assertIn("schedule unreadable", payload.get("note") or "")
+        self.assertIsNotNone(payload["max_steps"])
+        self.assertIsNone(payload["error"])
+
+    def test_the_panel_renders_the_declared_cadence_from_the_endpoint(self):
+        """Structural: the page the operator reads must show it."""
+        import webui
+        page = webui.RUNS_PAGE if hasattr(webui, "RUNS_PAGE") else ""
+        source = page or webui.__dict__.get("_RUNS_HTML", "")
+        if not source:
+            # The page template lives in a module-level string whose name has
+            # changed before; find it rather than pinning the name.
+            source = "\n".join(v for v in webui.__dict__.values()
+                               if isinstance(v, str) and "loadRunSettings" in v)
+        self.assertIn("loadRunSettings", source)
+
+
 class ConsoleRoutesTest(unittest.TestCase):
     """The panel's endpoints, exercised through the handler."""
 
