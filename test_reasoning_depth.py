@@ -72,6 +72,221 @@ class ReasonDepthPayloadTest(unittest.TestCase):
         self.assertNotIn("tool_choice", no_tools)
 
 
+class DepthReachesTheWireTest(unittest.TestCase):
+    """The payload dict is not the request. THIS is the request.
+
+    ``build_request`` returning a dict containing ``reasoning_effort`` proves
+    the dict has a key. The call site then does ``create(**payload)``, which
+    splats the dict into a TYPED signature: a parameter the installed SDK does
+    not model is dropped on the floor, and every assertion above still passes
+    against a request that never asked for depth at all.
+
+    That gap is not hypothetical, it is how this was first reported as working.
+    So the check here stands up a loopback endpoint, points the REAL client at
+    it through the same ``llm.Resolved``/``client_for`` path production uses,
+    and asserts on the JSON body that actually arrived.
+    """
+
+    def setUp(self):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        captured = []
+        self.captured = captured
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                captured.append(self.rfile.read(length))
+                body = json.dumps({
+                    "id": "x", "object": "chat.completion", "created": 0,
+                    "model": "capture",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant",
+                                             "content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                              "total_tokens": 2},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def _on_the_wire(self, effort, budget):
+        import json
+
+        import llm
+
+        with mock.patch.object(config, "REASONING_EFFORT", effort), \
+             mock.patch.object(config, "MAX_TOKENS", budget):
+            request = agent.build_request("wire-model",
+                                          [{"role": "user", "content": "hi"}],
+                                          True)
+            res = llm.Resolved(provider="capture", model="m",
+                               model_id="wire-model",
+                               base_url=f"http://127.0.0.1:{self.port}/v1",
+                               api_key="k")
+            llm.client_for(res).chat.completions.create(**request)
+        return json.loads(self.captured[-1].decode("utf-8"))
+
+    def test_the_effort_setting_survives_the_sdk_and_arrives(self):
+        wire = self._on_the_wire("max", 32000)
+        self.assertEqual(
+            wire.get("reasoning_effort"), "max",
+            "reasoning_effort never reached the wire -- the SDK dropped it, so "
+            "every payload assertion above was testing a dict nobody sent")
+        self.assertEqual(wire.get("max_tokens"), 32000)
+
+    def test_an_unset_effort_sends_no_field_at_all(self):
+        """A type-valid empty string would look configured and do nothing."""
+        wire = self._on_the_wire("", 32000)
+        self.assertNotIn("reasoning_effort", wire)
+
+
+class ReasoningSpendIsRecordedTest(unittest.TestCase):
+    """The provider's own token counts must reach the record.
+
+    Without them "configured for max effort" is the only checkable claim, and a
+    setting that does nothing looks identical to one that works -- which is how
+    this was reported as done when it had never been observed.
+    """
+
+    def _agent(self, events):
+        cls = agent.Agent
+        inst = cls.__new__(cls)
+        inst._transcript = None
+        inst.on_event = events.append
+        inst._log = lambda record: events.append(record)
+        return inst
+
+    def _usage(self, reasoning, completion=300, prompt=120):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            prompt_tokens=prompt, completion_tokens=completion,
+            completion_tokens_details=SimpleNamespace(
+                reasoning_tokens=reasoning))
+
+    def test_the_reasoning_tokens_reach_the_record_with_the_setting(self):
+        events = []
+        inst = self._agent(events)
+        with mock.patch.object(config, "REASONING_EFFORT", "max"), \
+             mock.patch.object(config, "MAX_TOKENS", 32000):
+            inst._record_usage(self._usage(153), "inferhub/flash")
+        self.assertEqual(len(events), 1)
+        rec = events[0]
+        self.assertEqual(rec["event"], "model_usage")
+        self.assertEqual(rec["reasoning_tokens"], 153)
+        self.assertEqual(rec["completion_tokens"], 300)
+        self.assertEqual(rec["reasoning_effort"], "max")
+        self.assertEqual(rec["max_tokens"], 32000)
+        self.assertEqual(rec["route"], "inferhub/flash")
+
+    def test_a_provider_reporting_ZERO_reasoning_records_zero(self):
+        """Zero is a finding, not a missing value.
+
+        Dropping it would hide the one case worth acting on: effort configured,
+        nothing spent.
+        """
+        events = []
+        inst = self._agent(events)
+        inst._record_usage(self._usage(0), "r")
+        self.assertEqual(events[0]["reasoning_tokens"], 0)
+
+    def test_no_usage_block_records_nothing_rather_than_a_fake_zero(self):
+        """An absent block must not be reported as 0 -- that reads as a fault."""
+        events = []
+        inst = self._agent(events)
+        inst._record_usage(None, "r")
+        self.assertEqual(events, [])
+
+    def test_a_provider_without_the_details_field_still_records_totals(self):
+        from types import SimpleNamespace
+        events = []
+        inst = self._agent(events)
+        inst._record_usage(
+            SimpleNamespace(prompt_tokens=5, completion_tokens=7), "r")
+        rec = events[0]
+        self.assertEqual(rec["completion_tokens"], 7)
+        self.assertNotIn("reasoning_tokens", rec)
+
+    def test_streamed_usage_is_read_even_when_the_chunk_has_no_choices(self):
+        """The usage chunk is choice-less BY DESIGN; reading it after the
+        choices guard would discard the only counts the provider sends."""
+        from types import SimpleNamespace
+
+        seen = []
+        usage = self._usage(42)
+        chunks = [
+            SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason=None,
+                delta=SimpleNamespace(content="hi", reasoning_content=None))]),
+            # The real final chunk: usage present, choices empty.
+            SimpleNamespace(choices=[], usage=usage),
+        ]
+        agent.assemble_stream(chunks, on_usage=seen.append)
+        self.assertEqual(seen, [usage])
+
+    def test_complete_actually_calls_the_recorder(self):
+        """THE CALL SITE, not the helper.
+
+        Every test above passes if `_record_usage` works AND nobody calls it,
+        which is the exact shape of the defect being fixed: the numbers were
+        always available on the response and were simply thrown away. So this
+        drives the real `_complete` through a stub client and asserts the
+        record came out the other end.
+        """
+        from types import SimpleNamespace
+
+        events = []
+        inst = self._agent(events)
+        usage = self._usage(153)
+        message = SimpleNamespace(content="done", tool_calls=None,
+                                  finish_reason="stop", reasoning_chars=0)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)], usage=usage)
+
+        class Create:
+            def create(self, **kwargs):
+                return response
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=Create()))
+
+        inst.route_pairs = [("prov", "alias")]
+        inst.messages = [{"role": "user", "content": "hi"}]
+        inst.verbose = False
+        inst.on_token = None
+        inst.session = None            # no per-run session log in a unit test
+        inst._client_for = lambda _resolved: client
+        with mock.patch.object(config, "STREAM", False), \
+             mock.patch("llm.resolve",
+                        return_value=SimpleNamespace(model_id="wire",
+                                                     provider="prov",
+                                                     model="alias")):
+            inst._complete(use_tools=False)
+
+        usage_events = [e for e in events
+                        if isinstance(e, dict)
+                        and e.get("event") == "model_usage"]
+        self.assertEqual(len(usage_events), 1,
+                         f"the recorder was never called; events={events}")
+        self.assertEqual(usage_events[0]["reasoning_tokens"], 153)
+        self.assertEqual(usage_events[0]["route"], "prov/alias")
+
+
 class TruncatedTurnIsRefusedTest(unittest.TestCase):
     """A turn that spent its whole budget reasoning must not read as "done".
 

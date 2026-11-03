@@ -92,7 +92,7 @@ def _backoff(attempt: int, retry_after: Optional[float]) -> float:
     return min(delay, 60.0)
 
 
-def assemble_stream(chunks, emit=None, on_think=None) -> SimpleNamespace:
+def assemble_stream(chunks, emit=None, on_think=None, on_usage=None) -> SimpleNamespace:
     """Fold SSE chunks into one message-shaped object.
 
     Streaming tool calls arrive FRAGMENTED: one chunk may carry the id, the
@@ -118,6 +118,17 @@ def assemble_stream(chunks, emit=None, on_think=None) -> SimpleNamespace:
     #: turn and a finished turn are otherwise indistinguishable downstream.
     finish_reason = None
     for chunk in chunks:
+        #: Read usage BEFORE the choices guard below. The chunk that carries
+        #: usage is the final one and it has EMPTY choices by design, so a
+        #: check that skips choice-less chunks first would discard the only
+        #: token counts the provider ever sends -- and the record would show a
+        #: call that reasoned for nothing.
+        usage = getattr(chunk, "usage", None)
+        if usage is not None and on_usage is not None:
+            try:
+                on_usage(usage)
+            except Exception:  # noqa: BLE001
+                pass
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -180,18 +191,32 @@ def build_request(model: str, messages: list, use_tools: bool) -> dict:
 
     REASONING DEPTH, two knobs, each sent only when configured:
 
-    ``max_tokens`` is the lever that measurably works on a reasoning model. The
-    model thinks out of its completion budget before writing anything, so
-    reasoning length tracks the budget rather than any effort hint. Setting it
-    explicitly stops "how hard does it think" from being a provider-side
-    default that could change under us.
+    ``max_tokens`` is the COMPLETION budget. A reasoning model thinks out of
+    that budget before writing anything, so it is the hard ceiling on depth and
+    the only lever that binds when a model will not stop on its own.
 
-    ``reasoning_effort`` is sent for providers that honour it. On the model
-    deployed here it was measured INERT -- same reasoning_tokens for "low" and
-    "max" alike -- so it must never be the only thing standing between the agent
-    and a deeper think. It is omitted entirely when empty: the gateway validates
-    the field's TYPE but not its VALUE (it accepts "banana"), so a bogus string
-    is accepted and silently ignored, which is worse than not asking.
+    ``reasoning_effort`` is sent for providers that honour it. WHETHER THEY DO
+    IS A PROPERTY OF THE MODEL, NOT OF THIS PAYLOAD, so it has to be measured
+    per model rather than assumed from the last one. Measured 2026-11-03:
+
+      * ``ali/deepseek-v4-pro-0813`` -- INERT. 900 reasoning tokens at none,
+        low and max alike against a 900 budget; wall time varied under 2 s.
+      * ``alicn/deepseek-v4.1-flash-1017`` (the current default) -- HONOURED,
+        but modestly. Repeated samples on one prompt with the budget held:
+        mean reasoning_tokens 104 (none) / 134 (low) / 153 (max), so roughly
+        +50% from none to max. Adjacent settings OVERLAP at three samples each,
+        which is why a single sample per setting is not evidence and why the
+        earlier "+73%" reading was an overstatement.
+
+    So it is never the only thing standing between the agent and a deeper
+    think, and it is omitted entirely when empty: the gateway validates the
+    field's TYPE but not its VALUE (it accepts "banana"), so a bogus string is
+    accepted and silently ignored -- an inert setting is indistinguishable from
+    a working one from outside.
+
+    That indistinguishability is why ``_record_usage`` logs the provider's own
+    reasoning_tokens for every call: with it, "configured for max effort" and
+    "actually reasoned at max effort" become separately checkable facts.
 
     Omitting ``tools`` entirely is what forces a text answer. Asking with tools
     still offered lets the model reach for one more call it will never get to
@@ -322,6 +347,45 @@ class Agent:
             f"(reasoning_chars={getattr(message, 'reasoning_chars', 0)}): "
             f"raise AGENT_MAX_TOKENS above {config.MAX_TOKENS} so the "
             "reasoning can finish and leave room for the answer")
+
+    def _record_usage(self, usage: Any, label: str) -> None:
+        """Write what the provider says this call actually cost and SPENT.
+
+        WHY THIS EXISTS. "Configured for maximum reasoning" and "reasoned at
+        maximum effort" are different claims, and until now only the first was
+        checkable: the request said ``reasoning_effort: max`` and nobody could
+        see whether a single extra token was spent on thinking. A setting whose
+        effect is invisible cannot be audited, so it gets re-litigated on the
+        next pass -- which is exactly what happened.
+
+        Recording the provider's own ``reasoning_tokens`` turns depth into
+        evidence in every run's transcript: a call that reports reasoning
+        tokens near zero while ``effort=max`` is configured is a fact that can
+        be acted on, and a call that reports thousands is proof the setting
+        reached the model.
+
+        Field names vary by provider, so every read is defensive: an absent
+        usage block records nothing rather than a misleading zero. A zero is
+        recorded when the provider genuinely reports zero, because "it thought
+        about nothing" is a real and important observation.
+        """
+        if usage is None:
+            return
+        details = (getattr(usage, "completion_tokens_details", None)
+                   or getattr(usage, "completion_tokens_detail", None))
+        reasoning = getattr(details, "reasoning_tokens", None) if details else None
+        record: Dict[str, Any] = {
+            "event": "model_usage",
+            "route": label,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "reasoning_tokens": reasoning,
+            #: The configured depth travels with the measurement. Without it a
+            #: reader has a number and no context for whether it is expected.
+            "reasoning_effort": config.REASONING_EFFORT or None,
+            "max_tokens": config.MAX_TOKENS or None,
+        }
+        self._log({k: v for k, v in record.items() if v is not None})
 
     def _on_think(self, n_chars: int) -> None:
         """Liveness signal from a model that is still reasoning.
@@ -488,6 +552,14 @@ class Agent:
                 continue
             client = self._client_for(resolved)
             model = resolved.model_id
+
+            #: Bind the route label by DEFAULT ARGUMENT, not by closure. The
+            #: loop rebinds `label` on every iteration, so a closure would
+            #: attribute a later attempt's token counts to whichever route
+            #: happened to be current when the callback finally fired.
+            def on_usage(usage, _label=label):
+                self._record_usage(usage, _label)
+
             for attempt in range(config.API_RETRIES):
                 # Recorded BEFORE the request so that a hung call leaves a
                 # trail: the last event in the session says which model we
@@ -518,7 +590,8 @@ class Agent:
                         stream = client.chat.completions.create(
                             **request, stream=True)
                         message = assemble_stream(stream, self._emit_token,
-                                                  on_think=self._on_think)
+                                                  on_think=self._on_think,
+                                                  on_usage=on_usage)
                         if self.verbose:
                             print(flush=True)
                         self._refuse_truncated_turn(message, label)
@@ -558,6 +631,11 @@ class Agent:
                 # the same disease as a 429, so treat it as retryable rather
                 # than crashing on response.choices[0].
                 if getattr(response, "choices", None):
+                    #: Record what this call cost and spent BEFORE judging it.
+                    #: A capped turn still consumed reasoning, and that spend
+                    #: is the evidence that the depth setting is live -- so it
+                    #: must survive the turn being refused below.
+                    self._record_usage(getattr(response, "usage", None), label)
                     #: Same guard as the streamed path: a batched turn that
                     #: spent its whole budget reasoning is not an answer.
                     self._refuse_truncated_turn(
