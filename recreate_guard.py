@@ -225,6 +225,25 @@ def decide(sched: Dict[str, Any],
                        % newest.get("file"))
 
 
+def line_log(*values: Any) -> None:
+    """Log one line and FLUSH it.
+
+    ``print`` block-buffers when stdout is not a tty, and this tool is meant to
+    be run detached -- it can legitimately wait tens of minutes for a run in
+    flight to end, so its normal invocation is
+    ``nohup ... > guard.log 2>&1 &``. Unflushed, that produces an EMPTY log
+    while the tool is working perfectly: an operator (or an agent) watching the
+    file cannot tell waiting from hung, and "hung" gets killed, which is how a
+    guard against killing runs ends up being killed itself. Observed live on
+    2026-11-03: 0 bytes after three minutes, with the build finished and the
+    wait loop polling happily.
+
+    Subprocess output is separate: ``sh`` streams it through this function,
+    which flushes per call, so a long build still shows progress.
+    """
+    print(*values, flush=True)
+
+
 def fetch_json(console: str, base_path: str, path: str,
                timeout: float = 20.0) -> Dict[str, Any]:
     with urllib.request.urlopen(console.rstrip("/") + base_path.rstrip("/") + path,
@@ -240,7 +259,7 @@ def probe(console: str, base_path: str,
     return (runs.get("scheduler") or {}), newest_session(runs, mounts)
 
 
-def wait_until_idle(probe_fn, wait_sec: float, log=print,
+def wait_until_idle(probe_fn, wait_sec: float, log=line_log,
                     poll_sec: float = POLL_SEC) -> Tuple[str, str]:
     """Poll until the scheduler is idle, or give up. Never recreates."""
     deadline = time.monotonic() + wait_sec
@@ -257,7 +276,7 @@ def wait_until_idle(probe_fn, wait_sec: float, log=print,
         time.sleep(min(poll_sec, max(1.0, remaining)))
 
 
-def confirm_still_idle(probe_fn, log=print,
+def confirm_still_idle(probe_fn, log=line_log,
                        confirm_sec: float = CONFIRM_SEC) -> Tuple[str, str]:
     """Re-probe once after a grace, so a run starting in the gap is caught."""
     time.sleep(confirm_sec)
@@ -267,7 +286,7 @@ def confirm_still_idle(probe_fn, log=print,
     return action, reason
 
 
-def sh(cmd: str, log=print, cwd: Optional[str] = None,
+def sh(cmd: str, log=line_log, cwd: Optional[str] = None,
        quiet_out: bool = False) -> Tuple[int, str]:
     log("+ %s" % cmd)
     proc = subprocess.run(cmd, shell=True, cwd=cwd,
@@ -297,7 +316,8 @@ def mask_if_secret(name: str, value: str) -> str:
     return value
 
 
-def container_started(docker: str, container: str, log=print) -> Optional[str]:
+def container_started(docker: str, container: str,
+                      log=line_log) -> Optional[str]:
     """The container's StartedAt stamp, or None if it cannot be read."""
     rc, out = sh('%s inspect %s --format "{{.State.StartedAt}}"' % (docker, container),
                  log=log)
@@ -305,7 +325,7 @@ def container_started(docker: str, container: str, log=print) -> Optional[str]:
 
 
 def verify(docker: str, container: str, before: Optional[str],
-           env_prefix: str = ENV_PREFIX, log=print) -> int:
+           env_prefix: str = ENV_PREFIX, log=line_log) -> int:
     """Prove the running container is the NEW one and read its env from inside.
 
     Verification is from INSIDE the running container -- not from a build log,
@@ -381,7 +401,7 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--json", action="store_true", help="print the probe as JSON and exit")
     args = ap.parse_args(argv)
 
-    log = (lambda *a: None) if args.json else print
+    log = (lambda *a: None) if args.json else line_log
 
     specs: List[str] = list(args.mount or []) or list(MOUNTS)
     try:

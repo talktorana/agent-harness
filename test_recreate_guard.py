@@ -35,15 +35,23 @@ Run:  python -m unittest test_recreate_guard
 """
 from __future__ import annotations
 
+import http.server
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest import mock
 
 import recreate_guard as RG
+
+GUARD = Path(__file__).resolve().parent / "recreate_guard.py"
 
 
 def sched(running=False, available=True, in_progress_since=None, reason=None):
@@ -366,6 +374,84 @@ class VerifyProvesTheReplacementTest(unittest.TestCase):
             rc = RG.verify("docker", "agent", "ts-old", log=out.write)
         self.assertEqual(rc, 4)
         self.assertIn("cannot inspect", out.getvalue())
+
+
+class DetachedRunShowsProgressTest(unittest.TestCase):
+    """A guard nobody can watch is a guard that gets killed for looking hung.
+
+    Observed live on 2026-11-03: run detached while it waited out a pass in
+    flight, the log file was STILL 0 bytes three minutes in -- ``print``
+    block-buffers when stdout is not a tty. The tool was working correctly and
+    was indistinguishable from a hang.
+    """
+
+    def test_line_log_flushes_so_a_redirected_log_is_not_empty(self):
+        import builtins
+        with mock.patch.object(builtins, "print") as p:
+            RG.line_log("[probe] WAIT", "--", "reason")
+        self.assertTrue(p.call_args.kwargs.get("flush"),
+                        "line_log did not pass flush=True, so a detached run "
+                        "buffers everything until it exits")
+
+    def test_helpers_log_through_the_flushing_logger_by_default(self):
+        """The default must be the flushing one, not ``print``."""
+        import inspect
+        for fn in (RG.sh, RG.wait_until_idle, RG.confirm_still_idle, RG.verify):
+            default = inspect.signature(fn).parameters["log"].default
+            self.assertIs(default, RG.line_log,
+                          "%s still defaults to a buffering logger" % fn.__name__)
+
+    def test_a_detached_run_writes_progress_while_it_is_still_running(self):
+        """End to end: the file has the WAIT line BEFORE the process exits."""
+        payload = json.dumps({
+            "scheduler": {"available": True, "running": True,
+                          "in_progress_since": "2026-11-03T19:39:08",
+                          "in_progress_sec": 42.0},
+            "runs": [], "sessions_dir": "/nonexistent-sessions",
+        }).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                log_path = os.path.join(tmp, "guard.log")
+                with open(log_path, "wb") as sink:
+                    proc = subprocess.Popen(
+                        [sys.executable, str(GUARD), "--apply", "--wait-sec", "40",
+                         "--console", "http://127.0.0.1:%d" % server.server_address[1],
+                         "--compose-dir", tmp, "--compose-file", "none.yml",
+                         "--container", "no-such-container"],
+                        stdout=sink, stderr=subprocess.STDOUT)
+                    seen = b""
+                    deadline = time.time() + 15
+                    while time.time() < deadline and proc.poll() is None:
+                        time.sleep(0.4)
+                        with open(log_path, "rb") as fh:
+                            seen = fh.read()
+                        if b"WAIT" in seen:
+                            break
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:  # pragma: no cover
+                        proc.kill()
+        finally:
+            server.shutdown()
+        self.assertIn(b"WAIT", seen,
+                      "a detached guard wrote nothing while still running -- "
+                      "stdout is block-buffered and every probe line is stuck "
+                      "in the buffer")
 
 
 if __name__ == "__main__":
