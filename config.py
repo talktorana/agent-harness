@@ -145,7 +145,25 @@ API_TIMEOUT_SEC = float(os.environ.get("AGENT_API_TIMEOUT_SEC", "120"))
 # Tried only after the primary model has been retried to exhaustion. Keep it
 # empty unless you want a second model to catch overflow.
 FALLBACK_MODEL = os.environ.get("AGENT_FALLBACK_MODEL", "").strip()
-
+# --- reasoning depth ------------------------------------------------------
+# Two knobs, because on a reasoning model they are NOT the same thing, and
+# only one of them was measured to work here.
+#
+# ``REASONING_EFFORT`` is sent as ``reasoning_effort``. The field is TYPE
+# validated by the gateway ("must be an object with 'effort' field or a
+# String") but NOT enum validated -- it accepts the string "banana" -- and on
+# ``ali/deepseek-v4-pro-0813`` it was measured to have NO effect: with the same
+# prompt and a 900-token budget, reasoning_tokens was 900 for none, "low" and
+# "max" alike, and wall time differed by under 2 s. So this setting is
+# expressed explicitly for providers that DO honour it, and must not be relied
+# on for this one. An empty value sends nothing at all.
+REASONING_EFFORT = os.environ.get("AGENT_REASONING_EFFORT", "").strip()
+# The knob that ACTUALLY governs depth on this model: a reasoning model spends
+# its completion budget thinking before it writes anything, so reasoning
+# length tracks ``max_tokens`` rather than any effort hint. Left unset the
+# provider default applies, which is why the setting is explicit rather than
+# implied -- "how hard does it think" should not be a provider-side accident.
+MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "0") or "0")
 # --- loop limits ----------------------------------------------------------
 # The agent stops when the model stops calling tools. MAX_STEPS is the
 # backstop so a confused model cannot loop forever and burn tokens.

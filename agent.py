@@ -112,10 +112,18 @@ def assemble_stream(chunks, emit=None, on_think=None) -> SimpleNamespace:
     content: List[str] = []
     calls: Dict[int, Dict[str, Any]] = {}
     thinking_chars = 0
+    #: The provider's own verdict on why the turn ended. "length" means the
+    #: budget ran out -- possibly entirely inside reasoning -- and the turn is
+    #: NOT a completed answer. Recorded rather than ignored because a capped
+    #: turn and a finished turn are otherwise indistinguishable downstream.
+    finish_reason = None
     for chunk in chunks:
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
+        fr = getattr(choices[0], "finish_reason", None)
+        if fr:
+            finish_reason = fr
         delta = getattr(choices[0], "delta", None)
         if delta is None:
             continue
@@ -160,7 +168,48 @@ def assemble_stream(chunks, emit=None, on_think=None) -> SimpleNamespace:
         ]
     return SimpleNamespace(content="".join(content) or None,
                            tool_calls=tool_calls,
-                           reasoning_chars=thinking_chars)
+                           reasoning_chars=thinking_chars,
+                           finish_reason=finish_reason)
+
+
+def build_request(model: str, messages: list, use_tools: bool) -> dict:
+    """The chat-completions payload for one model call.
+
+    Extracted from the call site so the payload -- which is where reasoning
+    depth is decided -- can be unit-tested directly instead of grepped.
+
+    REASONING DEPTH, two knobs, each sent only when configured:
+
+    ``max_tokens`` is the lever that measurably works on a reasoning model. The
+    model thinks out of its completion budget before writing anything, so
+    reasoning length tracks the budget rather than any effort hint. Setting it
+    explicitly stops "how hard does it think" from being a provider-side
+    default that could change under us.
+
+    ``reasoning_effort`` is sent for providers that honour it. On the model
+    deployed here it was measured INERT -- same reasoning_tokens for "low" and
+    "max" alike -- so it must never be the only thing standing between the agent
+    and a deeper think. It is omitted entirely when empty: the gateway validates
+    the field's TYPE but not its VALUE (it accepts "banana"), so a bogus string
+    is accepted and silently ignored, which is worse than not asking.
+
+    Omitting ``tools`` entirely is what forces a text answer. Asking with tools
+    still offered lets the model reach for one more call it will never get to
+    make.
+    """
+    request: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    if config.MAX_TOKENS > 0:
+        request["max_tokens"] = config.MAX_TOKENS
+    if config.REASONING_EFFORT:
+        request["reasoning_effort"] = config.REASONING_EFFORT
+    if use_tools:
+        request["tools"] = TOOLS
+        request["tool_choice"] = "auto"
+    return request
 
 
 class Agent:
@@ -238,6 +287,41 @@ class Agent:
                 self.on_token(text)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _refuse_truncated_turn(self, message: SimpleNamespace,
+                               label: str) -> None:
+        """Raise when a turn ended on the token cap with nothing to show for it.
+
+        WHY THIS EXISTS (2026-11-03). A reasoning model spends its completion
+        budget thinking. If the budget is too small the turn comes back with
+        ``finish_reason="length"``, NO content and NO tool calls -- and the
+        loop reads "no tool calls" as "the model has finished", so the run ends
+        with a thin or empty answer while the transcript looks like a clean
+        stop. Nothing in the code inspected ``finish_reason``, so configuring a
+        large reasoning budget by mistake was indistinguishable from the model
+        having nothing more to say.
+
+        This matters the moment ``AGENT_MAX_TOKENS`` is set explicitly, which
+        is exactly what "reason more deeply" requires. Raising here routes it
+        through the existing retry/route fallback, so the failure is loud and
+        attributable instead of silent.
+
+        Deliberately narrow: only a turn with NO content and NO tool calls is
+        refused. A turn that produced an answer and merely hit the cap is a
+        partial answer worth keeping -- discarding it would lose real work.
+        """
+        if getattr(message, "finish_reason", None) != "length":
+            return
+        if message.content or message.tool_calls:
+            return
+        self._log({"event": "turn_truncated", "route": label,
+                   "max_tokens": config.MAX_TOKENS or None,
+                   "reasoning_chars": getattr(message, "reasoning_chars", 0)})
+        raise RuntimeError(
+            "model turn hit the token cap with no content and no tool call "
+            f"(reasoning_chars={getattr(message, 'reasoning_chars', 0)}): "
+            f"raise AGENT_MAX_TOKENS above {config.MAX_TOKENS} so the "
+            "reasoning can finish and leave room for the answer")
 
     def _on_think(self, n_chars: int) -> None:
         """Liveness signal from a model that is still reasoning.
@@ -410,21 +494,17 @@ class Agent:
                 # were waiting on, instead of the log simply stopping.
                 self._log({"event": "model_call", "model": model,
                            "route": label, "attempt": attempt + 1,
-                           "timeout_sec": config.API_TIMEOUT_SEC})
+                           "timeout_sec": config.API_TIMEOUT_SEC,
+                           #: Recorded so a report can state the depth it ran
+                           #: at instead of assuming the configured values
+                           #: reached the wire. A setting nobody can see from
+                           #: the transcript is a setting nobody can audit.
+                           "max_tokens": config.MAX_TOKENS or None,
+                           "reasoning_effort": config.REASONING_EFFORT or None})
                 if self.session:
                     self.session.model_call(model, attempt + 1)
                 try:
-                    request = {
-                        "model": model,
-                        "messages": self.messages,
-                        "temperature": 0.2,
-                    }
-                    # Omitting `tools` entirely is what forces a text answer.
-                    # Asking with tools still offered lets the model reach for
-                    # one more call it will never get to make.
-                    if use_tools:
-                        request["tools"] = TOOLS
-                        request["tool_choice"] = "auto"
+                    request = build_request(model, self.messages, use_tools)
                     if config.STREAM and (self.verbose or self.on_token):
                         # Streamed: tokens print as they arrive and the web
                         # UI shows the answer forming. assemble_stream folds
@@ -441,6 +521,7 @@ class Agent:
                                                   on_think=self._on_think)
                         if self.verbose:
                             print(flush=True)
+                        self._refuse_truncated_turn(message, label)
                         return SimpleNamespace(
                             choices=[SimpleNamespace(message=message)])
                     response = client.chat.completions.create(**request)
@@ -477,6 +558,10 @@ class Agent:
                 # the same disease as a 429, so treat it as retryable rather
                 # than crashing on response.choices[0].
                 if getattr(response, "choices", None):
+                    #: Same guard as the streamed path: a batched turn that
+                    #: spent its whole budget reasoning is not an answer.
+                    self._refuse_truncated_turn(
+                        response.choices[0].message, label)
                     return response
                 if attempt == config.API_RETRIES - 1:
                     problems.append(f"{label}: empty completion")
