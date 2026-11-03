@@ -356,6 +356,7 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <a href="__AGENT_BASE__/">console</a>
 </div>
 <div id="model" class="m">loading model...</div>
+<div id="settings" class="m">loading run settings...</div>
 <div id="sched" class="m">loading schedule...</div>
 <div id="err"></div>
 <div id="keep" class="m"></div>
@@ -636,6 +637,113 @@ function mmsg(text,cls){
   const el=document.getElementById('mmsg');
   if(el){el.className='sub '+(cls||'');el.textContent=text;}
 }
+// ---- run settings: cadence and the step ceiling -------------------------
+// Same shape as the model panel on purpose. Two numbers an operator tunes
+// WHILE WATCHING a pass head for its cut-off, so they take effect on the next
+// run with no redeploy -- and the panel always says where the value in force
+// came from, because a page that shows a number without its provenance cannot
+// be distinguished from a stale one.
+const SSET={console:'set here',environment:'container environment',
+            default:'built-in default',schedule:'schedule file',none:'not set',
+            error:'unreadable'};
+async function loadRunSettings(){
+  const el=document.getElementById('settings');
+  let st=null;
+  try{const r=await fetch('__AGENT_BASE__/settings');st=await r.json();}catch(e){}
+  if(!st||typeof st!=='object'){el.className='bad';
+    el.textContent='run settings unavailable (__AGENT_BASE__/settings)';return;}
+  const lim=st.limits||{};
+  const ms=lim.max_steps||[1,4000], em=lim.every_min||[1,10080];
+  let h='<div class="row"><label>mission cadence</label>'
+    +'<input id="smin" type="number" min="'+em[0]+'" max="'+em[1]+'" '
+    +'style="width:5.5em" value="'+(st.every_min==null?'':st.every_min)+'">'
+    +'<span class="m">minutes between missions</span>'
+    +'<label>step ceiling</label>'
+    +'<input id="ssteps" type="number" min="'+ms[0]+'" max="'+ms[1]+'" '
+    +'style="width:6em" value="'+(st.max_steps==null?'':st.max_steps)+'">'
+    +'<button onclick="saveRunSettings()">apply</button>'
+    +'<button onclick="clearRunSteps()">ceiling: environment</button>'
+    +'<button onclick="clearRunEvery()">cadence: schedule file</button>'
+    +'</div>';
+  if(st.error)h+='<div class="sub bad">'+esc(st.error)+'</div>';
+  h+='<div class="sub">in force: cadence <b>'
+    +(st.every_min==null?'(schedule file says otherwise)':st.every_min+' min')
+    +'</b> <span class="m">('+esc(SSET[st.every_min_source]||st.every_min_source)+')</span>, '
+    +'step ceiling <b>'+(st.max_steps==null?'?':st.max_steps)+'</b> '
+    +'<span class="m">('+esc(SSET[st.max_steps_source]||st.max_steps_source)+'</span>'
+    +' wind-down warning at <b>'+(st.answer_warn_steps==null?'?':st.answer_warn_steps)
+    +'</b> turns left)</div>'
+    +'<div class="sub m">declared by the deployment: ceiling <b>'
+    +(st.declared_max_steps==null?'?':st.declared_max_steps)+'</b>, warning <b>'
+    +(st.declared_answer_warn_steps==null?'?':st.declared_answer_warn_steps)
+    +'</b>. An override here outlives a redeploy (it is a file in the sessions '
+    +'volume, not the container environment) -- so if you recreate the sidecar '
+    +'and a value comes back, that is why, and clear it deliberately.</div>'
+    +'<div class="sub m">the ceiling applies to the NEXT run; a run already in '
+    +'flight keeps the budget it started with. Values outside '
+    +ms[0]+'\u2013'+ms[1]+' turns / '+em[0]+'\u2013'+em[1]+' minutes are refused '
+    +'rather than clamped: a ceiling of 0 ends every run on turn one, and an '
+    +'interval of 0 fires on every poll.</div>'
+    +'<div class="sub" id="smsg"></div>';
+  el.innerHTML=h; el.className='';
+}
+function smsg(text,cls){
+  const el=document.getElementById('smsg');
+  if(el){el.className='sub '+(cls||'');el.textContent=text;}
+}
+async function postSettings(body){
+  let j=null;
+  try{
+    const r=await fetch('__AGENT_BASE__/settings',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    j=await r.json();
+  }catch(e){smsg('request failed: '+e,'bad');return null;}
+  return j;
+}
+function _readSetting(id,label){
+  const el=document.getElementById(id);
+  if(!el||el.value===''||el.value==null){return null;}
+  const v=Number(el.value);
+  if(!Number.isFinite(v)||Math.floor(v)!==v){
+    smsg(label+' must be a whole number','bad');return undefined;}
+  return v;
+}
+async function saveRunSettings(){
+  // Only post the field(s) actually filled in, so applying one does not wipe
+  // the other by sending an empty string the server would reject.
+  const body={}; smsg('applying...','');
+  const steps=_readSetting('ssteps','step ceiling');
+  if(steps===undefined)return;
+  const mins=_readSetting('smin','cadence');
+  if(mins===undefined)return;
+  if(steps!==null)body.max_steps=steps;
+  if(mins!==null)body.every_min=mins;
+  if(!Object.keys(body).length){smsg('nothing to apply: both fields are empty','bad');return;}
+  const j=await postSettings(body);
+  if(!j)return;
+  if(!j.ok){
+    smsg(j.error?('refused: '+j.error):'refused','bad');
+    await loadRunSettings();return;
+  }
+  smsg('applied','good');
+  await loadRunSettings();
+}
+async function clearRunSteps(){
+  smsg('reverting the ceiling to the environment...','');
+  const j=await postSettings({clear:'max_steps'});
+  if(!j)return;
+  smsg(j.ok?'ceiling now from the environment':('refused: '+(j.error||'?')),
+       j.ok?'good':'bad');
+  await loadRunSettings();
+}
+async function clearRunEvery(){
+  smsg('reverting the cadence to the schedule file...','');
+  const j=await postSettings({clear:'every_min'});
+  if(!j)return;
+  smsg(j.ok?'cadence now from the schedule file':('refused: '+(j.error||'?')),
+       j.ok?'good':'bad');
+  await loadRunSettings();
+}
 async function postModel(body){
   let j=null;
   try{
@@ -685,6 +793,7 @@ async function clearModelChoice(){
   mmsg(note,'ok');
 }
 loadModelChoice();
+loadRunSettings();
 
 loadSchedule(); loadRuns();
 setInterval(loadSchedule,15000); setInterval(loadRuns,30000);
@@ -1205,6 +1314,10 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/model":
             self._send(200, json.dumps(_model_state()).encode(),
                        "application/json")
+        elif route == "/settings":
+            import run_settings
+            self._send(200, json.dumps(run_settings.state()).encode(),
+                       "application/json")
         elif route == "/health":
             self._send(200, json.dumps({"ok": True,
                                         "tasks": len(_TASKS)}).encode(),
@@ -1218,6 +1331,52 @@ class Handler(BaseHTTPRequestHandler):
             task_id = route.split("/stop/", 1)[1]
             ok = _stop_task(task_id)
             self._send(200, json.dumps({"stopped": ok}).encode(),
+                       "application/json")
+            return
+        if route == "/settings":
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("body must be an object")
+            except ValueError as exc:
+                self._send(400, json.dumps(
+                    {"ok": False, "error": f"bad JSON: {exc}"}).encode(),
+                    "application/json")
+                return
+            import run_settings
+            try:
+                clearing = body.get("clear")
+                if clearing:
+                    remaining = run_settings.clear(
+                        None if clearing is True else str(clearing))
+                    payload = {"ok": True, "cleared": str(clearing),
+                               "remaining": remaining, **run_settings.state()}
+                else:
+                    steps = body.get("max_steps")
+                    every = body.get("every_min")
+                    if steps is None and every is None:
+                        raise run_settings.SettingsError(
+                            "pass 'max_steps' and/or 'every_min'.")
+                    saved = run_settings.save(max_steps=steps, every_min=every)
+                    payload = {"ok": True, "saved": saved,
+                               **run_settings.state()}
+            except Exception as exc:  # noqa: BLE001
+                # 400, not 500: the value was unusable and the operator is
+                # looking at the page. The previous setting is still in force,
+                # and the payload says which one that is.
+                #
+                # `error` is assigned AFTER the spread, as in /model: state()
+                # carries its own `error` key, so spreading it last would
+                # overwrite the refusal reason with None and the page would
+                # show a failure with no cause.
+                payload = {"ok": False, **run_settings.state()}
+                payload["error"] = f"{type(exc).__name__}: {exc}"
+                self._send(400, json.dumps(payload, default=str).encode(),
+                           "application/json")
+                return
+            self._send(200, json.dumps(payload, default=str).encode(),
                        "application/json")
             return
         if route == "/model":

@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import config
+import run_settings
 
 _LOCK = threading.Lock()
 
@@ -215,9 +216,14 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
         last_run = _comparable(_parse_stamp(entry.get("last_run")), when)
         finished = _comparable(_parse_stamp(entry.get("finished")), when)
 
+        #: The interval in force is the CONSOLE OVERRIDE if one is set, else
+        #: what the declaration says. Both are reported: an operator has to be
+        #: able to see that the page's 45 is what governs, not the 30 in the
+        #: file, otherwise the declaration reads as the truth and the override
+        #: looks like a display bug.
+        every, every_source = run_settings.effective_every_min(job.get("every_min"))
         next_due: Optional[datetime] = None
         seconds_until: Optional[float] = None
-        every = job.get("every_min")
         if job.get("enabled", True) and every and last_run:
             try:
                 next_due = last_run + timedelta(minutes=float(every))
@@ -266,8 +272,16 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
 
         jobs.append({
             "id": key,
-            "interval": _interval_label(job),
+            "interval": _interval_label({**job, "every_min": every}),
             "every_min": every,
+            #: Where the interval came from: "console" (an operator set it on
+            #: the page), "schedule" (the declaration) or "none" (an `at` job).
+            "every_min_source": every_source,
+            #: The declared value, so a page can say "45 in force, declaration
+            #: says 30" -- without it an override is invisible in the payload
+            #: that reports scheduling, and the next operator re-discovers it
+            #: by watching runs fire at an interval nobody set.
+            "every_min_declared": job.get("every_min"),
             "enabled": bool(job.get("enabled", True)),
             # The prompt is the thing an operator most wants to check -- "what
             # is it actually being told to do every half hour?" -- so it is
@@ -357,7 +371,15 @@ def _due(job: Dict[str, Any], now: datetime,
         return False
     stamp = ((state or {}).get("jobs", {}).get(key) or {}).get("last_run") \
         or job.get("last_run")   # an inline stamp in an old-style declaration
+    #: The console override wins over the declaration AT FIRE TIME, so cadence
+    #: is tunable while the daemon runs and the declaration stays read-only.
+    #: An unreadable override must not stop the loop: fall back to what the
+    #: declaration says and let the console report the read error.
     every = job.get("every_min")
+    try:
+        every, _source = run_settings.effective_every_min(every)
+    except Exception:  # noqa: BLE001
+        pass
     if every:
         if not stamp:
             return True

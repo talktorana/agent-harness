@@ -23,11 +23,38 @@ from openai import OpenAI
 
 import config
 import llm
+import run_settings
 import storage
 import tools_media
 from memory import MemoryStore
 from prompts import build_system
 from session import SessionLog
+
+
+def _effective_max_steps() -> int:
+    """The step ceiling in force for a NEW task.
+
+    Read through ``run_settings`` so a value an operator just set in the
+    console applies to the next run -- no redeploy, no recreate. A settings
+    file that cannot be parsed raises, and a run must not die because of that,
+    so the import-time value from the environment is the fallback. It is used
+    only when the override is UNREADABLE, never when it is merely absent.
+    """
+    try:
+        return run_settings.effective_max_steps()[0]
+    except Exception as exc:  # noqa: BLE001 -- a bad settings file is reported,
+        import sys                # not fatal: the env value still works
+        print(f"[warn] run settings unreadable, using AGENT_MAX_STEPS="
+              f"{config.MAX_STEPS}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return config.MAX_STEPS
+
+
+def _effective_answer_warn_steps(max_steps: int) -> int:
+    """The wind-down warning distance that goes with ``max_steps``."""
+    try:
+        return run_settings.effective_answer_warn_steps(max_steps)
+    except Exception:  # noqa: BLE001
+        return config.ANSWER_WARN_STEPS
 from tools import HANDLERS, TOOLS, set_memory_session
 from tools_repo_map import build_repo_map
 
@@ -784,7 +811,18 @@ class Agent:
         self._log({"event": "task", "task": task,
                    "images": list(images or [])})
 
-        for step in range(1, config.MAX_STEPS + 1):
+        #: Read the ceiling ONCE per task, not per turn. A console override can
+        #: legitimately change while a run is in flight (an operator watching a
+        #: pass head for the cut-off raises it), but a run that re-reads every
+        #: turn would also have its warning distance move under it, and the
+        #: warning fires on an exact equality -- so the run could skip the only
+        #: chance it gets to write an answer. Pinning at task start keeps the
+        #: budget coherent for the run and applies the new value to the next.
+        max_steps = _effective_max_steps()
+        warn_steps = _effective_answer_warn_steps(max_steps)
+        self.max_steps = max_steps
+
+        for step in range(1, max_steps + 1):
             self.steps = step
             if self.stop_requested:
                 # Cooperative stop: bail between turns, never mid-tool, so a
@@ -795,8 +833,8 @@ class Agent:
                     self.session.finish("stopped")
                 self._close()
                 return "STOPPED by user request."
-            remaining = config.MAX_STEPS - step
-            if remaining == max(1, config.ANSWER_WARN_STEPS):
+            remaining = max_steps - step
+            if remaining == max(1, warn_steps):
                 # Told before it runs out, not after. A model that knows the
                 # budget is nearly spent writes its answer; one that does not
                 # keeps exploring and loses everything to the cut-off.
@@ -875,7 +913,7 @@ class Agent:
                     "content": content,
                 })
 
-        self._say(f"\n[stopped] reached {config.MAX_STEPS} steps")
+        self._say(f"\n[stopped] reached {max_steps} steps")
         salvaged = self._final_answer()
         if salvaged:
             self._say("\n\033[33m" + salvaged + "\033[0m")
@@ -889,7 +927,7 @@ class Agent:
         if self.session:
             self.session.finish("step_limit")
         self._close()
-        return (f"Reached the {config.MAX_STEPS}-step limit and could not "
+        return (f"Reached the {max_steps}-step limit and could not "
                 f"produce a final answer. The work is in the transcript at "
                 f"{self.session.md_path if self.session else 'the session log'}.")
 

@@ -177,11 +177,26 @@ MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "0") or "0")
 # --- loop limits ----------------------------------------------------------
 # The agent stops when the model stops calling tools. MAX_STEPS is the
 # backstop so a confused model cannot loop forever and burn tokens.
-MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
+#: 200, raised from 40. The loop stops when the MODEL stops calling tools;
+#: this is only the backstop against a confused model looping forever. Every
+#: observed cut-off of an unattended mission lost work rather than saving it:
+#: runs that died exactly at the ceiling had typically found a defect, fixed it
+#: and proved the fix, then had nothing left to deliver or report it. Raising
+#: the backstop costs nothing on a healthy run -- it finishes when the model
+#: finishes -- and it is now also changeable per-deployment from the console
+#: without a redeploy (see ``run_settings``).
+MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "200"))
 # Warn the model this many steps before the cut-off. Without a warning it
 # keeps investigating to the very end and the run returns "no answer" --
 # fifty steps of good research thrown away for want of a sentence.
-ANSWER_WARN_STEPS = int(os.environ.get("AGENT_ANSWER_WARN_STEPS", "3"))
+#:
+#: 20, raised from 3 alongside the ceiling: the warning fires ONCE (agent.py
+#: compares ``remaining == ANSWER_WARN_STEPS``), so the window IS the run's only
+#: chance to stop and write its answer, and it has to hold at least a few tool
+#: calls. At 200 turns, 3 would mean a warning that arrives with 1.5% of the
+#: run left -- too late to reach the report. ``run_settings`` scales this with
+#: whatever ceiling is actually in force.
+ANSWER_WARN_STEPS = int(os.environ.get("AGENT_ANSWER_WARN_STEPS", "20"))
 TOOL_TIMEOUT_SEC = int(os.environ.get("AGENT_TOOL_TIMEOUT_SEC", "180"))
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the
