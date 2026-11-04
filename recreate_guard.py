@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import posixpath
 import subprocess
@@ -243,6 +244,75 @@ def describe_run(sched: Dict[str, Any],
            if (newest or {}).get("file") else ""))
 
 
+def wait_budget_verdict(sched: Dict[str, Any], wait_sec: float) -> Optional[str]:
+    """Can ``wait_sec`` actually contain the run that is in flight?
+
+    Returns ``None`` when there is nothing to warn about, or a sentence saying
+    that the wait will expire first. Pure -- no I/O, no clock -- so the rule can
+    be unit-tested and mutation-checked like ``decide``.
+
+    WHY THIS EXISTS. The wait is a fixed budget supplied by whoever runs the
+    command, while the run it waits for is bounded by a DIFFERENT number
+    (``AGENT_MAX_RUN_SEC``, reported as ``run_bound_sec``) that the guard never
+    looked at. Nothing related the two. With the shipped default of 1500 s and a
+    5400 s bound, a perfectly healthy mission that has been running 20 minutes
+    can still legally run for another 70 -- longer than the wait -- so
+    ``--build --apply"`` returns 3 with the image rebuilt and the container
+    untouched. That is the worst possible outcome: it reads like a refusal to
+    act, when in truth the action was taken and the shipping step quietly
+    expired. The fix ships late or never, and the next pass sees the drift again
+    and cannot tell whether the previous one failed or was never given enough
+    time.
+
+    Three cases, deliberately different, because "unknown" and "unbounded" read
+    the same through ``.get()``:
+
+      * the key is ABSENT  -> this console predates the field. Say nothing;
+        guessing would warn on every old deployment.
+      * the key is present but falsy -> no wall-clock bound is set, so NO wait
+        can be known sufficient. That is worth saying, differently.
+      * a positive bound -> compare it against what this run has already spent.
+        Comparing against the WHOLE bound would cry wolf on a run that started
+        89 minutes ago; the question is whether the run in flight can still
+        finish inside the wait.
+    """
+    if not sched.get("running"):
+        return None
+    if "run_bound_sec" not in sched:
+        return None
+    bound = sched.get("run_bound_sec")
+    if not bound:
+        return ("no wall-clock bound is set on the harness (run_bound_sec is "
+                "null), so NO wait can be known to contain this run -- it ends "
+                "when the model stops calling tools or the step ceiling is "
+                "reached. Prefer --force, or watch the run and re-invoke when "
+                "it ends")
+    try:
+        remaining = float(bound) - float(sched.get("in_progress_sec") or 0.0)
+        budget = float(wait_sec)
+    except (TypeError, ValueError):
+        return None
+    #: NaN is not hypothetical. Python's ``json`` EMITS and PARSES it by default
+    #: (a nonstandard extension), so a console that computed an unbounded value
+    #: can hand back ``run_bound_sec: NaN``, which survives ``float()`` and then
+    #: raises inside ``int()`` -- a crash in the one function whose whole job is
+    #: to help an operator at 4am. Non-finite means "cannot measure": stay
+    #: silent rather than inventing a verdict.
+    if not (math.isfinite(remaining) and math.isfinite(budget)):
+        return None
+    if remaining <= budget:
+        return None
+    suggest = int(remaining) + 60    # a little slack for the confirm probe
+    return ("this --wait-sec %.0f CANNOT contain the run in flight: it may "
+            "legally run %.0fs more (%.0fs wall-clock bound, %.0fs already "
+            "elapsed), so the command would exit 3 without recreating and a fix "
+            "built in this same invocation would not be running. Re-run with "
+            "--wait-sec %d or more, or use --force to end the run now and have "
+            "the log name what it destroyed"
+            % (budget, remaining, float(bound),
+               float(sched.get("in_progress_sec") or 0.0), suggest))
+
+
 def line_log(*values: Any) -> None:
     """Log one line and FLUSH it.
 
@@ -289,8 +359,17 @@ def wait_until_idle(probe_fn, wait_sec: float, log=line_log,
             return action, reason
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return "wait", ("still in flight after %.0fs; gave up WITHOUT recreating, "
-                            "because a killed run is worse than a late fix" % wait_sec)
+            #: Say WHY the wait ran out, not just that it did. Without the
+            #: comparison, "still in flight, gave up" is indistinguishable from
+            #: a hung run -- and the usual truth is the duller one: the wait was
+            #: simply shorter than the run was allowed to be.
+            too_short = wait_budget_verdict(sched, wait_sec)
+            reason = ("still in flight after %.0fs; gave up WITHOUT recreating, "
+                      "because a killed run is worse than a late fix"
+                      % wait_sec)
+            if too_short:
+                reason += " -- and the wait was never going to be enough: " + too_short
+            return "wait", reason
         time.sleep(min(poll_sec, max(1.0, remaining)))
 
 
@@ -447,6 +526,14 @@ def main(argv: Optional[list] = None) -> int:
         action, reason = decide(sched, newest)
         result = {"action": action, "reason": reason, "scheduler": sched,
                   "newest_session": newest}
+        if action == "wait":
+            #: Reported in JSON mode as well, because a script driving this tool
+            #: needs the same fact a human reading the log gets: whether the
+            #: wait it asked for can possibly succeed. Absent when there is
+            #: nothing wrong with the budget.
+            verdict = wait_budget_verdict(sched, args.wait_sec)
+            if verdict:
+                result["wait_too_short"] = verdict
         if action == "wait" and getattr(args, "force", False):
             result["forced"] = {
                 "would_destroy": describe_run(sched, newest),
@@ -475,6 +562,14 @@ def main(argv: Optional[list] = None) -> int:
         return 2
     action, reason = decide(sched, newest)
     log("[probe] %s -- %s" % (action.upper(), reason))
+
+    # BEFORE building. The build is always safe, but it takes minutes, and the
+    # operator's real decision -- "is my wait long enough for this run?" -- is
+    # better made now than after the image has been rebuilt twice over.
+    if action == "wait" and args.apply and not args.force:
+        too_short = wait_budget_verdict(sched, args.wait_sec)
+        if too_short:
+            log("[wait] WARNING -- %s" % too_short)
 
     if action == "refuse" and args.apply:
         log("REFUSING to recreate: %s" % reason)
