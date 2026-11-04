@@ -872,6 +872,13 @@ TOOLS = [
         "applies its own edits to a live system. Use dry_run to rehearse all "
         "gates without touching anything. Runtime-state files, secrets and "
         ".git are refused outright.\n\n"
+        "To DELETE an obsolete deployed source file, include "
+        "{target: 'relative/path.py', delete: true} in `files`, optionally with "
+        "`services` to rebuild/recreate in the same request. The host requires "
+        "the base file hash to match at apply time, backs it up before removal, "
+        "and mirrors the deletion into git. It refuses a file changed since "
+        "staging, a directory, runtime state, secrets, or paths outside the "
+        "deploy root.\n\n"
         "To change RUNTIME STATE (a setting the running service owns, such as "
         "an instance's risk profile), pass `action` instead of `files`. The "
         "host runs its own sanctioned command for that change and verifies by "
@@ -884,15 +891,17 @@ TOOLS = [
                                        "reviewer would want."},
             "files": {"type": "array",
                       "description": "Files to change. Each item is "
-                                     "{target, content} or {target, source} "
-                                     "where target is RELATIVE to the deploy "
-                                     "root and source is an existing file to "
-                                     "stage bytes from.",
+                                     "{target, content}, {target, source}, or "
+                                     "{target, delete: true} for removal. "
+                                     "target is RELATIVE to the deploy root "
+                                     "and source is an existing file to stage "
+                                     "bytes from.",
                       "items": {"type": "object",
                                 "properties": {
                                     "target": {"type": "string"},
                                     "content": {"type": "string"},
-                                    "source": {"type": "string"}}}},
+                                    "source": {"type": "string"},
+                                    "delete": {"type": "boolean"}}}},
             "services": {"type": "array", "items": {"type": "string"},
                          "description": "Compose services to rebuild/restart "
                                         "after applying. Only honoured when the "

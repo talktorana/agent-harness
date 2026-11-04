@@ -589,7 +589,23 @@ def gate_schema(req: Dict[str, Any],
         target = entry.get("target")
         if not isinstance(target, str) or not target.strip():
             raise Refused(f"files[{i}].target must be a non-empty string")
-        if "content" in entry:
+        if entry.get("delete") is True:
+            if any(k in entry for k in ("content", "payload_path", "sha256")):
+                raise Refused(
+                    f"files[{i}] delete cannot carry content or a payload")
+            if not isinstance(entry.get("staged_against_sha256"), str) \
+                    or not entry["staged_against_sha256"]:
+                raise Refused(
+                    f"files[{i}] delete needs the base file's sha256 in "
+                    f"staged_against_sha256; an unconditional delete is not "
+                    f"an auditable deploy")
+            #: None is the deletion marker through the existing target/backup/
+            #: verify/restart pipeline. Old appliers never see this branch and
+            #: refuse the entry, so a mixed request cannot be half-applied.
+            pairs.append((target, None))
+        elif "delete" in entry:
+            raise Refused(f"files[{i}].delete must be true when present")
+        elif "content" in entry:
             content = entry["content"]
             if not isinstance(content, str):
                 raise Refused(f"files[{i}].content must be a string")
@@ -599,7 +615,7 @@ def gate_schema(req: Dict[str, Any],
             pairs.append((target, payload.read_bytes()))
         else:
             raise Refused(
-                f"files[{i}] needs either 'content' or 'payload_path'")
+                f"files[{i}] needs 'content', 'payload_path', or 'delete': true")
     # A request that says nothing about why is not reviewable later.
     purpose = req.get("purpose")
     if not isinstance(purpose, str) or not purpose.strip():
@@ -672,9 +688,15 @@ def gate_paths(pairs: List[Tuple[str, Any]], root: Path,
 
 
 def gate_checksums(req: Dict[str, Any], pairs: List[Tuple[str, Any]]) -> None:
-    """Declared sha256 must match the payload byte for byte."""
+    """Declared sha256 must match the payload byte for byte.
+
+    Deletes carry no payload; their identity is the BASE file hash and it is
+    checked against the live target by :func:`gate_delete_preconditions`.
+    """
     declared = req.get("files") or []
     for entry, (_target, payload) in zip(declared, pairs):
+        if entry.get("delete") is True:
+            continue
         want = entry.get("sha256")
         if not want:
             raise Refused(
@@ -685,6 +707,36 @@ def gate_checksums(req: Dict[str, Any], pairs: List[Tuple[str, Any]]) -> None:
             raise Refused(
                 f"checksum mismatch for {entry.get('target')!r}: declared "
                 f"{str(want)[:16]}..., staged {got[:16]}...")
+
+
+def gate_delete_preconditions(req: Dict[str, Any],
+                              targets: List[Path]) -> None:
+    """A delete removes exactly the file that was reviewed, or is refused.
+
+    Unlike a write's staged-against warning, this is a VETO: deleting a file
+    another pass has since fixed would erase the fix itself. A base mismatch is
+    therefore permanent and the request is quarantined with a receipt naming
+    both hashes. An already-absent target is idempotent and still mirrored into
+    git, which is how a host-side cleanup reaches the repository.
+    """
+    for entry, target in zip(req.get("files") or [], targets):
+        if entry.get("delete") is not True:
+            continue
+        declared = str(entry.get("staged_against_sha256") or "")
+        try:
+            if target.is_dir():
+                raise Refused(
+                    f"delete target is a directory, not a file: {target}")
+            if not target.exists():
+                continue
+            current = sha256_bytes(target.read_bytes())
+        except OSError as exc:
+            raise Refused(f"delete target is unreadable: {target}: {exc}")
+        if current != declared:
+            raise Refused(
+                f"delete target changed after staging: {target}; expected "
+                f"{declared[:16]}..., found {current[:16]}.... Refusing to "
+                f"delete a newer revision; re-read it and stage a new request")
 
 
 def gate_age(req: Dict[str, Any], path: Path, max_age: float) -> None:
@@ -969,13 +1021,17 @@ def backup_targets(targets: List[Path], backup_dir: Path) -> List[Dict[str, str]
     made: List[Dict[str, str]] = []
     for target in targets:
         if not target.exists():
-            made.append({"target": str(target), "backup": "", "created": "true"})
+            #: A deleted target whose prior bytes were backed up and whose write
+            #: failed is NOT created: it existed at backup time, and must be
+            #: restored. Only a target that never existed gets this marker.
+            made.append({"target": str(target), "backup": "", "created": "true",
+                         "existed_at_backup": "false"})
             continue
         flat = str(target).replace(":", "_").replace("/", "_").replace("\\", "_")
         dest = backup_dir / flat
         shutil.copy2(target, dest)
         made.append({"target": str(target), "backup": str(dest),
-                     "created": "false"})
+                     "created": "false", "existed_at_backup": "true"})
     return made
 
 
@@ -983,10 +1039,21 @@ def restore_backup(made: List[Dict[str, str]]) -> None:
     """Put the originals back after a failed apply."""
     for row in made:
         target = Path(row["target"])
-        if row.get("created") == "true":
+        if row.get("created") == "true" and \
+                row.get("existed_at_backup", "false") == "false":
             target.unlink(missing_ok=True)
         elif row.get("backup"):
-            shutil.copy2(Path(row["backup"]), target)
+            #: Restore the original owner too, not just the bytes: a root-run
+            #: applier restoring root:root into a user-owned tree leaves the
+            #: next service or operator unable to write it.
+            backup = Path(row["backup"])
+            shutil.copy2(backup, target)
+            if hasattr(os, "chown"):
+                try:
+                    stat = backup.stat()
+                    os.chown(target, stat.st_uid, stat.st_gid)
+                except OSError:
+                    pass
 
 
 def write_payloads(targets: List[Path], pairs: List[Tuple[str, Any]]) -> None:
@@ -1006,6 +1073,12 @@ def write_payloads(targets: List[Path], pairs: List[Tuple[str, Any]]) -> None:
     a failed deploy.
     """
     for target, (_name, payload) in zip(targets, pairs):
+        if payload is None:
+            #: DELETE after the caller has backed the target up. unlink() cannot
+            #: remove a directory and the precondition gate has already refused
+            #: one, so this path cannot widen into recursive deletion.
+            target.unlink(missing_ok=True)
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         stat_before = target.stat() if target.exists() else None
         tmp = target.with_name(target.name + ".deploy-tmp")
@@ -1786,12 +1859,21 @@ def sync_applied_files(targets: List[Path], root: Path, *,
         in_repo = (prefix / rel) if prefix is not None else rel
         dest = mirror / in_repo
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+            if not src.exists():
+                #: An applied DELETE must delete the same path in the mirror.
+                #: copy2() would fail on the absent source and leave the deleted
+                #: module committed in the repository -- precisely the stale
+                #: source that later deploys would resurrect. git add below is
+                #: still restricted to these exact paths, never a whole tree.
+                dest.unlink(missing_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
             copied.append(in_repo.as_posix())
         except OSError as exc:
             return {"state": "failed", "mirror": str(mirror),
-                    "reason": f"copy {rel} failed: {type(exc).__name__}: {exc}",
+                    "reason": f"mirror sync {rel} failed: "
+                              f"{type(exc).__name__}: {exc}",
                     "copied": copied}
 
     rc, out = _git(mirror, ["add", "--"] + copied, cfg["timeout_sec"], ident)
@@ -2010,6 +2092,7 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         pairs = gate_schema(req, outbox)
         targets = gate_paths(pairs, root, policy)
         gate_checksums(req, pairs)
+        gate_delete_preconditions(req, targets)
         gate_age(req, path, policy.max_age_sec)
     except Refused as exc:
         receipt = write_receipt(
@@ -2064,6 +2147,13 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
     #: the shortcut.
     unchanged: List[str] = []
     for target, (_pname, payload) in zip(targets, pairs):
+        if payload is None:
+            #: An already-absent delete is a no-op on the host, but STILL goes
+            #: through the mirror sync: the deployed file may be gone while the
+            #: repository still carries it, which was the original cleanup gap.
+            if not target.exists():
+                unchanged.append(str(target))
+            continue
         try:
             if Path(target).read_bytes() == payload:
                 unchanged.append(str(target))
@@ -2124,6 +2214,10 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
             req.get("files") or [], targets, pairs):
         if not isinstance(entry, dict):
             continue
+        if entry.get("delete") is True:
+            #: Delete bases are enforced above, not warned about here. Reporting
+            #: a refused deletion as an advisory overwrite would be false.
+            continue
         declared = entry.get("staged_against_sha256")
         if not isinstance(declared, str) or not declared:
             continue
@@ -2163,9 +2257,15 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         "id": rid,
         "purpose": req.get("purpose"),
         "readiness": readiness,
-        "files": [{"target": str(t), "bytes": len(payload),
-                   "sha256": sha256_bytes(payload)[:16]}
-                  for t, (_n, payload) in zip(targets, pairs)],
+        "files": [
+            ({"target": str(t), "operation": "delete", "bytes": None,
+              "sha256": None,
+              "staged_against": str((req.get("files") or [])[i]
+                                    .get("staged_against_sha256"))[:16]}
+             if payload is None else
+             {"target": str(t), "operation": "write", "bytes": len(payload),
+              "sha256": sha256_bytes(payload)[:16]})
+            for i, (t, (_n, payload)) in enumerate(zip(targets, pairs))],
         #: Empty means every staged file still looked exactly as it did when it
         #: was staged, OR the request predates the field -- so the distinction
         #: is recorded explicitly rather than left to an empty list.
@@ -2320,7 +2420,20 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         elif not targets:
             reason = "all gates passed; nothing to write"
         else:
-            reason = "all gates passed and payloads written"
+            deleted_n = sum(1 for _t, (_n, payload) in zip(targets, pairs)
+                            if payload is None)
+            written_n = len(targets) - deleted_n
+            if not deleted_n:
+                #: Keep the long-standing write-only receipt string: consumers
+                #: and the morning review already know it, and rewording the
+                #: common path adds no information.
+                reason = "all gates passed and payloads written"
+            else:
+                parts = []
+                if written_n:
+                    parts.append(f"{written_n} payload(s) written")
+                parts.append(f"{deleted_n} file(s) deleted")
+                reason = "all gates passed and " + " and ".join(parts)
 
         receipt = write_receipt(outbox, path, "applied",
                                 reason,

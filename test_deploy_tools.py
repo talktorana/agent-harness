@@ -550,7 +550,8 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(props["files"]["type"], "array")
         self.assertEqual(
             sorted((props["files"]["items"]["properties"]).keys()),
-            ["content", "source", "target"])
+            ["content", "delete", "source", "target"],
+            "the deletion operation must be declared or the model cannot form it")
         #: The action shape is what lets the agent change runtime state, so its
         #: three parts must be declared or the model cannot form the call.
         self.assertEqual(props["action"]["type"], "object")

@@ -223,11 +223,14 @@ STAGED_AGAINST_UNREADABLE = "unreadable"
 def _current_sha256(target: str) -> str:
     """Hash of the target as it stands NOW, for the request to carry.
 
-    Reads through ``_deploy_root()`` so it hashes the copy the host will
+    Reads through :func:`deploy_root` so it hashes the copy the host will
     overwrite -- not a copy in some other checkout that happens to be nearby.
+    This used to call an undefined ``_deploy_root()``; the broad exception then
+    recorded EVERY base as "unreadable", so writes could not detect being
+    overwritten by a newer request and deletion preconditions could not work.
     """
     try:
-        path = _deploy_root() / target
+        path = deploy_root() / target
     except Exception:  # noqa: BLE001 - a bad root must not stop staging
         return STAGED_AGAINST_UNREADABLE
     try:
@@ -384,18 +387,42 @@ def compose_deploy_request(purpose: str,
             raise DeployError(f"files[{i}] must be an object")
         target = str(entry.get("target") or "")
         _check_target(target)
+        if entry.get("delete") is True:
+            #: DELETE is a file operation, not a new top-level request kind.
+            #: An OLD applier rejects this entry because it carries no payload,
+            #: so a mixed write+delete request cannot be half-applied by a host
+            #: that predates deletion support. That fail-closed property is why
+            #: the schema version stays 1.
+            if any(k in entry for k in ("content", "source", "sha256",
+                                        "payload_path")):
+                raise DeployError(
+                    f"files[{i}] delete cannot also carry content, source or "
+                    f"a payload hash")
+            base = _current_sha256(target)
+            if base in (STAGED_AGAINST_ABSENT, STAGED_AGAINST_UNREADABLE):
+                raise DeployError(
+                    f"files[{i}] delete target must be an existing readable "
+                    f"file in the deployment, got {base}: {target!r}")
+            row = {"target": target, "delete": True,
+                   #: A deletion has no payload hash to verify; the BASE hash is
+                   #: the payload identity. The host refuses if it changed
+                   #: between staging and apply, instead of deleting a newer fix.
+                   "staged_against_sha256": base}
+            entries.append(row)
+            continue
+        if "delete" in entry:
+            raise DeployError(f"files[{i}].delete must be true when present")
         if "content" in entry:
             content = entry["content"]
             if not isinstance(content, str):
                 raise DeployError(f"files[{i}].content must be a string")
             payload = content.encode("utf-8")
-            row: Dict[str, Any] = {"target": target,
-                                   "content": content}
+            row = {"target": target, "content": content}
         else:
             source = entry.get("source")
             if not source:
                 raise DeployError(
-                    f"files[{i}] needs either 'content' or 'source'")
+                    f"files[{i}] needs 'content', 'source', or 'delete': true")
             src_path = Path(str(source)).expanduser()
             if not src_path.is_absolute():
                 src_path = Path(config.PROJECT_ROOT) / src_path
@@ -408,22 +435,6 @@ def compose_deploy_request(purpose: str,
         total += len(payload)
         row["sha256"] = sha256_bytes(payload)
         row["bytes"] = len(payload)
-        #: WHAT THIS REQUEST IS BASED ON: the hash of the file as it stood when
-        #: the request was staged (or the literal "absent" when there was no
-        #: file). Recorded so the host can tell "I am changing what I expected
-        #: to change" from "somebody else has rewritten this since I looked".
-        #:
-        #: Without it, a staged request is indistinguishable from an
-        #: unconditional overwrite. That was tolerable while the request window
-        #: was 30 minutes and became a real hazard when the owner widened it to
-        #: FOUR HOURS: a pass stages at 10:20, another pass fixes the same file
-        #: at 12:30, the applier applies the older payload at 13:00 and silently
-        #: reverts the newer fix -- with a receipt that says `applied` and looks
-        #: perfect. A lost fix with a clean audit trail is the worst outcome
-        #: this deployment has, so the base is recorded and reported.
-        #:
-        #: It is NOT a veto (see the owner's 2026-11-02 directive); the applier
-        #: still applies and records `staged_against` in the receipt.
         row["staged_against_sha256"] = _current_sha256(target)
         entries.append(row)
 
@@ -634,6 +645,11 @@ def apply_request(request: Dict[str, Any], *, dry_run: bool = False
         "dry_run": dry_run,
         "applier_output": output[-1500:],
         "files": receipt.get("files") or [],
+        "services": receipt.get("services") or [],
+        "restart": receipt.get("restart") or [],
+        "verify_rc": receipt.get("verify_rc"),
+        "verify_advisory": receipt.get("verify_advisory"),
+        "verify_warning": receipt.get("verify_warning"),
         #: Readiness verdict, accepting the key an OLDER applier filed it under:
         #: a receipt is a persisted audit trail, so one written before a field
         #: rename still has to be reportable. ``deploy_applier.READINESS_KEYS``
@@ -776,8 +792,19 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
                          f"{readiness.get('state')!r} "
                          f"age={readiness.get('age_sec')}s")
     for row in outcome.get("files") or []:
-        lines.append(f"  target {row.get('target')} "
-                     f"({row.get('bytes')} bytes, sha256 {row.get('sha256')}...)")
+        if row.get("operation") == "delete":
+            lines.append(f"  target {row.get('target')} (DELETE)")
+        else:
+            lines.append(f"  target {row.get('target')} "
+                         f"({row.get('bytes')} bytes, sha256 {row.get('sha256')}...)")
+    for row in outcome.get("restart") or []:
+        lines.append(f"  service {row.get('service')}: {row.get('cmd')} -> "
+                     f"rc={row.get('rc')}" + (f" ({row['error']})"
+                                              if row.get("error") else ""))
+    if outcome.get("verify_rc") is not None:
+        lines.append(f"verification rc={outcome['verify_rc']}"
+                     + (" (ADVISORY; files kept)" if outcome.get("verify_advisory")
+                        else ""))
     #: DID THIS REQUEST OVERWRITE SOMETHING NEWER?
     #:
     #: The applier records this and nothing else read it, which made the whole
@@ -818,6 +845,11 @@ def _summarise_outcome(outcome: Dict[str, Any]) -> str:
     backups = outcome.get("backups") or []
     if backups:
         lines.append(f"backups: {len(backups)} file(s) copied aside")
+        for row in backups:
+            if row.get("backup"):
+                lines.append(f"  {row.get('target')} -> {row.get('backup')}")
+            else:
+                lines.append(f"  {row.get('target')} (no pre-existing file)")
     #: Whether the applied change reached the repository. Omitted entirely when
     #: the receipt predates the field (or git is not configured), because
     #: "git: (none)" would read as a failed push rather than "not applicable".
@@ -881,7 +913,11 @@ def deploy_request(purpose: str,
     Two kinds of change, one tool:
 
     * FILES -- ``{"target": "engine/x.py", "content": "..."}`` or
-      ``{"target": ..., "source": "path/to/existing/file"}``;
+      ``{"target": ..., "source": "path/to/existing/file"}``. To remove an
+      obsolete file, use ``{"target": "engine/x.py", "delete": True}``: the
+      host enforces an unchanged reviewed base, backs it up first, and mirrors
+      the removal into git. This is the supported deletion path; never replace
+      it with a direct ``rm`` or ``git rm``;
     * ACTION -- ``{"kind": ..., "instance_id": ..., "set": {...}}``: ask the
       host to run one of its OWN commands to change runtime state. Use this
       when the value lives in a file the running service owns and caches (an
