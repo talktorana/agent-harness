@@ -270,6 +270,31 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 in_progress_sec = None
 
+        #: WHAT "overdue" means, because the word alone reads as "the mission
+        #: never started". Live 2026-11-03 an operator looked at a job 40
+        #: minutes past its next_due with no visible progress and reported it
+        #: as a major defect; in fact one run had been in flight for 75 minutes
+        #: and the loop is sequential, so the next firing was DELAYED, not
+        #: lost. Three causes look identical from ``overdue`` alone -- a run
+        #: holding the only slot, an operator pause, and a daemon that is not
+        #: polling -- and only the third is a fault.
+        overdue_reason: Optional[str] = None
+        if seconds_until is not None and seconds_until < 0:
+            late_min = int(-seconds_until // 60)
+            if running:
+                overdue_reason = (
+                    f"a run is in flight since {in_progress_since or last_run} "
+                    f"({late_min}m past due); the loop is SEQUENTIAL, so the "
+                    f"next firing waits for it to end and is not lost")
+            elif held.get("held"):
+                overdue_reason = ("an operator hold file is pausing the loop "
+                                  f"({late_min}m past due)")
+            else:
+                overdue_reason = (
+                    f"nothing is running and {late_min}m past due: the daemon "
+                    f"is not polling, the job is disabled, or the process died "
+                    f"-- this IS a fault")
+
         jobs.append({
             "id": key,
             "interval": _interval_label({**job, "every_min": every}),
@@ -304,6 +329,11 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
                               if seconds_until is not None else None),
             "due_now": _due(job, when, state, key),
             "overdue": bool(seconds_until is not None and seconds_until < 0),
+            #: Why it is late, and whether that is a fault. See the note where
+            #: it is computed: without this, a sequential loop that is
+            #: correctly waiting for a long run is indistinguishable from a
+            #: scheduler that has stopped.
+            "overdue_reason": overdue_reason,
             #: A run in progress: finished has not caught up with last_run yet.
             "running": running,
             #: When it started, and for how long. Non-null only while running,

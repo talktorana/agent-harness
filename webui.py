@@ -214,6 +214,18 @@ def _scheduler_view() -> Dict[str, Any]:
         "in_progress_sec": current.get("in_progress_sec"),
         "in_progress_since": current.get("in_progress_since"),
         "next_due": current.get("next_due"),
+        #: Which cadence is governing, and from where. A console override
+        #: silently replaces the declared interval, so a reader who only sees
+        #: a "last run" stamp cannot tell whether spacing is a fault or the
+        #: number someone set.
+        "every_min": current.get("every_min"),
+        "every_min_source": current.get("every_min_source"),
+        #: WHY this job is late, and whether that is a fault at all. Without
+        #: it, "overdue" beside a sequential loop that is correctly waiting
+        #: for a long run reads as "the mission never started" -- the exact
+        #: conclusion an operator reached live on 2026-11-03.
+        "overdue": bool(current.get("overdue")),
+        "overdue_reason": current.get("overdue_reason"),
         "paused": bool(doc.get("paused")),
         "any_enabled": bool(doc.get("any_enabled")),
     }
@@ -428,7 +440,16 @@ async function loadSchedule(){
       next='next due <b>'+(s!=null&&s>0?(s>=60?Math.round(s/60)+'m '+Math.round(s%60)+'s':
             s+'s'):'now')+'</b> <span class="m">('+esc(job.next_due)+')</span>'
         +' <span class="m">= last run + '+esc(job.every_min||'?')+' min</span>';
-      if(job.overdue) next+=' <span class="warn">overdue</span>';
+      // "overdue" alone is not a diagnosis. A sequential loop waiting on a
+      // long run is late for a benign reason; a daemon that stopped polling is
+      // late for a fatal one, and both used to render as the same word. The
+      // reason is printed so a human can tell "delayed" from "broken" without
+      // opening the run history.
+      if(job.overdue){
+        next+=' <span class="'+(job.overdue_reason&&/IS a fault/i.test(job.overdue_reason)?'bad':'warn')
+          +'">overdue</span>';
+        if(job.overdue_reason) next+='<div class="m">'+esc(job.overdue_reason)+'</div>';
+      }
     }
     h+='<div class="row"><b>'+esc(job.id)+'</b>'
       +'<span>'+esc(job.interval)+'</span>'+statePill

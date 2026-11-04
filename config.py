@@ -197,7 +197,35 @@ MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "200"))
 #: run left -- too late to reach the report. ``run_settings`` scales this with
 #: whatever ceiling is actually in force.
 ANSWER_WARN_STEPS = int(os.environ.get("AGENT_ANSWER_WARN_STEPS", "20"))
+#: Wall-clock bound on ONE run, in seconds. ``MAX_STEPS`` bounds turns and
+#: ``API_TIMEOUT_SEC`` bounds a single call, so until now nothing bounded the
+#: run as a whole: a 200-turn ceiling with 6 retries at 120 s per attempt is,
+#: worst case, days. The scheduler is SEQUENTIAL, so that arithmetic is not
+#: academic -- one slow run silently delays every mission after it, and the
+#: console can only report the job as overdue. Live 2026-11-03: a mission ran
+#: 75 minutes and logged 14 timeouts across 62 of 200 turns; the next firing
+#: never came, and the operator's honest reading of the page was "nothing is
+#: running, the next scheduled mission never started, major defect".
+#:
+#: ``0`` means unbounded. A deployment that schedules missions should set it
+#: comfortably above a GOOD long run (a 47-minute pass that delivered its
+#: report) and well below the point where the next firing is fiction. A run
+#: that overruns is warned first, then ends by salvaging an answer from what it
+#: already knows -- the same path the step limit uses -- and finishes as
+#: ``time_limit_with_answer``, so an overrun still delivers and the schedule
+#: still advances.
+MAX_RUN_SEC = float(os.environ.get("AGENT_MAX_RUN_SEC", "0") or "0")
 TOOL_TIMEOUT_SEC = int(os.environ.get("AGENT_TOOL_TIMEOUT_SEC", "180"))
+#: How many timeouts ONE route may cause in a run before the chain steps over
+#: it. A timeout is classified transient, so retrying is right -- but
+#: "transient" was unbounded per run, which left a slow primary in charge for
+#: the entire mission. Live 2026-11-03: 14 timeouts, 62 turns, 75 minutes and
+#: zero ``route_switch`` events, so the seven routes declared behind it existed
+#: on paper only.
+#:
+#: Counted per route, per run, and NEVER persisted: a provider that hiccups
+#: tonight is still eligible as tomorrow's primary. ``0`` disables demotion.
+ROUTE_TIMEOUT_LIMIT = int(os.environ.get("AGENT_ROUTE_TIMEOUT_LIMIT", "4") or "0")
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the
 # context window in one turn.

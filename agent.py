@@ -17,7 +17,7 @@ import random
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -61,6 +61,27 @@ from tools_repo_map import build_repo_map
 # Statuses that mean "the service is momentarily unable", not "your request is
 # wrong". Only these are worth waiting out.
 _TRANSIENT_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when the route ran out of TIME rather than refusing the request.
+
+    Kept separate from ``_is_transient`` because the two get different
+    handling: a transient failure is retried on the same route, while the Nth
+    timeout in one run is evidence that this route is the problem and the chain
+    should move on. A busy provider recovers; a slow one only gets slower.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        from openai import APITimeoutError
+
+        if isinstance(exc, APITimeoutError):
+            return True
+    except Exception:  # noqa: BLE001 - SDK optional/absent in some installs
+        pass
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "time out" in text
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -332,6 +353,16 @@ class Agent:
         # step loop exits before the next model call. Set, never kill.
         self.stop_requested = False
         self.steps = 0
+        #: The run's own clock, and per-route timeout counts. Both are reset
+        #: when a run STARTS (``_run_impl``) so a second run on the same Agent
+        #: object cannot inherit the first one's elapsed time or blame a new
+        #: run for an old route's timeouts.
+        self._run_started_monotonic = 0.0
+        self._route_timeouts: Dict[str, int] = {}
+        #: Set to the elapsed seconds when the WALL-CLOCK bound ends the run,
+        #: and only then. It is the difference between "ran out of turns" and
+        #: "ran out of time" after the loop, which is what the status must say.
+        self._run_elapsed_at_stop: Optional[float] = None
         # Liveness during a reasoning model's silent phase. `_on_think` reports
         # progress from the chunk loop; the counters reset per model call.
         self._thinking_route: Optional[str] = None
@@ -681,6 +712,32 @@ class Agent:
                         break
                     if not _is_transient(exc):
                         raise
+                    #: ROUTE HEALTH, counted across the whole run. One timeout
+                    #: deserves a retry; an unbounded sequence does not, because
+                    #: the chain behind the primary exists exactly so a slow
+                    #: provider can be stepped over. Without this count the
+                    #: primary kept the entire mission -- 14 timeouts, 62 turns,
+                    #: 75 minutes, zero ``route_switch`` events -- and the
+                    #: declared fallbacks were decoration.
+                    if (_is_timeout(exc)
+                            and config.ROUTE_TIMEOUT_LIMIT > 0):
+                        hits = self._route_timeouts.get(label, 0) + 1
+                        self._route_timeouts[label] = hits
+                        if hits >= config.ROUTE_TIMEOUT_LIMIT:
+                            why = (f"{type(exc).__name__}: {hits} timeouts in "
+                                   f"this run (limit "
+                                   f"{config.ROUTE_TIMEOUT_LIMIT})")
+                            problems.append(f"{label}: {why}")
+                            self._say(f"\n\033[33m[route] {label} too slow "
+                                      f"({hits} timeouts) -- trying next "
+                                      f"route\033[0m")
+                            self._log({"event": "route_dead", "route": label,
+                                       "reason": why, "timeouts": hits})
+                            if self.session:
+                                self.session.event("route_dead", route=label,
+                                                   reason=why,
+                                                   timeouts=hits)
+                            break
                     if attempt == config.API_RETRIES - 1:
                         problems.append(
                             f"{label}: {type(exc).__name__}: {exc}")
@@ -728,18 +785,27 @@ class Agent:
 
         raise RuntimeError("; ".join(problems) or "no route available")
 
-    def _final_answer(self) -> str:
+    def _slowest_route(self) -> Optional[Tuple["str", int]]:
+        """(route, timeouts) for the route that cost this run the most clock."""
+        if not self._route_timeouts:
+            return None
+        return max(self._route_timeouts.items(), key=lambda kv: kv[1])
+
+    def _final_answer(self, reason: str = "You have run out of tool steps.") -> str:
         """One last request, with tools disabled, to salvage an answer.
 
         Running out of steps used to return "no answer" -- which discards
         every piece of research already done. Whatever the model can say from
         what it has seen is strictly more useful, as long as it is told to
-        mark what it could not verify.
+        mark what it could not verify. ``reason`` is the sentence that opens
+        the instruction, so a run cut off by the CLOCK says so instead of
+        claiming it ran out of turns -- a distinction the next pass would
+        otherwise have to reconstruct.
         """
         self.messages.append({
             "role": "user",
             "content": (
-                "You have run out of tool steps. Write your final answer NOW "
+                f"{reason} Write your final answer NOW "
                 "from what you have already seen -- no more tools are "
                 "available. Be concise. Mark anything you did not manage to "
                 "verify as UNVERIFIED rather than omitting it."),
@@ -804,6 +870,9 @@ class Agent:
                                   origin=self.origin)
         set_memory_session(self.session.session_id)
         self._bound_storage()
+        self._run_started_monotonic = time.monotonic()
+        self._route_timeouts = {}
+        self._run_elapsed_at_stop = None
 
         memory = MemoryStore(session_id=self.session.session_id)
         # The structural map is built once per task, not per step: it is the
@@ -852,6 +921,20 @@ class Agent:
         max_steps = _effective_max_steps()
         warn_steps = _effective_answer_warn_steps(max_steps)
         self.max_steps = max_steps
+        #: The run's wall-clock ceiling. ``0`` means unbounded; see
+        #: ``config.MAX_RUN_SEC`` for why an unbounded run is a scheduling
+        #: fault and not just a slow pass.
+        max_run_sec = float(getattr(config, "MAX_RUN_SEC", 0.0) or 0.0)
+        #: Warn with the larger of two minutes or a tenth of the bound left,
+        #: for the same reason the STEP warning fires twenty turns out rather
+        #: than three: one more model round trip has to fit inside the warning,
+        #: or the run ends with nothing to deliver.
+        run_warn_sec = (max_run_sec - max(120.0, max_run_sec * 0.1)
+                        if max_run_sec > 0 else 0.0)
+        time_warned = False
+        #: The route that ate the most clock, named in the record so the next
+        #: pass starts from the cause instead of from the overrun.
+        slowest_route: Optional[Tuple[str, int]] = None
 
         for step in range(1, max_steps + 1):
             self.steps = step
@@ -864,6 +947,49 @@ class Agent:
                     self.session.finish("stopped")
                 self._close()
                 return "STOPPED by user request."
+
+            #: Checked BEFORE the turn's model call: a bound that is only
+            #: tested after the call lets one final 2-minute timeout push a run
+            #: minutes past its own ceiling.
+            if max_run_sec > 0:
+                elapsed = time.monotonic() - self._run_started_monotonic
+                if elapsed >= max_run_sec:
+                    self._run_elapsed_at_stop = round(elapsed, 1)
+                    slowest_route = self._slowest_route()
+                    self._say(f"\n\033[33m[time budget] {elapsed:.0f}s of "
+                              f"{max_run_sec:.0f}s spent -- ending the "
+                              f"run\033[0m")
+                    self._log({"event": "time_limit", "step": step,
+                               "elapsed_sec": round(elapsed, 1),
+                               "budget_sec": max_run_sec,
+                               "route_timeouts": dict(self._route_timeouts)})
+                    if self.session:
+                        self.session.event(
+                            "route_health", timeouts=self._route_timeouts or {},
+                            slowest_route=(str(slowest_route[0])
+                                           if slowest_route else None),
+                            slowest_timeouts=(slowest_route[1]
+                                              if slowest_route else None))
+                    break
+                if not time_warned and elapsed >= run_warn_sec:
+                    time_warned = True
+                    left = max(0, int(max_run_sec - elapsed))
+                    self.messages.append({
+                        "role": "system",
+                        "content": (
+                            f"Time budget: {left}s left before this run is "
+                            f"ended. Stop investigating and write your final "
+                            f"answer now from what you already know. Report "
+                            f"unfinished work as unfinished rather than "
+                            f"leaving it out."),
+                    })
+                    self._say(f"\n\033[33m[time budget] {left}s left -- "
+                              f"answer now\033[0m")
+                    self._log({"event": "time_budget_warning",
+                               "elapsed_sec": round(elapsed, 1),
+                               "budget_sec": max_run_sec, "left_sec": left})
+                    if self.session:
+                        self.session.assistant(f"[time budget] {left}s left")
             remaining = max_steps - step
             if remaining == max(1, warn_steps):
                 # Told before it runs out, not after. A model that knows the
@@ -943,6 +1069,45 @@ class Agent:
                     "tool_call_id": tc.id,
                     "content": content,
                 })
+
+        if self._run_elapsed_at_stop is not None:
+            #: Ended by the CLOCK, so it gets its own status and its own wording.
+            #: Falling through to the step-limit path here would report
+            #: ``step_limit_with_answer`` for a run that had plenty of turns
+            #: left, sending the next pass hunting a model that would not stop
+            #: calling tools when the actual cause was a provider that would not
+            #: answer inside the budget. Distinct statuses are what make that
+            #: diagnosis available at all.
+            spent = self._run_elapsed_at_stop
+            slowest = self._slowest_route()
+            cause = (f"; the slowest route was {slowest[0]} with "
+                     f"{slowest[1]} timeout(s)"
+                     if slowest and len(self._route_timeouts) else "")
+            self._say(f"\n[stopped] used {int(spent)}s of the "
+                      f"{int(max_run_sec)}s wall-clock budget on turn "
+                      f"{self.steps} of {max_steps}{cause}")
+            salvaged = self._final_answer(
+                reason=(f"You have spent your {int(max_run_sec)}s wall-clock "
+                        f"budget ({int(spent)}s elapsed, turn {self.steps} of "
+                        f"{max_steps}) and this run is being ended now."))
+            self._log({"event": "answer", "steps": self.steps,
+                       "text": salvaged or "[time limit, no answer]",
+                       "salvaged": bool(salvaged), "elapsed_sec": spent,
+                       "budget_sec": max_run_sec})
+            if self.session:
+                if salvaged:
+                    self.session.answer(salvaged)
+                    self.session.finish("time_limit_with_answer")
+                else:
+                    self.session.answer("[no answer salvaged]")
+                    self.session.finish("time_limit")
+            self._close()
+            if salvaged:
+                return salvaged
+            return (f"Used the {int(max_run_sec)}s wall-clock budget "
+                    f"({int(spent)}s) by turn {self.steps} of {max_steps} and "
+                    f"could not produce a final answer{cause}. The work done is "
+                    f"in the session record.")
 
         self._say(f"\n[stopped] reached {max_steps} steps")
         salvaged = self._final_answer()

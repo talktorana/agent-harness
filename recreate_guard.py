@@ -225,6 +225,24 @@ def decide(sched: Dict[str, Any],
                        % newest.get("file"))
 
 
+def describe_run(sched: Dict[str, Any],
+                 newest: Optional[Dict[str, Any]]) -> str:
+    """Name exactly what a forced recreate will destroy.
+
+    ``--force`` is an escape hatch for a run that is not merely slow but is the
+    thing blocking the schedule, so it is deliberately narrow: only "a run is
+    in flight" can be forced past. That is also why it states the facts -- a
+    command that silently kills a 75-minute mission is indistinguishable from
+    the accidental kills this guard exists to prevent.
+    """
+    if not sched.get("running"):
+        return "no run in flight"
+    return ("run in flight since %s (%ss ago)" % (
+        sched.get("in_progress_since"), sched.get("in_progress_sec"))
+        + (", session file %s" % (newest or {}).get("file")
+           if (newest or {}).get("file") else ""))
+
+
 def line_log(*values: Any) -> None:
     """Log one line and FLUSH it.
 
@@ -399,6 +417,11 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--env-prefix", default=ENV_PREFIX,
                     help="env vars to report from inside the container (default %(default)s)")
     ap.add_argument("--json", action="store_true", help="print the probe as JSON and exit")
+    ap.add_argument("--force", action="store_true",
+                    help="recreate even with a run in flight, DESTROYING it. "
+                         "Refuses if the scheduler cannot be reached, because "
+                         "forcing must never mean acting blind about what is "
+                         "about to be killed")
     args = ap.parse_args(argv)
 
     log = (lambda *a: None) if args.json else line_log
@@ -422,8 +445,14 @@ def main(argv: Optional[list] = None) -> int:
                               "scheduler": None, "newest_session": None}))
             return 2
         action, reason = decide(sched, newest)
-        print(json.dumps({"action": action, "reason": reason, "scheduler": sched,
-                          "newest_session": newest}, indent=2, sort_keys=True))
+        result = {"action": action, "reason": reason, "scheduler": sched,
+                  "newest_session": newest}
+        if action == "wait" and getattr(args, "force", False):
+            result["forced"] = {
+                "would_destroy": describe_run(sched, newest),
+                "scheduler_available": bool(sched.get("available")),
+            }
+        print(json.dumps(result, indent=2, sort_keys=True))
         return {"proceed": 0, "refuse": 2, "wait": 3}[action]
 
     usage_error = None
@@ -464,22 +493,41 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if action == "wait":
-        action, reason = wait_until_idle(_probe, args.wait_sec, log=log)
+        if getattr(args, "force", False):
+            #: Only "a run is in flight" can be forced. If the scheduler cannot
+            #: answer we do not know WHAT is running, and forcing through that
+            #: would be acting blind -- so an unavailable scheduler still stops
+            #: us here.
+            if not sched.get("available"):
+                log("REFUSING to force: %s" % reason)
+                return 2
+            victim = describe_run(sched, newest)
+            log("[probe] FORCE -- proceeding despite an in-flight run; "
+                "--force was given. It will DESTROY: %s" % victim)
+            action = "proceed"
+            reason = "forced past an in-flight run (%s)" % victim
+        else:
+            action, reason = wait_until_idle(_probe, args.wait_sec, log=log)
+            if action == "refuse":
+                log("REFUSING to recreate: %s" % reason)
+                return 2
+            if action == "wait":
+                log("NOT recreating: %s" % reason)
+                return 3
+
+    if not getattr(args, "force", False):
+        # Close the race: re-ask once, immediately before the destructive step.
+        # Skipped under --force because the run we would wait for is exactly the
+        # one we have already decided to destroy, so re-asking can only ever
+        # return "wait".
+        action, reason = confirm_still_idle(_probe, log=log,
+                                           confirm_sec=args.confirm_sec)
         if action == "refuse":
             log("REFUSING to recreate: %s" % reason)
             return 2
         if action == "wait":
             log("NOT recreating: %s" % reason)
             return 3
-
-    # Close the race: re-ask once, immediately before the destructive step.
-    action, reason = confirm_still_idle(_probe, log=log, confirm_sec=args.confirm_sec)
-    if action == "refuse":
-        log("REFUSING to recreate: %s" % reason)
-        return 2
-    if action == "wait":
-        log("NOT recreating: %s" % reason)
-        return 3
 
     before = container_started(args.docker, args.container, log=log)
     if args.recreate_cmd:
