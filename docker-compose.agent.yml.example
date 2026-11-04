@@ -1,0 +1,153 @@
+# Production sidecar composition for the agent harness.
+#
+# This is the reference deployment pattern: a container that runs the harness
+# as a long-lived service with console + scheduler, alongside a host applier
+# that drains a gated deploy outbox.
+#
+# The target application is mounted READ-ONLY. The agent's own state (sessions,
+# memories, transcripts, run settings, model choice) lives on a persistent
+# volume so a container recreate does not erase knowledge.
+#
+# Usage:
+#   docker compose -f docker-compose.agent.yml up -d
+#   docker compose -f docker-compose.agent.yml logs -f
+#
+# Prerequisites:
+#   1. Copy providers.json.example → providers.json and fill in your keys
+#   2. Copy routes.json.example → routes.json and set your preferred order
+#   3. Copy schedule.json.example → schedule.json, write your mission, enable it
+#   4. Copy deploy_policy.json.example → deploy_policy.json and configure gates
+#   5. Set the AGENT_* env vars in your .env or environment
+#
+# The host applier runs OUTSIDE this container, on the host, from cron/systemd.
+# See deploy_applier.py --help for its flags.
+
+name: agent-harness
+
+services:
+  agent:
+    build: .
+    image: ${AGENT_IMAGE:-agent-harness:1.0.0}
+    container_name: ${AGENT_CONTAINER_NAME:-agent-harness}
+    restart: unless-stopped
+    # Non-root. The container is a worker, not an owner of the host.
+    user: "${AGENT_UID:-1001}:${AGENT_GID:-1001}"
+    init: true
+    # The image ENTRYPOINT is `python /harness/run.py`. With no arguments it
+    # prompts `task>` on stdin and exits on EOF in detached mode, so the
+    # command must be explicit. This runs the console AND the scheduler in
+    # ONE process -- they share the same session directory and state.
+    command: ["--serve", "--schedule"]
+    environment:
+      # --- what the agent works on -----------------------------------------
+      AGENT_PROJECT_ROOT: /project
+      AGENT_CONFIRM_WRITES: "0"
+      AGENT_STREAM: "1"
+      AGENT_REPO_MAP: "1"
+      # --- run bounds ------------------------------------------------------
+      # Turns: the backstop against a confused model looping forever.
+      # 200. The loop stops when the MODEL stops calling tools; this is only
+      # the backstop. Every observed cut-off of an unattended mission lost work
+      # rather than saving it: runs that died exactly at the ceiling had
+      # typically found a defect, fixed it and proved the fix, then had nothing
+      # left to deliver or report it. Raising the backstop costs nothing on a
+      # healthy run -- it finishes when the model finishes.
+      AGENT_MAX_STEPS: "${AGENT_MAX_STEPS:-200}"
+      # Warn the model this many turns before the cut-off, so it writes its
+      # answer instead of losing fifty steps of research to silence.
+      AGENT_ANSWER_WARN_STEPS: "${AGENT_ANSWER_WARN_STEPS:-20}"
+      # Wall clock: bounds MINUTES, not turns. A run that outlasts this is
+      # warned, then ends by salvaging an answer -- the same path the step
+      # limit uses. 0 means unbounded. A deployment that schedules missions
+      # should set this comfortably above a GOOD long run and well below the
+      # point where the next firing is fiction.
+      AGENT_MAX_RUN_SEC: "${AGENT_MAX_RUN_SEC:-0}"
+      # How many timeouts ONE route may cause in a run before the chain steps
+      # over it. A timeout is transient so retrying is right -- but "transient"
+      # was unbounded per run, which left a slow primary in charge for the
+      # entire mission. Counted per route, per run, never persisted.
+      AGENT_ROUTE_TIMEOUT_LIMIT: "${AGENT_ROUTE_TIMEOUT_LIMIT:-4}"
+      # --- model behaviour -------------------------------------------------
+      AGENT_MAX_TOKENS: "${AGENT_MAX_TOKENS:-32000}"
+      AGENT_REASONING_EFFORT: "${AGENT_REASONING_EFFORT:-max}"
+      # --- provider configuration ------------------------------------------
+      # Catalogue and routes are mounted read-only from the host. The agent
+      # reads them; it does not edit them.
+      AGENT_PROVIDERS_FILE: /agent-config/providers.json
+      AGENT_ROUTES_FILE: /agent-config/routes.json
+      # --- agent-owned state (persistent) ----------------------------------
+      # Everything the agent remembers or records lives here. On the
+      # container's own filesystem it dies with the container.
+      AGENT_MEMORY_ROOT: /agent-data/memories
+      AGENT_SESSIONS_DIR: /agent-data/sessions
+      AGENT_TRANSCRIPT: /agent-data/transcript.jsonl
+      AGENT_MODEL_CHOICE_FILE: /agent-data/sessions/model_choice.json
+      AGENT_RUN_SETTINGS_FILE: /agent-data/sessions/run_settings.json
+      AGENT_SCHEDULE_STATE_FILE: /agent-data/schedule_state.json
+      # --- scheduling ------------------------------------------------------
+      AGENT_SCHEDULE_FILE: /agent-config/schedule.json
+      # The hold file is an operator pause switch: touch it to pause, rm to
+      # resume. It lives OUTSIDE the read-only config mount so an operator
+      # (not the agent) can write it.
+      AGENT_SCHEDULE_HOLD: /agent-data/paused.json
+      # --- web console -----------------------------------------------------
+      # The console has NO built-in authentication. Bind to loopback and put
+      # an authenticated reverse proxy in front of it for any remote access.
+      AGENT_WEBUI_HOST: "${AGENT_WEBUI_HOST:-127.0.0.1}"
+      AGENT_WEBUI_PORT: "${AGENT_WEBUI_PORT:-8787}"
+      AGENT_WEBUI_BASE_PATH: "${AGENT_WEBUI_BASE_PATH:-/agent}"
+      # --- deployment gate -------------------------------------------------
+      # The agent stages deploy requests into an outbox; the host applier
+      # drains it. The agent never has docker or ssh.
+      AGENT_DEPLOY_MODE: "${AGENT_DEPLOY_MODE:-gated}"
+      AGENT_DEPLOY_ROOT: /project
+      AGENT_DEPLOY_OUTBOX: /project/.deploy/outbox
+      AGENT_DEPLOY_POLICY: /agent-config/deploy_policy.json
+      AGENT_DEPLOY_ALLOW_RESTART: "0"
+      AGENT_DEPLOY_MAX_FILES: "20"
+      AGENT_DEPLOY_MAX_BYTES: "4194304"
+      # --- Python hygiene --------------------------------------------------
+      PYTHONDONTWRITEBYTECODE: "1"
+    env_file:
+      # Provider API keys. This file is NOT committed. It contains only the
+      # keys named by providers.json's api_key_env fields.
+      - path: .env
+        required: false
+    volumes:
+      # The target application. READ-ONLY. This is what the agent inspects,
+      # tests and reasons about. The deploy gate is the only way to change it.
+      - ${PROJECT_DIR:-../project}:/project:ro
+      # Agent configuration. READ-ONLY. Providers, routes, schedule, policy.
+      - ${AGENT_CONFIG_DIR:-./config}:/agent-config:ro
+      # Agent state. READ-WRITE. Everything the agent remembers or records.
+      - ${AGENT_DATA_DIR:-./agent-data}:/agent-data
+      # Writable scratch for staging work.
+      - ${AGENT_WORKSPACE_DIR:-./workspace}:/workspace
+    working_dir: /workspace
+    ports:
+      # Loopback only. The console has no auth; anything broader needs a proxy.
+      - "${AGENT_WEBUI_BIND:-127.0.0.1}:${AGENT_WEBUI_PORT:-8787}:${AGENT_WEBUI_PORT:-8787}"
+    healthcheck:
+      # The console endpoint proves the process is alive and serving.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; "
+             "r=urllib.request.urlopen('http://127.0.0.1:8787/agent/models',"
+             "timeout=10); exit(0 if r.status==200 else 1)"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Security: no docker socket, no ssh keys, no host network. The deploy
+    # gate is the only way to change the target application.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: false  # /agent-data and /workspace need to be writable
+    tmpfs:
+      - /tmp:size=100m,mode=1777

@@ -115,10 +115,10 @@ python run.py --routes-file routes.json "task..."
 ```
 
 With `providers.json.example` copied into place, the example chain crosses
-providers — OpenRouter first, then the `gateway` template, then `ollama-local`
-as a last resort — because a gateway that is dark for one alias is usually dark
-for all of them. Point the chain at your own hosts and `--routes` is for one-off
-overrides.
+providers — `example-cloud` first, then the `gateway` template, then
+`ollama-local` as a last resort — because a gateway that is dark for one alias
+is usually dark for all of them. Point the chain at your own hosts and
+`--routes` is for one-off overrides.
 
 ## The three ideas
 
@@ -389,18 +389,22 @@ than by trusting the DOM.
 | [DevOps & infrastructure](docs/DEVOPS.md) | GKE, GCP, Terraform, monitoring — and what to let it do alone |
 | [Guide](docs/GUIDE.md) | writing tasks and `system.md`, memory hygiene, troubleshooting |
 | [Architecture](docs/ARCHITECTURE.md) | how it works, and why each piece is that shape |
+| [Deployment runbook](docs/DEPLOYMENT.md) | from zero to a running, scheduled, gated agent |
+| [Kubernetes & GKE](docs/KUBERNETES.md) | cluster monitoring, gated remediation, multi-cluster |
+| [Agent prompt](docs/AGENT_PROMPT.md) | ready-to-use document for another AI agent |
 
 Start with the examples — they show the range faster than any description. If
 you are pointing this at infrastructure, read the DevOps one first: it is
-mostly about the autonomy boundary, and that is the part that matters.
+mostly about the autonomy boundary, and that is the part that matters. If you
+are deploying it as a production sidecar, start with the deployment runbook.
 
 ## Files
 
 ```
 run.py             CLI (--check, --serve, --schedule*, --memory-export/-import)
-agent.py           the loop
-webui.py           zero-dependency browser chat UI
-scheduler.py       cron-lite daemon over schedule.json
+agent.py           the loop: tool calls, routing, run bounds, salvage
+webui.py           zero-dependency browser console (chat, runs, schedule, settings)
+scheduler.py       sequential interval/daily missions with overdue reasons
 tools.py           tool schemas and handlers
 tools_edit.py      exact-string edits, glob, per-file failure tracking
 tools_git.py       guarded git verbs
@@ -411,19 +415,42 @@ tools_todo.py      the visible plan
 tools_delegate.py  bounded subagents
 tools_browser.py   headless chromium (Playwright, optional)
 tools_media.py     multimodal image envelopes
+tools_deploy.py    agent-side deploy-request staging and gate interaction
 prompts.py         the system prompt, plus your system.md
 python_exec.py     persistent interpreter for run_python
 memory.py          three-scope memory
-session.py         per-task action log
+session.py         per-task action log (JSONL + Markdown)
 config.py          settings, provenance, memory discovery
-llm.py             generic provider catalogue: resolve, keys, web-UI catalog
-recreate_guard.py  host-side gate: recreate the container without killing a run
+llm.py             generic provider catalogue: resolve, keys, routing
+run_settings.py    validated, atomic console overrides for steps and cadence
+deploy_applier.py  host-side gated applier: policy, readiness, verify, rollback
+recreate_guard.py  host-side gate: recreate without killing a run (--force)
+storage.py         retention bounds for sessions and transcripts
+make_schedule.py   generate schedule.json from mission.md (the reviewed brief)
+sync_source.py     three-way drift: checkout / host / image
+```
+
+Example configuration files:
+
+```
+.env.example                    environment template (all knobs)
+providers.json.example          provider catalogue template
+routes.json.example             fallback chain template
+schedule.json.example           schedule format template
+mission.md.example              canonical mission brief template
+system.md.example               project-specific prompt template
+deploy_policy.json.example      deployment gate policy template
+docker-compose.agent.yml.example production sidecar composition
 ```
 
 ## What this is not
 
 Not a framework and not production multi-tenant infrastructure. It is a
-single-user tool that runs one task at a time and asks before it writes.
+single-user tool that runs one task at a time (the scheduler is sequential by
+design). It has a console, a gate, a schedule, and run bounds, but no built-in
+authentication, no multi-user model, and no cloud control plane. Those belong
+in the deployment, not in the harness.
+
 Unattended use (`--schedule`, `AGENT_AUTO_APPROVE`) is opt-in and stays inside
 the safety rails above: what the rails refuse, the run reports instead of
 doing.

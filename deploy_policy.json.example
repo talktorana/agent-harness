@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "Deployment policy for the gated applier. Copy to deploy_policy.json and",
+    "configure for your deployment. Every field is documented below.",
+    "",
+    "The applier reads this file on EVERY request, so changes take effect",
+    "immediately without restarting anything.",
+    "",
+    "SECURITY MODEL: the agent (inside the sidecar) stages deploy requests",
+    "into a shared outbox directory. The applier (on the host) reads them,",
+    "checks this policy, and either applies or refuses. The agent never has",
+    "docker, ssh, or any way to bypass this gate.",
+    "",
+    "DEFAULT POSTURE: enforcing. A readiness check that fails REFUSES the",
+    "deploy. A verifier that fails ROLLS BACK the write. Relax these only",
+    "after you have proven the gate works and understand what you are",
+    "trading away."
+  ],
+
+  "readiness": {
+    "_comment": "A health check on the target application BEFORE deploying.",
+    "_how": "Read the JSON file at status_file, extract field, and compare",
+    "_against": "safe_states. If the value is not in safe_states, refuse.",
+    "_freshness": "If timestamp_field is set, the value must be newer than",
+    "_max_age_sec": "seconds old, or the verdict is stale and refused.",
+    "status_file": "data/readiness.json",
+    "field": "state",
+    "label": "the application's own health verdict",
+    "timestamp_field": "at",
+    "safe_states": ["ready", "healthy"],
+    "max_age_sec": 120,
+    "enforce": true,
+    "_why_enforce": "true means a failed readiness check REFUSES the deploy.",
+    "_advisory_alternative": "false means the check still runs and is recorded",
+    "_in_receipt": "as readiness.would_refuse, but does not veto. Use false",
+    "_only_when": "you have proven the gate works and want evidence without",
+    "_blocking": "blocking -- e.g. during a migration from manual to gated."
+  },
+
+  "verify": {
+    "_comment": "A command run AFTER writing files to prove they work.",
+    "_example": "python -m unittest discover -s tests -p 'test_*.py'",
+    "_runs_on": "the HOST, not in the sidecar. It sees the real filesystem.",
+    "blocking": true,
+    "_why_blocking": "true means a failing verifier ROLLS BACK the write.",
+    "_advisory_alternative": "false means the verifier still runs and its rc",
+    "_and_output": "land in the receipt as verify_advisory/verify_rc/verify_output,",
+    "_but_no_rollback": "but the files are NOT rolled back. Use false only when",
+    "_you_have": "a separate rollback mechanism or are testing the gate."
+  },
+
+  "limits": {
+    "_comment": "How old a staged request may be before it is refused.",
+    "_why": "A request staged hours ago was written against a different state",
+    "_of_the_tree": "and may be wrong by now. The agent re-stages fresh.",
+    "max_age_sec": 14400
+  },
+
+  "forbid": {
+    "_comment": "Paths the agent may NEVER write, even through the gate.",
+    "_why": "These are the things that would let the agent bypass its own",
+    "_gate_or_destroy": "irreplaceable state. The list is defense-in-depth:",
+    "_the_agent": "already cannot write the read-only project mount, but the",
+    "_outbox_is_shared": "outbox is shared and the applier has host access.",
+    "names": [
+      ".env",
+      ".env.local",
+      ".env.production",
+      "credentials.json",
+      "secrets.yaml",
+      "id_rsa",
+      "id_ed25519"
+    ],
+    "prefixes": [
+      ".git/",
+      "node_modules/"
+    ],
+    "suffixes": [
+      ".pem",
+      ".key",
+      ".p12",
+      ".pfx"
+    ],
+    "dirs": [
+      ".git",
+      "data",
+      "logs",
+      "memories"
+    ],
+    "_why_dirs": "Directories are refused entirely, not just their contents.",
+    "_customize": "Add your application's runtime state, credential stores,",
+    "_and_control_plane": "and control-plane files here."
+  },
+
+  "actions": {
+    "_comment": "Typed host actions the applier can run on the agent's behalf.",
+    "_why": "Some operations (restart a service, run a migration) need host",
+    "_access_but_are": "too dangerous to give the agent a shell for. Actions",
+    "_are_bounded": "are bounded: each declares allowed fields, argument arrays",
+    "_not_shell_strings": "(never shell strings), and a timeout.",
+    "_example": {
+      "container": {
+        "allowed_fields": ["service"],
+        "read_argv": ["docker", "inspect", "{service}"],
+        "apply_argv": ["docker", "compose", "restart", "{service}"],
+        "validate_argv": ["docker", "inspect", "--format", "{{.State.Status}}", "{service}"],
+        "run_timeout_sec": 60
+      }
+    }
+  },
+
+  "git": {
+    "_comment": "Best-effort commit and push of applied files to a mirror repo.",
+    "_why": "The deploy root is NOT a git checkout (it is a plain copy), so",
+    "_a_fix_that_lands": "only on the host exists on one machine until it",
+    "_reaches_git": "reaches git. The mirror is a separate clone that the",
+    "_applier_commits_to": "applier commits to and pushes from.",
+    "_failure_is_not_fatal": "A failed push never blocks the deploy -- the",
+    "_fix_is_live": "fix is live on the host regardless.",
+    "enabled": false,
+    "_enable_when": "true when you have set up a mirror clone and deploy key.",
+    "mirror_dir": "",
+    "_example_mirror": "/opt/my-project-git",
+    "subdir": "",
+    "_example_subdir": "the path within the repo that maps to the deploy root",
+    "remote": "origin",
+    "branch": "main",
+    "user_name": "agent-applier",
+    "user_email": "agent@localhost",
+    "timeout_sec": 30
+  }
+}

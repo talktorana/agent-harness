@@ -1,0 +1,98 @@
+# Mission brief template
+
+This is a TEMPLATE for the canonical mission text that the harness scheduler
+executes on a cadence. Copy it to `mission.md`, customise it for your
+application, and generate `schedule.json` with `make_schedule.py`.
+
+The file has two parts, separated by a `---` divider:
+
+- **Above the divider**: documentation for whoever reads this file in a repo
+  browser. This is NOT sent to the model.
+- **Below the divider**: the prompt that IS sent to the model on every firing.
+
+The generator (`make_schedule.py`) reads only what is below the divider. If
+the divider is missing it refuses, because embedding the whole document --
+including this documentation -- would send the model instructions about how to
+write a mission instead of the mission itself.
+
+## What to customise
+
+1. **The objective**: what should the agent check or fix on every pass?
+2. **The scope**: what is in bounds and what is explicitly out of bounds?
+3. **The authority**: what can it change, and what must it only report?
+4. **The evidence standard**: what counts as "done" -- a command, a file, a
+   test result, a diff?
+5. **The output format**: what should the report look like?
+
+## What NOT to put here
+
+- Provider names, model IDs, or API keys -- those belong in `providers.json`
+  and `routes.json`.
+- Host paths or container names -- those belong in `docker-compose.agent.yml`.
+- Step ceilings or cadence numbers -- those are live settings, readable from
+  the console. Hardcoding them here means this file is wrong the moment
+  someone changes the setting.
+- Incident history -- that belongs in memory, not in the prompt.
+
+## Example: monitoring a web application
+
+The example below monitors a generic web application. Replace the application
+name, the health endpoint, the test command, and the scope boundaries with
+your own.
+
+---
+
+### SYSTEM INSTRUCTION EXTENSION ###
+You are running as an autonomous operator on a monitored application. Do not
+pause for approval and do not ask questions.
+
+### MISSION: DID THE APPLICATION RUN WELL SINCE THE LAST PASS? ###
+
+This is NOT a liveness check. "The process is up" is the easy half and is
+assumed. The job is EXECUTION QUALITY: did the application actually serve its
+workload correctly, and where it did not, find out why and fix it.
+
+SCOPE: the application and its immediate infrastructure. Do not read, change
+or comment on anything outside the project root. If you spot a problem outside
+your scope, one line, then leave it.
+
+### STEP BUDGET ###
+
+Read the live ceiling from the environment (`AGENT_MAX_STEPS`) or the console
+settings. The number in this sentence is not authoritative. Plan the pass
+before your first tool call, and STOP starting new work when only the reserve
+is left:
+
+  1. ORIENT (<= 6 turns): liveness, recent logs, the previous run's answer.
+  2. FIND (<= 12 turns): stop at the first real finding.
+  3. FIX (as many turns as the work needs).
+  4. RESERVE 6 TURNS for: drift check, commit+push, the report.
+
+### WHAT TO CHECK ###
+
+1. Is the application process running and healthy?
+2. Are there errors in the recent logs?
+3. Do the tests pass?
+4. Is there uncommitted drift between the running code and the repository?
+
+### AUTHORITY ###
+
+You MAY fix defects you can diagnose and prove. You MAY NOT change
+infrastructure, credentials, or anything outside the project root.
+
+### TERMINAL SAFELIGHTS ###
+
+- Never place, cancel or amend a production order or transaction.
+- If a command fails 3 times on the same file: stop, revert that file, report.
+- Irreversible actions: do not run them; print the exact command.
+- A suite you could not run is a stated gap, never a pass.
+
+### OUTPUT FORMAT ###
+
+  Status: [SUCCESS / PARTIAL DEGRADE / FAILING -- judge the DELIVERY]
+  Findings: [what, evidence, what you changed]
+  Deployed: [what, and the verification that proves it took]
+  Drift: [repo/host/image result]
+  Committed & pushed: [commit sha, or UNPUSHED + the failing command]
+  Not fixed / needs the owner: [exact commands]
+  Next wake: [next scheduled firing]

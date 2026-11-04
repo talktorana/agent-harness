@@ -1,7 +1,12 @@
 # Architecture
 
-Nine Python files, no framework, no database, no service. This is how it
-fits together and — more usefully — *why* each piece is the shape it is.
+A handful of Python modules, no framework, no database, no service. This is how
+it fits together and — more usefully — *why* each piece is the shape it is.
+
+The harness has grown from a CLI tool into a full autonomous operator: it runs
+on a schedule, has a web console, deploys through a gate, and accumulates
+knowledge across runs. The core loop is unchanged; the additions are the parts
+that make unattended operation survivable.
 
 ---
 
@@ -246,7 +251,11 @@ in the wrong place", and only one is true.
 
 ## What it is not
 
-Not a framework, not multi-tenant, not an unattended worker. It runs one task
-at a time and asks before it writes. That is the right shape for an assistant
-you supervise, and the wrong one to leave running against systems you care
-about.
+Not a framework, not multi-tenant, not a managed service. It runs one task at a
+time (the scheduler is sequential by design -- two concurrent missions would
+write the same edits and judge the same defects). It has a console, a gate, and
+a schedule, but no built-in authentication, no multi-user model, and no cloud
+control plane. Those belong in the deployment, not in the harness.
+
+The right shape for an assistant you supervise, and -- with the gate, the
+schedule, and the run bounds -- a survivable shape for one you do not.
