@@ -22,15 +22,13 @@ was. Each of the four below is the repair for one of those gaps.
 from __future__ import annotations
 
 import io
+import importlib
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-
-import httpx
-from openai import APITimeoutError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -45,16 +43,55 @@ from test_webui_runs import TempDirs  # noqa: E402
 # --------------------------------------------------------------- fake clocks
 
 
+def _transport_request():
+    """A request object from whatever transport module this SDK bundles.
+
+    NOT ``import httpx``. The transport name differs across openai SDK majors --
+    one deployment ships openai 3.45.0 with ``httpx2``/``httpcore2``, where
+    ``import httpx`` raises -- so a module-scope httpx import made this whole
+    file fail to LOAD there. It passed on the workstation (openai 1.x, plain
+    httpx) and reported ``FAILED (errors=1)`` with a loader traceback in the
+    image instead: a green-on-one-box, red-on-the-other suite, and the red one
+    was the deployment.
+    """
+    for name in ("httpx", "httpx2"):
+        try:
+            mod = importlib.import_module(name)
+            return mod.Request("POST", "https://prov.example/v1")
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _real_timeout():
     """The SDK exception a slow provider actually raises.
 
-    A plain ``TimeoutError`` would be simpler, but `_is_transient` only accepts
-    the openai connection/timeout types -- so a test that raised the builtin
-    would never reach the retry path at all, and would pass against a demotion
-    rule that the production exception never triggers. Using the real type is
-    what makes this test say something about deployed behaviour.
+    A plain ``TimeoutError`` would be simpler, but ``_is_transient`` only accepts
+    the openai connection/timeout types -- so a test raising the builtin would
+    never reach the retry path at all, and would pass against a demotion rule the
+    production exception never triggers. Using the real type is what makes this
+    say something about deployed behaviour.
+
+    Constructed defensively for the same reason as above: the constructor's
+    argument shape is not stable across SDK majors, so fall back to building the
+    instance directly. ``isinstance`` is what ``_is_transient`` checks, and that
+    holds either way.
     """
-    return APITimeoutError(httpx.Request("POST", "https://prov.example/v1"))
+    from openai import APITimeoutError
+
+    for build in (lambda: APITimeoutError(_transport_request()),
+                  lambda: APITimeoutError(request=_transport_request()),
+                  lambda: APITimeoutError("Request timed out.")):
+        try:
+            return build()
+        except Exception:  # noqa: BLE001
+            continue
+    exc = APITimeoutError.__new__(APITimeoutError)
+    try:
+        exc.args = ("Request timed out.",)
+    except Exception:  # noqa: BLE001
+        pass
+    return exc
 
 
 class FakeClock:
