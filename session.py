@@ -85,6 +85,31 @@ def _args_hash(args: Any) -> str:
         :ARGS_HASH_CHARS]
 
 
+#: Public name for the bare argument fingerprint already recorded on every
+#: action row. Callers outside this module need the same value the record holds
+#: -- e.g. to report WHICH call was duplicated alongside the composite grouping
+#: key -- and reaching into a private helper from another module invites the two
+#: drifting apart.
+args_hash = _args_hash
+
+
+def fingerprint(name: str, args: Any) -> str:
+    """The identity of one tool call: its name plus a fingerprint of its args.
+
+    This is the grouping key an audit of repeated calls has to use, and it is
+    defined here -- next to ``_args_hash`` -- so the number a later pass counts
+    in the session file and the number the agent was warned about at run time
+    are the SAME number. Two implementations of one identity would eventually
+    disagree, and then "you repeated this 6 times" and "the log shows 5
+    repeats" would both be true.
+
+    ``detail`` cannot serve as this key: it truncates every argument, so two
+    commands differing only past the cut are indistinguishable. See
+    ``_args_hash``.
+    """
+    return "%s %s" % (name, _args_hash(args))
+
+
 def _failed(result: str) -> bool:
     """Did this action fail? Drives the ⚠️ markers in the timeline.
 

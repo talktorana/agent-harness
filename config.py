@@ -226,6 +226,19 @@ TOOL_TIMEOUT_SEC = int(os.environ.get("AGENT_TOOL_TIMEOUT_SEC", "180"))
 #: Counted per route, per run, and NEVER persisted: a provider that hiccups
 #: tonight is still eligible as tomorrow's primary. ``0`` disables demotion.
 ROUTE_TIMEOUT_LIMIT = int(os.environ.get("AGENT_ROUTE_TIMEOUT_LIMIT", "4") or "0")
+#: Tell the model when it repeats an EXACT tool call within one run. The
+#: fingerprint this uses was already computed for every call -- but only ever
+#: written into the session record, so its sole consumer was a later audit.
+#: Measured live on 2026-11-04 across five missions: `deploy_status` repeated
+#: 6, 3, 6, 2 and 2 times per pass, and a 60-second dashboard suite was re-run
+#: three times in one pass whose brief already carried an explicit "RUN IT ONCE
+#: PER PASS" rule naming that same failure from two days earlier. Prose rules do
+#: not stop a model re-proving a fact; a line in the tool result does.
+#:
+#: This INFORMS, never blocks: polling an asynchronous result is legitimate and
+#: only the model knows whether that is what it is doing. 0 disables it.
+DUPLICATE_CALL_NOTICE = int(os.environ.get("AGENT_DUPLICATE_CALL_NOTICE",
+                                           "1") or "0")
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the
 # context window in one turn.

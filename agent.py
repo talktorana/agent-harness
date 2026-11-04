@@ -29,6 +29,11 @@ import tools_media
 from memory import MemoryStore
 from prompts import build_system
 from session import SessionLog
+#: The module as well, for ``fingerprint``/``args_hash``. NOT imported as plain
+#: ``session``: the crash handler binds a LOCAL of that name
+#: (``session = getattr(self, "session", None)``), and a module import that can
+#: be shadowed by a local in some scopes is a name that only works by accident.
+import session as session_mod
 
 
 def _effective_max_steps() -> int:
@@ -359,6 +364,12 @@ class Agent:
         #: run for an old route's timeouts.
         self._run_started_monotonic = 0.0
         self._route_timeouts: Dict[str, int] = {}
+        #: Fingerprints of the tool calls made so far in THIS run, so an exact
+        #: repeat can be named to the model. Declared here and RESET when a run
+        #: starts (``_run_impl``), because one Agent object can run more than one
+        #: task and a second run must not inherit the first one's history -- the
+        #: same reasoning as ``_route_timeouts`` beside it.
+        self._call_fingerprints: Dict[str, int] = {}
         #: Set to the elapsed seconds when the WALL-CLOCK bound ends the run,
         #: and only then. It is the difference between "ran out of turns" and
         #: "ran out of time" after the loop, which is what the status must say.
@@ -602,6 +613,35 @@ class Agent:
                 {"type": "image_url",
                  "image_url": {"url": tools_media.data_url(payload)}},
             ]
+        #: The duplicate notice is appended AFTER the envelope is parsed, never
+        #: before: ``parse_image_envelope`` matches an exact prefix, so text in
+        #: front of the wrapper would silently degrade every repeated screenshot
+        #: into plain text and the model would lose the pixels it needs to judge
+        #: its own UI work. When the result IS multimodal the notice rides along
+        #: as its own text part instead of being spliced into the image one.
+        notice = self._duplicate_call_notice(name, args)
+        if notice:
+            if isinstance(content, list):
+                content = content + [{"type": "text", "text": notice}]
+            else:
+                content = str(result) + notice
+            result = str(result) + notice
+            repeats = self._repeat_count(name, args)
+            #: Recorded, because a warning that cannot be seen afterwards is not
+            #: auditable: a later pass reading this run must be able to tell
+            #: "repeated and was never told" from "repeated and ignored a direct
+            #: notice". Those need different fixes -- the second means the
+            #: wording has to change.
+            self._log({"event": "duplicate_call", "tool": name,
+                       "args_hash": session_mod.args_hash(args),
+                       "repeats": repeats})
+            if self.session is not None:
+                try:
+                    self.session.event("duplicate_call", tool=name,
+                                       args_hash=session_mod.args_hash(args),
+                                       repeats=repeats)
+                except Exception:  # noqa: BLE001
+                    pass
         self._say(f"\033[90m{str(result)[:1200]}\033[0m"
                   + (f"\n\033[90m... [{elapsed:.1f}s]\033[0m"
                      if elapsed > 2 else ""))
@@ -785,6 +825,57 @@ class Agent:
 
         raise RuntimeError("; ".join(problems) or "no route available")
 
+    def _repeat_count(self, name: str, args: Dict[str, Any]) -> int:
+        """How many times this exact call has happened so far, this call included.
+
+        Read-only: ``_duplicate_call_notice`` is what increments, and it must be
+        called first so the two agree. Kept as a method rather than recomputing
+        arithmetic at each call site, because the count has to be the same number
+        in the log, the session record and the notice the model reads -- three
+        renderings of one fact, and a disagreement among them would make the
+        notice impossible to audit.
+        """
+        return self._call_fingerprints.get(
+            session_mod.fingerprint(name, args), 0)
+
+    def _duplicate_call_notice(self, name: str,
+                               args: Dict[str, Any]) -> Optional[str]:
+        """A notice when this exact call has already been made in this run.
+
+        Returns None for a first call, or when the feature is off. The count is
+        always updated so the notice can state how many times this call has now
+        happened, including the one just made.
+
+        WHY THIS EXISTS. The harness already fingerprinted every call's
+        arguments, but only ever WROTE the fingerprint down. Its single consumer
+        was a later audit pass counting waste -- so the waste was measured and
+        never prevented, and each pass re-discovered the same repeats as a fresh
+        finding. Measured on 2026-11-04, five consecutive missions repeated one
+        argument-less status tool 6, 3, 6, 2 and 2 times, and a 60-second test
+        suite was re-run three times inside a pass whose own brief said to run it
+        once and named that exact mistake from two days earlier. Telling the
+        model to stop doing something is not the same as showing it that it just
+        did it.
+
+        INFORMS, NEVER BLOCKS. Repeating a call is legitimately how you poll an
+        asynchronous result -- a deploy receipt the host applier has not drained
+        yet, a file another process is still writing. Only the model knows which
+        case it is in, so the notice states the fact, states that it is not
+        blocked, and names both readings instead of assuming the wasteful one.
+        """
+        key = session_mod.fingerprint(name, args)
+        seen = self._call_fingerprints.get(key, 0) + 1
+        self._call_fingerprints[key] = seen
+        if seen < 2 or not getattr(config, "DUPLICATE_CALL_NOTICE", 1):
+            return None
+        return (
+            "\n\n[duplicate call] You have now run `%s` with these EXACT "
+            "arguments %d times in this run. This was not blocked -- if you are "
+            "polling for something that changes elsewhere, say so in your "
+            "narration and keep going. If you are re-checking a fact the "
+            "previous result already gave you, the earlier answer is still "
+            "true and each repeat costs a turn." % (name, seen))
+
     def _slowest_route(self) -> Optional[Tuple["str", int]]:
         """(route, timeouts) for the route that cost this run the most clock."""
         if not self._route_timeouts:
@@ -872,6 +963,7 @@ class Agent:
         self._bound_storage()
         self._run_started_monotonic = time.monotonic()
         self._route_timeouts = {}
+        self._call_fingerprints = {}
         self._run_elapsed_at_stop = None
 
         memory = MemoryStore(session_id=self.session.session_id)
