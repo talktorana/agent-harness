@@ -226,6 +226,13 @@ def _scheduler_view() -> Dict[str, Any]:
         #: conclusion an operator reached live on 2026-11-03.
         "overdue": bool(current.get("overdue")),
         "overdue_reason": current.get("overdue_reason"),
+        #: The wall-clock bound on one run next to the cadence it is scheduled
+        #: against. Both are already facts the loop obeys; showing only the
+        #: cadence let a page look healthy while the bound could outlast it.
+        "run_bound_sec": current.get("run_bound_sec"),
+        "every_min_seconds": current.get("every_min_seconds"),
+        "bound_overruns_cadence": bool(current.get("bound_overruns_cadence")),
+        "bound_overrun_reason": current.get("bound_overrun_reason"),
         "paused": bool(doc.get("paused")),
         "any_enabled": bool(doc.get("any_enabled")),
     }
@@ -451,6 +458,28 @@ async function loadSchedule(){
         if(job.overdue_reason) next+='<div class="m">'+esc(job.overdue_reason)+'</div>';
       }
     }
+    // The cadence on this page only bounds the GAP between firings: this loop
+    // is sequential, so a long run simply pushes the next one. Saying what
+    // bounds the RUN itself is what makes the number above readable rather than
+    // decorative -- and it is the one place an operator can see that a bound
+    // longer than the interval makes the interval a floor.
+    let bound='';
+    if(job.enabled){
+      const mins=job.run_bound_sec!=null
+        ? Math.round(job.run_bound_sec/60)+' min wall-clock bound'
+        : '<span class="warn">unbounded</span> (only a turn ceiling)';
+      bound='<span class="m">run limit: '+mins
+        +' <span class="m">/ cadence '+(job.every_min||'?')+' min</span></span>';
+      // Styled as a note, not an error: a bound longer than the cadence is a
+      // sizing choice, and an unbounded run is the more dangerous of the two.
+      // Colouring either RED would train the eye away from the statuses that
+      // are genuinely broken.
+      if(job.bound_overrun_reason){
+        bound+='<div class="warn"'+(!job.bound_overruns_cadence
+          ?' title="not an error: no bound is set at all"':'')
+          +'>\u26a0 '+esc(job.bound_overrun_reason)+'</div>';
+      }
+    }
     h+='<div class="row"><b>'+esc(job.id)+'</b>'
       +'<span>'+esc(job.interval)+'</span>'+statePill
       +'<span>last run <b>'+esc(job.last_run||'never')+'</b>'
@@ -468,7 +497,7 @@ async function loadSchedule(){
           +'</b></span>':''))
       +(job.last_run?'<span>last outcome <span class="'+cls(job.last_ok?'ok':'bad')
         +'">'+(job.last_ok===false?'FAILED':'ok')+'</span></span>':'')
-      +'<span>'+next+'</span></div>';
+      +'<span>'+next+'</span>'+bound+'</div>';
     if(job.last_error) h+='<div class="bad">last error: '+esc(job.last_error)+'</div>';
     h+='<div class="m" style="margin-top:4px">prompt sent each run ('
       +job.prompt_chars+' chars): '+(job.prompt

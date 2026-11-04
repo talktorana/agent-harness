@@ -295,6 +295,44 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
                     f"is not polling, the job is disabled, or the process died "
                     f"-- this IS a fault")
 
+        #: COHERENCE BETWEEN THE TWO NUMBERS THAT DECIDE THE CADENCE.
+        #:
+        #: This loop is SEQUENTIAL by design, so the interval on the page only
+        #: bounds the gap between FIRINGS -- it never bounds the length of a
+        #: run. What bounds a run is the step ceiling and the wall-clock bound,
+        #: and until now nothing compared that bound to the cadence it is
+        #: scheduled against. A 5400 s bound on a 3600 s interval means one run
+        #: may legally outlast the interval it belongs to, so the next firing
+        #: slips; the console showed a respectable cadence beside a bound that
+        #: could break it by 50%, and read as healthy while it was not.
+        #:
+        #: An unbounded run is the same problem with no number to print: the
+        #: only ceiling is turns, and turns have no DURATION, so a provider that
+        #: times out can hold one slot for hours. That is what actually happened
+        #: here -- 120 minutes, 14 timeouts, turn 62 of 200, `next_due` an hour
+        #: past -- so "0 means unbounded" is stated outright rather than hidden
+        #: as an absent field.
+        run_bound_sec = float(getattr(config, "MAX_RUN_SEC", 0.0) or 0.0)
+        cadence_sec = float(every) * 60 if every else None
+        bound_overruns_cadence = bool(
+            run_bound_sec > 0 and cadence_sec and run_bound_sec > cadence_sec)
+        if bound_overruns_cadence:
+            bound_overrun_reason = (
+                "a run may legally last %ds but this job is scheduled every "
+                "%ds, so one run can hold the slot past its own next firing "
+                "and the cadence here is a FLOOR, not a promise -- lower "
+                "AGENT_MAX_RUN_SEC or raise the interval"
+                % (int(run_bound_sec), int(cadence_sec)))
+        elif run_bound_sec <= 0:
+            bound_overrun_reason = (
+                "no wall-clock bound is set (AGENT_MAX_RUN_SEC=0), so the only "
+                "ceiling is the step budget and turns have no DURATION -- a "
+                "provider that times out repeatedly can hold this job's slot "
+                "for hours. Set AGENT_MAX_RUN_SEC to make the cadence mean "
+                "anything")
+        else:
+            bound_overrun_reason = None
+
         jobs.append({
             "id": key,
             "interval": _interval_label({**job, "every_min": every}),
@@ -307,6 +345,20 @@ def status(now: Optional[datetime] = None) -> Dict[str, Any]:
             #: that reports scheduling, and the next operator re-discovers it
             #: by watching runs fire at an interval nobody set.
             "every_min_declared": job.get("every_min"),
+            #: The wall-clock bound on ONE run, and how it compares with this
+            #: job's own cadence. Reported per job rather than once globally
+            #: because the cadence is per job (a console override applies to one
+            #: job, and an `at` job has no interval at all).
+            "every_min_seconds": cadence_sec,
+            "run_bound_sec": run_bound_sec or None,
+            #: True when a single run is allowed to outlast the interval it is
+            #: scheduled on -- i.e. the cadence cannot be a promise.
+            "bound_overruns_cadence": bound_overruns_cadence,
+            #: The sentence that explains it, and what to change. Null when the
+            #: two numbers agree AND a bound is actually set; an unbounded run
+            #: is reported too, because "no bound" is the more dangerous of the
+            #: two and an absent field would read as "nothing to worry about".
+            "bound_overrun_reason": bound_overrun_reason,
             "enabled": bool(job.get("enabled", True)),
             # The prompt is the thing an operator most wants to check -- "what
             # is it actually being told to do every half hour?" -- so it is
