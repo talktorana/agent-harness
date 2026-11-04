@@ -262,11 +262,14 @@ def assemble_stream(chunks, emit=None, on_think=None, on_usage=None) -> SimpleNa
                            finish_reason=finish_reason)
 
 
-def build_request(model: str, messages: list, use_tools: bool) -> dict:
+def build_request(model: str, messages: list, use_tools: bool,
+                  reasoning_effort: Optional[str] = None) -> dict:
     """The chat-completions payload for one model call.
 
     Extracted from the call site so the payload -- which is where reasoning
     depth is decided -- can be unit-tested directly instead of grepped.
+    ``reasoning_effort`` overrides the configured base for adaptive runs;
+    None preserves the original fixed-effort behaviour.
 
     REASONING DEPTH, two knobs, each sent only when configured:
 
@@ -308,8 +311,9 @@ def build_request(model: str, messages: list, use_tools: bool) -> dict:
     }
     if config.MAX_TOKENS > 0:
         request["max_tokens"] = config.MAX_TOKENS
-    if config.REASONING_EFFORT:
-        request["reasoning_effort"] = config.REASONING_EFFORT
+    effort = config.REASONING_EFFORT if reasoning_effort is None else reasoning_effort
+    if effort:
+        request["reasoning_effort"] = effort
     if getattr(config, "PROMPT_CACHE_KEY", ""):
         request["prompt_cache_key"] = config.PROMPT_CACHE_KEY
     if use_tools:
@@ -373,6 +377,12 @@ class Agent:
         #: task and a second run must not inherit the first one's history -- the
         #: same reasoning as ``_route_timeouts`` beside it.
         self._call_fingerprints: Dict[str, int] = {}
+        #: One-way, per-run reasoning escalation. The default is unchanged
+        #: unless DEEP_REASONING_EFFORT and a trigger are configured. Recording
+        #: the active value makes provider usage attributable to the ACTUAL
+        #: request, not merely the base environment setting.
+        self._deep_reasoning = False
+        self._active_reasoning_effort = config.REASONING_EFFORT
         #: Set to the elapsed seconds when the WALL-CLOCK bound ends the run,
         #: and only then. It is the difference between "ran out of turns" and
         #: "ran out of time" after the loop, which is what the status must say.
@@ -489,9 +499,12 @@ class Agent:
                                      if prompt_details else None),
             "cache_write_tokens": (getattr(prompt_details, "cache_write_tokens", None)
                                    if prompt_details else None),
-            #: The configured depth travels with the measurement. Without it a
-            #: reader has a number and no context for whether it is expected.
-            "reasoning_effort": config.REASONING_EFFORT or None,
+            #: The depth on THIS request travels with the measurement. An
+            #: adaptive run can move from its base effort to the deep effort;
+            #: logging only the environment default would mislabel every later
+            #: call and make the optimisation impossible to audit.
+            "reasoning_effort": getattr(
+                self, "_active_reasoning_effort", config.REASONING_EFFORT) or None,
             "max_tokens": config.MAX_TOKENS or None,
         }
         clean = {k: v for k, v in record.items() if v is not None}
@@ -659,7 +672,47 @@ class Agent:
                    "result": str(result)[:20000], "seconds": round(elapsed, 2)})
         if self.session:
             self.session.action(self.steps, name, args, str(result), elapsed)
+        self._update_reasoning_depth(name, str(result))
         return result, content
+
+    def _update_reasoning_depth(self, name: str, result: str) -> None:
+        """Escalate once when configured evidence justifies deeper reasoning.
+
+        Opt-in only: no deep effort means no behaviour change. Trigger markers
+        are deployment configuration, not hard-coded provider or project rules.
+        Once raised, depth stays raised for this run so an investigation does
+        not oscillate between cheap and deep calls as different tools return.
+        """
+        deep = getattr(config, "DEEP_REASONING_EFFORT", "")
+        if getattr(self, "_deep_reasoning", False) or not deep:
+            return
+        reason = ""
+        if name in getattr(config, "DEEP_REASONING_TOOLS", ()):
+            reason = f"tool {name}"
+        else:
+            markers = tuple(item for item in getattr(
+                config, "DEEP_REASONING_TRIGGER", "").split("||") if item)
+            marker = next((item for item in markers if item in result), "")
+            if marker:
+                reason = f"result marker {marker!r}"
+        if not reason:
+            return
+        self._deep_reasoning = True
+        record = {"event": "reasoning_escalated", "from": config.REASONING_EFFORT or None,
+                  "to": deep, "reason": reason, "tool": name}
+        self._log(record)
+        if self.session is not None:
+            try:
+                self.session.event("reasoning_escalated", **{
+                    key: value for key, value in record.items() if key != "event"})
+            except Exception:  # noqa: BLE001 -- diagnostics must not kill a run
+                pass
+
+    def _next_reasoning_effort(self) -> str:
+        """The effort for the next request in this run."""
+        if getattr(self, "_deep_reasoning", False):
+            return getattr(config, "DEEP_REASONING_EFFORT", "") or config.REASONING_EFFORT
+        return config.REASONING_EFFORT
 
     # ----------------------------------------------------------------- api
 
@@ -713,6 +766,8 @@ class Agent:
                 self._record_usage(usage, _label)
 
             for attempt in range(config.API_RETRIES):
+                effort = self._next_reasoning_effort()
+                self._active_reasoning_effort = effort
                 # Recorded BEFORE the request so that a hung call leaves a
                 # trail: the last event in the session says which model we
                 # were waiting on, instead of the log simply stopping.
@@ -724,11 +779,12 @@ class Agent:
                            #: reached the wire. A setting nobody can see from
                            #: the transcript is a setting nobody can audit.
                            "max_tokens": config.MAX_TOKENS or None,
-                           "reasoning_effort": config.REASONING_EFFORT or None})
+                           "reasoning_effort": effort or None})
                 if self.session:
                     self.session.model_call(model, attempt + 1)
                 try:
-                    request = build_request(model, self.messages, use_tools)
+                    request = build_request(model, self.messages, use_tools,
+                                            reasoning_effort=effort)
                     if config.STREAM and (self.verbose or self.on_token):
                         # Streamed: tokens print as they arrive and the web
                         # UI shows the answer forming. assemble_stream folds
@@ -1008,6 +1064,8 @@ class Agent:
         self._run_started_monotonic = time.monotonic()
         self._route_timeouts = {}
         self._call_fingerprints = {}
+        self._deep_reasoning = False
+        self._active_reasoning_effort = config.REASONING_EFFORT
         self._run_elapsed_at_stop = None
 
         memory = MemoryStore(session_id=self.session.session_id)

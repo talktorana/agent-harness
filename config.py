@@ -168,6 +168,16 @@ FALLBACK_MODEL = os.environ.get("AGENT_FALLBACK_MODEL", "").strip()
 # that does not. Whether a given model honours it is a property of THAT model,
 # so measure it rather than assuming. An empty value sends nothing at all.
 REASONING_EFFORT = os.environ.get("AGENT_REASONING_EFFORT", "").strip()
+# Optional deeper effort for the REST of a run after evidence justifies it.
+# Empty preserves the original fixed-effort behaviour. A deployment can name
+# tool result substrings (separated by ``||``) and/or comma-separated tool names
+# that trigger the one-way escalation. This keeps routine monitoring cheap
+# without guessing that every turn deserves the deepest reasoning budget.
+DEEP_REASONING_EFFORT = os.environ.get("AGENT_DEEP_REASONING_EFFORT", "").strip()
+DEEP_REASONING_TRIGGER = os.environ.get("AGENT_DEEP_REASONING_TRIGGER", "").strip()
+DEEP_REASONING_TOOLS = tuple(
+    item.strip() for item in os.environ.get("AGENT_DEEP_REASONING_TOOLS", "").split(",")
+    if item.strip())
 # The knob that ACTUALLY governs depth on this model: a reasoning model spends
 # its completion budget thinking before it writes anything, so reasoning
 # length tracks ``max_tokens`` rather than any effort hint. Left unset the
