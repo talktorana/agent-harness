@@ -374,11 +374,43 @@ def wait_until_idle(probe_fn, wait_sec: float, log=line_log,
 
 
 def confirm_still_idle(probe_fn, log=line_log,
-                       confirm_sec: float = CONFIRM_SEC) -> Tuple[str, str]:
-    """Re-probe once after a grace, so a run starting in the gap is caught."""
+                      confirm_sec: float = CONFIRM_SEC,
+                      waited_from: Optional[str] = None) -> Tuple[str, str]:
+    """Re-probe once after a grace, so a run starting in the gap is caught.
+
+    ``waited_from`` is the ``in_progress_since`` of the run this guard was
+    waiting for when it began waiting, if it waited. It exists because a
+    "wait" verdict here can mean two very different things, and only one of
+    them says "give the guard a bigger budget":
+
+      * SAME run still going -- the wait budget ran out before the run ended.
+        Raise ``--wait-sec`` (see :func:`wait_budget_verdict`).
+      * A DIFFERENT run -- the run you waited for DID end, and the scheduler
+        fired the next mission inside the 5-second gap. The wait succeeded.
+        Recreating now would kill a brand-new pass, so refusing is still
+        correct -- but the remedy is to re-arm, not to raise the budget.
+
+    Both poll on the same clock as the scheduler daemon (30s), and a job whose
+    cadence is shorter than its runs are already overdue when they finish, so
+    the second case is not exotic: it is what happens whenever a fix races the
+    cadence. Without this distinction the reason names only the new timestamp,
+    a caller concludes its budget was still too short, re-arms with a bigger
+    number, and hits the same window again.
+    """
     time.sleep(confirm_sec)
     sched, newest = probe_fn()
     action, reason = decide(sched, newest)
+    if action == "wait" and waited_from:
+        now_at = sched.get("in_progress_since")
+        if now_at and now_at != waited_from:
+            reason = (reason + "; NOTE this is a DIFFERENT run: the one you "
+                      "waited for (started %s) HAS finished -- %s started after "
+                      "it, in the %.0fs confirmation gap. The wait succeeded; "
+                      "re-arm this guard (do not raise --wait-sec, the budget "
+                      "was not the problem) or --force. Refusing is correct: "
+                      "recreating now would kill a mission that has done no "
+                      "work yet."
+                      % (waited_from, now_at, confirm_sec))
     log("[confirm] %s -- %s" % (action.upper(), reason))
     return action, reason
 
@@ -562,6 +594,12 @@ def main(argv: Optional[list] = None) -> int:
         return 2
     action, reason = decide(sched, newest)
     log("[probe] %s -- %s" % (action.upper(), reason))
+    #: Remember WHICH run this guard would be waiting for: the "wait" verdict
+    #: from the confirmation re-probe is only evidence about the wait budget if
+    #: it is still THE SAME run. (The probe above is unconditional, so this is
+    #: the right place to capture it.)
+    waited_from: Optional[str] = (sched.get("in_progress_since")
+                                  if sched.get("running") else None)
 
     # BEFORE building. The build is always safe, but it takes minutes, and the
     # operator's real decision -- "is my wait long enough for this run?" -- is
@@ -616,7 +654,8 @@ def main(argv: Optional[list] = None) -> int:
         # one we have already decided to destroy, so re-asking can only ever
         # return "wait".
         action, reason = confirm_still_idle(_probe, log=log,
-                                           confirm_sec=args.confirm_sec)
+                                           confirm_sec=args.confirm_sec,
+                                           waited_from=waited_from)
         if action == "refuse":
             log("REFUSING to recreate: %s" % reason)
             return 2
