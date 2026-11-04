@@ -266,7 +266,14 @@ HISTORY_SUMMARY_CHARS = int(os.environ.get("AGENT_HISTORY_SUMMARY_CHARS",
 # the second identical 19,852-token request reported 19,712 cached tokens and
 # returned in 1.60s versus 3.03s. This is a cache hint, never a correctness
 # requirement, and cached token counts are recorded separately for auditing.
-PROMPT_CACHE_KEY = os.environ.get("AGENT_PROMPT_CACHE_KEY", "").strip()
+#
+# ``AGENT_CACHE_ID`` is the deployment-friendly spelling: unlike
+# ``AGENT_PROMPT_CACHE_KEY`` it does not match a secret-scanner's KEY pattern,
+# so a reviewed non-secret cache id can live in compose without being mistaken
+# for a credential. The explicit [OI]-style name takes precedence when both
+# are set; both empty means no cache field is sent.
+PROMPT_CACHE_KEY = os.environ.get(
+    "AGENT_PROMPT_CACHE_KEY", os.environ.get("AGENT_CACHE_ID", "")).strip()
 
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the

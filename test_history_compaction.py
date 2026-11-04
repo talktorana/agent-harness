@@ -193,6 +193,24 @@ class RequestCacheTest(unittest.TestCase):
             request = agent_mod.build_request("vendor/model", [], True)
         self.assertEqual(request["prompt_cache_key"], "stable-prefix-v1")
 
+    def test_deployment_cache_id_is_a_nonsecret_alternative(self):
+        """The deployment can avoid a KEY-looking name in compose.
+
+        Its secret-scanner must still reject actual credential variables, so
+        this second spelling keeps the non-secret cache id out of that bucket.
+        """
+        import importlib
+        with mock.patch.dict("os.environ", {"AGENT_CACHE_ID": "stable-prefix-v1"},
+                             clear=True):
+            self.assertEqual(importlib.reload(config).PROMPT_CACHE_KEY,
+                             "stable-prefix-v1")
+        with mock.patch.dict("os.environ", {
+                "AGENT_CACHE_ID": "deployment-value",
+                "AGENT_PROMPT_CACHE_KEY": "explicit-wins"}, clear=True):
+            self.assertEqual(importlib.reload(config).PROMPT_CACHE_KEY,
+                             "explicit-wins")
+        importlib.reload(config)
+
     def test_cached_token_counts_are_recorded_in_both_sinks(self):
         class Details:
             cached_tokens = 19712

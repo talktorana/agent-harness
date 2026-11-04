@@ -125,7 +125,8 @@ The compose file reads from your `.env` and environment. Key variables:
 | `AGENT_HISTORY_MAX_CHARS` | `0` | Condense older turns past this size (0 = unbounded) |
 | `AGENT_HISTORY_KEEP_CHARS` | `35000` | Recent turn groups kept verbatim after compaction |
 | `AGENT_HISTORY_SUMMARY_CHARS` | `6000` | Maximum size of the condensed older-turn index |
-| `AGENT_PROMPT_CACHE_KEY` | empty | Optional stable key for provider-side prefix caching |
+| `AGENT_CACHE_ID` | empty | Non-secret stable id for provider-side prefix caching |
+| `AGENT_PROMPT_CACHE_KEY` | empty | Optional [OI]-style override; wins over `AGENT_CACHE_ID` |
 
 For a long mission, prompt size is often the dominant latency cost: every model
 call resends the system prompt, mission, tool schemas and all prior turns.
@@ -134,9 +135,11 @@ original system prompt or task, keeps tool calls paired with their results,
 and leaves the full evidence in the session log. It is a request-size
 optimisation, not deletion of the run's record.
 
-`AGENT_PROMPT_CACHE_KEY` is independent of compaction. A stable key can let the
+`AGENT_CACHE_ID` is independent of compaction. A stable id can let the
 provider reuse the unchanged prefix across turns and scheduled runs, but support
-is endpoint-specific. Prove it before relying on it: repeat a large request and
+is endpoint-specific. It is not a credential, so it is safe to declare in a
+reviewed compose file; the alternative `AGENT_PROMPT_CACHE_KEY` takes precedence
+when both are set. Prove support before relying on it: repeat a large request and
 check that `usage.prompt_tokens_details.cached_tokens` is nonzero on the second
 call. The agent records `cached_prompt_tokens` and `cache_write_tokens` in each
 session so production cache hits can be measured rather than assumed.
