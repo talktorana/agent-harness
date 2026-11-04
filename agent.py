@@ -714,6 +714,25 @@ class Agent:
             return getattr(config, "DEEP_REASONING_EFFORT", "") or config.REASONING_EFFORT
         return config.REASONING_EFFORT
 
+    def _route_demoted(self, label: str) -> bool:
+        """True once ``label`` has hit its per-run timeout limit.
+
+        The chain walk must consult this at the TOP of the loop, not only when a
+        timeout occurs. Until it did, demotion fired only on the turn where the
+        limit was crossed, so the NEXT turn re-tried the dead route from
+        attempt 1: a persistently slow primary was re-paid (up to
+        ``API_RETRIES x API_TIMEOUT_SEC`` per turn) on every turn and the run
+        never actually left it. Measured live 2026-11-04 14:29, one turn hit
+        the 3-timeout limit and emitted ``route_dead``, then the very next turn
+        called the same route again -- 535 s for a 4-tool pass that normally
+        runs ~90 s. That contradicts both this setting's own docstring and the
+        deployment mission brief: ``ROUTE_TIMEOUT_LIMIT`` "steps over a route
+        after that many timeouts IN THIS RUN."
+        """
+        limit = getattr(config, "ROUTE_TIMEOUT_LIMIT", 0)
+        timeouts = getattr(self, "_route_timeouts", {}).get(label, 0)
+        return limit > 0 and timeouts >= limit
+
     # ----------------------------------------------------------------- api
 
     def _client_for(self, resolved):
@@ -744,8 +763,37 @@ class Agent:
         chain = self.route_pairs
         problems: List[str] = []
 
+        #: Park, for THE REST OF THIS RUN, any route that already hit its
+        #: timeout limit on an earlier turn -- but only while another route can
+        #: still serve. If EVERY route is demoted (a broad provider outage),
+        #: skipping them all would leave nothing to call and the run would die;
+        #: a slow attempt is better than a hard api_error, so demotion is a
+        #: preference, never an absolute ban.
+        labels = [f"{prov}/{alias}" for prov, alias in chain]
+        demoted = [lab for lab in labels if self._route_demoted(lab)]
+        skip_demoted = bool(demoted) and len(demoted) < len(labels)
+
         for ridx, (prov, alias) in enumerate(chain):
             label = f"{prov}/{alias}"
+            if skip_demoted and self._route_demoted(label):
+                hits = getattr(self, "_route_timeouts", {}).get(label, 0)
+                why = (f"{label}: parked for this run ({hits} timeouts, limit "
+                       f"{config.ROUTE_TIMEOUT_LIMIT})")
+                problems.append(why)
+                self._say(f"\n\033[33m[route] {label} already hit its "
+                          f"per-run timeout limit ({hits}) -- trying next "
+                          f"route\033[0m")
+                #: Auditable: a parked route must be visible in the record, or
+                #: a later pass sees it vanish from the chain with no reason.
+                self._log({"event": "route_skipped", "route": label,
+                           "timeouts": hits})
+                if self.session:
+                    try:
+                        self.session.event("route_skipped", route=label,
+                                           timeouts=hits)
+                    except Exception:  # noqa: BLE001 -- never let logging kill a run
+                        pass
+                continue
             try:
                 resolved = llm.resolve(prov, alias)
             except llm.ProviderError as exc:
