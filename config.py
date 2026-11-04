@@ -239,6 +239,35 @@ ROUTE_TIMEOUT_LIMIT = int(os.environ.get("AGENT_ROUTE_TIMEOUT_LIMIT", "4") or "0
 #: only the model knows whether that is what it is doing. 0 disables it.
 DUPLICATE_CALL_NOTICE = int(os.environ.get("AGENT_DUPLICATE_CALL_NOTICE",
                                            "1") or "0")
+
+# --- bounded request history ----------------------------------------------
+# Every model call resends ``messages``. Left unbounded, the Nth turn costs
+# several times the first: measured 2026-11-04, one mission's prompt grew
+# 25,298 -> 121,248 tokens and totalled 9.56 million prompt tokens across 123
+# calls. ``HISTORY_MAX_CHARS`` is the point at which older COMPLETE turn groups
+# are condensed into a small index; the original system prompt and task are
+# never rewritten. ``HISTORY_KEEP_CHARS`` bounds the recent groups kept
+# verbatim, and ``HISTORY_SUMMARY_CHARS`` bounds the index itself. The full
+# evidence remains in the session log, so this is a request-size optimisation,
+# not deletion of the run's record.
+#
+# 0 disables compaction and preserves the original behaviour exactly. A
+# deployment enabling it should choose a budget that leaves room for the static
+# system/task/tool prefix, not merely a number that sounds small.
+HISTORY_MAX_CHARS = int(os.environ.get("AGENT_HISTORY_MAX_CHARS", "0") or "0")
+HISTORY_KEEP_CHARS = int(os.environ.get("AGENT_HISTORY_KEEP_CHARS", "35000")
+                        or "35000")
+HISTORY_SUMMARY_CHARS = int(os.environ.get("AGENT_HISTORY_SUMMARY_CHARS",
+                                           "6000") or "6000")
+# Optional [OI]-style prompt-cache key. Empty sends NO field, which is the safe
+# default for endpoints that do not recognise it. A stable value lets the
+# provider reuse the unchanged system/task/tool prefix across turns and runs;
+# the conversation suffix still changes normally. Measured on a real gateway:
+# the second identical 19,852-token request reported 19,712 cached tokens and
+# returned in 1.60s versus 3.03s. This is a cache hint, never a correctness
+# requirement, and cached token counts are recorded separately for auditing.
+PROMPT_CACHE_KEY = os.environ.get("AGENT_PROMPT_CACHE_KEY", "").strip()
+
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the
 # context window in one turn.

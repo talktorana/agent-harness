@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 import config
+import history
 import llm
 import run_settings
 import storage
@@ -309,6 +310,8 @@ def build_request(model: str, messages: list, use_tools: bool) -> dict:
         request["max_tokens"] = config.MAX_TOKENS
     if config.REASONING_EFFORT:
         request["reasoning_effort"] = config.REASONING_EFFORT
+    if getattr(config, "PROMPT_CACHE_KEY", ""):
+        request["prompt_cache_key"] = config.PROMPT_CACHE_KEY
     if use_tools:
         request["tools"] = TOOLS
         request["tool_choice"] = "auto"
@@ -473,12 +476,19 @@ class Agent:
         details = (getattr(usage, "completion_tokens_details", None)
                    or getattr(usage, "completion_tokens_detail", None))
         reasoning = getattr(details, "reasoning_tokens", None) if details else None
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
         record: Dict[str, Any] = {
             "event": "model_usage",
             "route": label,
             "prompt_tokens": getattr(usage, "prompt_tokens", None),
             "completion_tokens": getattr(usage, "completion_tokens", None),
             "reasoning_tokens": reasoning,
+            #: Prompt-cache evidence, reported by the provider rather than
+            #: inferred from our request. Absent stays absent (never a fake 0).
+            "cached_prompt_tokens": (getattr(prompt_details, "cached_tokens", None)
+                                     if prompt_details else None),
+            "cache_write_tokens": (getattr(prompt_details, "cache_write_tokens", None)
+                                   if prompt_details else None),
             #: The configured depth travels with the measurement. Without it a
             #: reader has a number and no context for whether it is expected.
             "reasoning_effort": config.REASONING_EFFORT or None,
@@ -825,6 +835,39 @@ class Agent:
 
         raise RuntimeError("; ".join(problems) or "no route available")
 
+    def _compact_history(self) -> None:
+        """Bound the request's conversation history at complete turn groups.
+
+        Called before every model turn. The original system prompt and task
+        stay put; older turns become a small index pointing at the SessionLog.
+        A malformed budget is reported and leaves the history untouched rather
+        than killing a monitoring pass for a configuration error.
+        """
+        if not getattr(config, "HISTORY_MAX_CHARS", 0):
+            return
+        session_file = (self.session.jsonl_path.name
+                        if self.session is not None else "")
+        try:
+            compacted, info = history.compact_history(
+                self.messages,
+                max_chars=config.HISTORY_MAX_CHARS,
+                keep_chars=config.HISTORY_KEEP_CHARS,
+                summary_chars=config.HISTORY_SUMMARY_CHARS,
+                session_file=session_file)
+        except Exception as exc:  # noqa: BLE001
+            self._log({"event": "history_warning",
+                       "error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        if info is None:
+            return
+        self.messages = compacted
+        self._log({"event": "history_compacted", **info})
+        if self.session is not None:
+            try:
+                self.session.event("history_compacted", **info)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _repeat_count(self, name: str, args: Dict[str, Any]) -> int:
         """How many times this exact call has happened so far, this call included.
 
@@ -901,6 +944,7 @@ class Agent:
                 "available. Be concise. Mark anything you did not manage to "
                 "verify as UNVERIFIED rather than omitting it."),
         })
+        self._compact_history()
         try:
             response = self._complete(use_tools=False)
             return (response.choices[0].message.content or "").strip()
@@ -1102,6 +1146,7 @@ class Agent:
                            "remaining": remaining})
                 if self.session:
                     self.session.assistant(f"[step budget] {remaining} left")
+            self._compact_history()
             try:
                 response = self._complete()
             except Exception as exc:  # noqa: BLE001
