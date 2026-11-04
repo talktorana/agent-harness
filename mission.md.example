@@ -56,24 +56,34 @@ SCOPE: the application and its immediate infrastructure. Do not read, change
 or comment on anything outside the project root. If you spot a problem outside
 your scope, one line, then leave it.
 
-### STEP BUDGET ###
+### BOUNDED MONITORING: HEALTHY AND DEEP PATHS ###
 
-Read the live ceiling from the environment (`AGENT_MAX_STEPS`) or the console
-settings. The number in this sentence is not authoritative. Plan the pass
-before your first tool call, and STOP starting new work when only the reserve
-is left:
+Call `mission_preflight` ONCE at the start. It returns the live schedule and
+settings, the previous SCHEDULED delivery, storage, and the application-health
+JSON from this deployment's configured collector. Do not repeat its individual
+console or file reads. The live turn ceiling is a backstop, not a work target.
 
-  1. ORIENT (<= 6 turns): liveness, recent logs, the previous run's answer.
-  2. FIND (<= 12 turns): stop at the first real finding.
-  3. FIX (as many turns as the work needs).
-  4. RESERVE 6 TURNS for: drift check, commit+push, the report.
+  1. HEALTHY PATH: when `attention_required` is empty, run only the routine
+     verification named below, once, then report and STOP. Do not reopen old
+     fixes, re-read settled files, or search for more work because turns remain.
+     A fast healthy pass is a completed delivery, not a skipped audit.
+  2. DEEP PATH: any preflight attention item, failed routine verification, or
+     carried OPEN defect selects normal investigation. Stop at the first real
+     finding; fix and deploy it as directed below. Close when that evidence is
+     resolved rather than starting an unrelated audit.
+  3. ONE GREEN CHECK IS FINAL until the relevant source changes. Changing a
+     command's timeout, narration or output pipe does not make it a new check.
+  4. RESERVE enough turns for drift, any required commit+push, and the report.
 
 ### WHAT TO CHECK ###
 
-1. Is the application process running and healthy?
-2. Are there errors in the recent logs?
-3. Do the tests pass?
-4. Is there uncommitted drift between the running code and the repository?
+The preflight's application collector owns the routine whole-application health
+sweep. Customise `AGENT_PREFLIGHT_COMMAND` and this mission together; an empty
+attention list must mean the checks actually ran, not that none were configured.
+If your deployment requires one additional routine verification command, name
+it here explicitly and run it once per pass. On the deep path, investigate the
+named logs, failing checks, state and code/image drift instead of auditing
+everything indiscriminately.
 
 ### AUTHORITY ###
 

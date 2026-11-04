@@ -227,12 +227,23 @@ key you just pasted in — the file looks right and the run still returns 401.
 | `write_file` | create or overwrite a file (asks first) |
 | `search` | regex search returning `file:line: text` |
 | `run_python` | analysis in a persistent interpreter |
+| `mission_preflight` | one read-only orientation snapshot: schedule, prior scheduled delivery, storage and configured application health |
 | `memory_read` / `memory_search` | read and search memory |
 | `memory_append` / `memory_revise` / `memory_retire` | write and correct it |
 | `memory_status` | what memory exists and where it lives |
 
 Adding one is a description and a function. **The description is the product**
 — the model chooses tools from it, so say when to use it and what it returns.
+
+## Keeping scheduled missions fast
+
+History compaction, optional provider prefix caching and adaptive reasoning are
+automatic after one-time setup; no recurring cache-maintenance job is needed.
+For bounded monitoring, `mission_preflight` merges harness orientation with a
+deployment-owned health command. An empty attention list selects a short healthy
+path; any evidence selects normal investigation. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) for configuration, cache-expiry
+semantics, the JSON contract and measurement guidance.
 
 ## Resilience
 

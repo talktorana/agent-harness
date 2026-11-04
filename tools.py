@@ -29,6 +29,7 @@ from tools_browser import (browser_click, browser_close, browser_navigate,
 from tools_git import (git_commit, git_diff, git_log, git_restore, git_show,
                        git_status)
 from tools_media import view_image
+from tools_preflight import mission_preflight
 from tools_repo_map import repo_map
 from tools_safety import guard_command, operator_prompt_ok
 from tools_session import session_list, session_read, session_search
@@ -757,6 +758,16 @@ TOOLS = [
         ["pattern"],
     ),
     _fn(
+        "mission_preflight",
+        "ONE read-only orientation call for a monitoring pass: schedule and "
+        "live settings, the previous SCHEDULED delivery (never chat smoke "
+        "tests), storage, and deployment-configured application health. Call "
+        "once at mission start. If attention_required is empty and "
+        "fast_path_eligible is true, do not rediscover those facts with "
+        "individual commands; any attention item selects the deep path.",
+        {}, [],
+    ),
+    _fn(
         "manage_todo_list",
         "Publish your plan and its progress. Replace the WHOLE list each time "
         "with items {id, title, status in not-started|in-progress|completed}; "
@@ -974,6 +985,7 @@ HANDLERS = {
     "session_list": session_list,
     "session_read": session_read,
     "session_search": session_search,
+    "mission_preflight": mission_preflight,
     "manage_todo_list": manage_todo_list,
     "todo_show": todo_show,
     "run_subagent": run_subagent,

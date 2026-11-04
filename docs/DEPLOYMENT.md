@@ -127,6 +127,13 @@ The compose file reads from your `.env` and environment. Key variables:
 | `AGENT_HISTORY_SUMMARY_CHARS` | `6000` | Maximum size of the condensed older-turn index |
 | `AGENT_CACHE_ID` | empty | Non-secret stable id for provider-side prefix caching |
 | `AGENT_PROMPT_CACHE_KEY` | empty | Optional [OI]-style override; wins over `AGENT_CACHE_ID` |
+| `AGENT_REASONING_EFFORT` | empty | Base reasoning effort; measure per route |
+| `AGENT_DEEP_REASONING_EFFORT` | empty | Optional one-way deeper effort after evidence |
+| `AGENT_DEEP_REASONING_TRIGGER` | empty | `||`-separated result markers that trigger escalation |
+| `AGENT_DEEP_REASONING_TOOLS` | empty | Comma-separated tool names that trigger escalation |
+| `AGENT_PREFLIGHT_COMMAND` | empty | Read-only application-health command printing the documented JSON contract |
+| `AGENT_PREFLIGHT_REQUIRE_COMMAND` | `1` | Missing collector selects deep path; set `0` only for harness-only monitoring |
+| `AGENT_PREFLIGHT_TIMEOUT_SEC` | `45` | Bound the application-health command |
 
 For a long mission, prompt size is often the dominant latency cost: every model
 call resends the system prompt, mission, tool schemas and all prior turns.
@@ -143,6 +150,13 @@ when both are set. Prove support before relying on it: repeat a large request an
 check that `usage.prompt_tokens_details.cached_tokens` is nonzero on the second
 call. The agent records `cached_prompt_tokens` and `cache_write_tokens` in each
 session so production cache hits can be measured rather than assumed.
+
+These are **one-time fixes, not periodic cache-maintenance work**. Compaction
+and provider caching operate automatically; cache expiry simply produces a
+normal uncached request. Revisit settings only when measurements change, and do
+not rotate a stable cache id on a schedule. See [PERFORMANCE.md](PERFORMANCE.md)
+for the complete operations model, `mission_preflight`, the healthy/deep mission
+policy and adaptive-reasoning rollout.
 
 ### Start
 

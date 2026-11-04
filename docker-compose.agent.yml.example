@@ -70,6 +70,27 @@ services:
       # --- model behaviour -------------------------------------------------
       AGENT_MAX_TOKENS: "${AGENT_MAX_TOKENS:-32000}"
       AGENT_REASONING_EFFORT: "${AGENT_REASONING_EFFORT:-max}"
+      # Optional deeper effort for the REST of a run after evidence. Empty
+      # deep effort preserves fixed-effort behaviour. Markers use ||; tools
+      # use commas. See docs/PERFORMANCE.md before enabling adaptive depth.
+      AGENT_DEEP_REASONING_EFFORT: "${AGENT_DEEP_REASONING_EFFORT:-}"
+      AGENT_DEEP_REASONING_TRIGGER: "${AGENT_DEEP_REASONING_TRIGGER:-}"
+      AGENT_DEEP_REASONING_TOOLS: "${AGENT_DEEP_REASONING_TOOLS:-}"
+      # --- request size and provider prefix cache --------------------------
+      # OFF by default for backward compatibility. Once configured, these run
+      # automatically: no periodic cache flush/warm-up mission is required.
+      AGENT_HISTORY_MAX_CHARS: "${AGENT_HISTORY_MAX_CHARS:-0}"
+      AGENT_HISTORY_KEEP_CHARS: "${AGENT_HISTORY_KEEP_CHARS:-35000}"
+      AGENT_HISTORY_SUMMARY_CHARS: "${AGENT_HISTORY_SUMMARY_CHARS:-6000}"
+      AGENT_CACHE_ID: "${AGENT_CACHE_ID:-}"
+      AGENT_PROMPT_CACHE_KEY: "${AGENT_PROMPT_CACHE_KEY:-}"
+      # --- one-call monitoring orientation ---------------------------------
+      # The deployment owns application health. Its read-only command prints
+      # fast_path_eligible plus attention_required; no application rules here.
+      AGENT_PREFLIGHT_COMMAND: "${AGENT_PREFLIGHT_COMMAND:-}"
+      AGENT_PREFLIGHT_REQUIRE_COMMAND: "${AGENT_PREFLIGHT_REQUIRE_COMMAND:-1}"
+      AGENT_PREFLIGHT_TIMEOUT_SEC: "${AGENT_PREFLIGHT_TIMEOUT_SEC:-45}"
+      AGENT_CONSOLE_URL: "${AGENT_CONSOLE_URL:-http://127.0.0.1:8787}"
       # --- provider configuration ------------------------------------------
       # Catalogue and routes are mounted read-only from the host. The agent
       # reads them; it does not edit them.

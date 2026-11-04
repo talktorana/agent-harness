@@ -285,6 +285,22 @@ HISTORY_SUMMARY_CHARS = int(os.environ.get("AGENT_HISTORY_SUMMARY_CHARS",
 PROMPT_CACHE_KEY = os.environ.get(
     "AGENT_PROMPT_CACHE_KEY", os.environ.get("AGENT_CACHE_ID", "")).strip()
 
+# --- one-call mission orientation ------------------------------------------
+# The generic harness owns schedule/settings/run-history evidence. A deployment
+# owns its application health checks and supplies them as ONE read-only command
+# that prints a JSON object with ``fast_path_eligible`` (bool) and
+# ``attention_required`` (list of strings). No shell is used and no project-
+# specific filenames or health rules live in this repository. Requiring the
+# command by default prevents a harness-only snapshot being mistaken for proof
+# that an unexamined application is healthy.
+PREFLIGHT_COMMAND = os.environ.get("AGENT_PREFLIGHT_COMMAND", "").strip()
+PREFLIGHT_REQUIRE_COMMAND = os.environ.get(
+    "AGENT_PREFLIGHT_REQUIRE_COMMAND", "1") != "0"
+PREFLIGHT_TIMEOUT_SEC = float(os.environ.get("AGENT_PREFLIGHT_TIMEOUT_SEC", "45"))
+PREFLIGHT_ANSWER_CHARS = int(os.environ.get("AGENT_PREFLIGHT_ANSWER_CHARS", "6000"))
+PREFLIGHT_CONSOLE_URL = os.environ.get(
+    "AGENT_CONSOLE_URL", "http://127.0.0.1:8787").rstrip("/")
+
 # Tool results are truncated to this many characters. Large enough to carry a
 # test failure or a diff, small enough that a 200 KB log dump cannot drown the
 # context window in one turn.
