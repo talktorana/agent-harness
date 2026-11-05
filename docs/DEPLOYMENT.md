@@ -134,6 +134,26 @@ The compose file reads from your `.env` and environment. Key variables:
 | `AGENT_PREFLIGHT_COMMAND` | empty | Read-only application-health command printing the documented JSON contract |
 | `AGENT_PREFLIGHT_REQUIRE_COMMAND` | `1` | Missing collector selects deep path; set `0` only for harness-only monitoring |
 | `AGENT_PREFLIGHT_TIMEOUT_SEC` | `45` | Bound the application-health command |
+| `AGENT_REFERENCES_DIR` | `./references` | Optional read-only reference documents mounted at `/agent-references` |
+| `AGENT_SCRATCH_DIR` | unset | Scratch root to bound with `retention.prune_scratch()` |
+| `AGENT_SCRATCH_MAX_AGE_HOURS` | `168` | Delete scratch older than this age |
+| `AGENT_SCRATCH_GRACE_HOURS` | `48` | Never delete anything written this recently |
+
+**Mount reference documents OUTSIDE the project root.** `/project` is a
+read-only bind mount. A nested bind such as `/project/references` requires
+Docker to create that directory through the read-only parent, so container
+initialization fails before the agent starts. Mount references at
+`/agent-references` instead; keep the project, provider catalogue, routes,
+schedule and deploy policy read-only. The mission template shows how to tell the
+agent to compare implementation and versioned reference documents without
+guessing which is authoritative when they disagree.
+
+`retention.prune_scratch()` provides bounded cleanup for candidate work created
+by an agent. It is opt-in, not a background deletion loop. A pending request
+whose text names an entry protects it, including a nested file path; a fresh
+file inside an old directory keeps that directory. The host-side maintenance
+script applies the equivalent protection for the deployment's scratch directory
+with `find -depth -delete`, a bounded timeout and a dry-run mode.
 
 For a long mission, prompt size is often the dominant latency cost: every model
 call resends the system prompt, mission, tool schemas and all prior turns.

@@ -140,6 +140,12 @@ services:
       - ${PROJECT_DIR:-../project}:/project:ro
       # Agent configuration. READ-ONLY. Providers, routes, schedule, policy.
       - ${AGENT_CONFIG_DIR:-./config}:/agent-config:ro
+      # Optional read-only reference material (versioned specs, runbooks or
+      # other documentation the mission must consult). Defaults OFF. Mount it
+      # OUTSIDE the project root: Docker cannot create a nested mountpoint under
+      # a read-only parent bind, so /project/references would make container
+      # creation fail before the agent starts. See docs/DEPLOYMENT.md.
+      - ${AGENT_REFERENCES_DIR:-./references}:/agent-references:ro
       # Agent state. READ-WRITE. Everything the agent remembers or records.
       - ${AGENT_DATA_DIR:-./agent-data}:/agent-data
       # Writable scratch for staging work.

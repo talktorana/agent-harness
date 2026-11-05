@@ -23,6 +23,11 @@ write a mission instead of the mission itself.
 4. **The evidence standard**: what counts as "done" -- a command, a file, a
    test result, a diff?
 5. **The output format**: what should the report look like?
+6. **The evidence base**: when judging intended application behavior, read both
+   the implementation and any versioned reference documents. If they disagree,
+   report that disagreement rather than silently choosing one. Mount those
+   references read-only at `/agent-references` (outside the project root) and
+   customise the paths in the prompt below.
 
 ## What NOT to put here
 
@@ -84,6 +89,12 @@ If your deployment requires one additional routine verification command, name
 it here explicitly and run it once per pass. On the deep path, investigate the
 named logs, failing checks, state and code/image drift instead of auditing
 everything indiscriminately.
+
+When judging INTENDED behavior, read both the implementation and the versioned
+reference documents mounted at `/agent-references` (if this deployment provides
+them). A document and the code disagreeing is a finding to report, not something
+to resolve by silently choosing either. Check the eventual real outcome after a
+corrective change; an applied receipt is not proof that the behavior recovered.
 
 ### AUTHORITY ###
 

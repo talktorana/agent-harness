@@ -65,10 +65,21 @@ def manifest_from_dockerfile(root: Path) -> List[str]:
     return sorted(set(files))
 
 
+def content_md5(payload: bytes) -> str:
+    """MD5 of the CONTENT, with line endings normalised to LF.
+
+    Checkouts on one OS and hosts on another routinely use different line
+    endings. Hashing raw bytes reports that as a code difference forever, which
+    makes a correct installation look stale and can lead an operator to replace
+    good content. Actual source bytes still change the hash.
+    """
+    return hashlib.md5(payload.replace(b"\r\n", b"\n")).hexdigest()
+
+
 def md5(path: Path) -> str:
-    """MD5 of the file's bytes, or empty if unreadable."""
+    """Normalized content hash, truncated for the drift table."""
     try:
-        return hashlib.md5(path.read_bytes()).hexdigest()[:16]
+        return content_md5(path.read_bytes())[:16]
     except OSError:
         return ""
 
@@ -83,8 +94,10 @@ def compare_host(host_root: str, manifest: List[str]) -> Dict[str, str]:
     result = {}
     for name in manifest:
         path = os.path.join(host_root, name)
+        # Normalize line endings on the remote side too, or a correct LF host
+        # copy never equals a CRLF checkout on a workstation.
         proc = subprocess.run(
-            ["ssh", HOST, f"md5sum {path} 2>/dev/null | cut -d' ' -f1"],
+            ["ssh", HOST, f"tr -d '\\r' < {path} 2>/dev/null | md5sum | cut -d' ' -f1"],
             capture_output=True, text=True, timeout=30,
         )
         result[name] = proc.stdout.strip()[:16] if proc.returncode == 0 else ""
@@ -97,7 +110,7 @@ def compare_image(image: str, manifest: List[str]) -> Dict[str, str]:
     for name in manifest:
         proc = subprocess.run(
             ["sudo", "docker", "run", "--rm", "--entrypoint", "sh",
-             image, "-c", f"md5sum /harness/{name} 2>/dev/null | cut -d' ' -f1"],
+             image, "-c", f"tr -d '\\r' < /harness/{name} 2>/dev/null | md5sum | cut -d' ' -f1"],
             capture_output=True, text=True, timeout=30,
         )
         result[name] = proc.stdout.strip()[:16] if proc.returncode == 0 else ""
