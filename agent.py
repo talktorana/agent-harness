@@ -382,6 +382,7 @@ class Agent:
         #: the active value makes provider usage attributable to the ACTUAL
         #: request, not merely the base environment setting.
         self._deep_reasoning = False
+        self._route_reasoning_efforts = llm.route_reasoning_efforts()
         self._active_reasoning_effort = config.REASONING_EFFORT
         #: Set to the elapsed seconds when the WALL-CLOCK bound ends the run,
         #: and only then. It is the difference between "ran out of turns" and
@@ -814,7 +815,15 @@ class Agent:
                 self._record_usage(usage, _label)
 
             for attempt in range(config.API_RETRIES):
+                # A route may declare its own base effort. Apply it only while
+                # this route is active, so a max-effort option does not change
+                # unrelated models; an evidence-triggered deep escalation still
+                # takes precedence for the rest of the run.
+                route_effort = getattr(self, "_route_reasoning_efforts", {}).get(
+                    (prov, alias), "")
                 effort = self._next_reasoning_effort()
+                if route_effort and not getattr(self, "_deep_reasoning", False):
+                    effort = route_effort
                 self._active_reasoning_effort = effort
                 # Recorded BEFORE the request so that a hung call leaves a
                 # trail: the last event in the session says which model we

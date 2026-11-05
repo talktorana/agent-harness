@@ -414,6 +414,35 @@ def configured_chain() -> List[Tuple[str, str]]:
     return _routes_from_file()
 
 
+def route_reasoning_efforts() -> Dict[Tuple[str, str], str]:
+    """Optional per-route reasoning effort from ``routes.json``.
+
+    The route file remains backward compatible: entries without
+    ``reasoning_effort`` inherit the run-wide setting. A route that declares it
+    uses that effort as its base whenever it is selected, including as a
+    fallback. This is deliberately keyed by (provider, alias), not by the wire
+    model id, because aliases are the stable user-facing choice.
+    """
+    if os.environ.get("AGENT_ROUTES", "").strip() or not ROUTES_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(ROUTES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProviderError(f"{ROUTES_FILE} is not readable JSON: {exc}")
+    raw = data.get("routes") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        raise ProviderError(f"{ROUTES_FILE.name}: 'routes' must be a list.")
+    result: Dict[Tuple[str, str], str] = {}
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("model"):
+            continue
+        effort = str(item.get("reasoning_effort") or "").strip()
+        if effort:
+            provider = str(item.get("provider") or default_choice()[0]).strip()
+            result[(provider, str(item["model"]).strip())] = effort
+    return result
+
+
 def route_chain(provider: Optional[str] = None,
                 model: Optional[str] = None) -> List[Tuple[str, str]]:
     """The full ordered fallback chain for a request.
