@@ -616,6 +616,41 @@ class Agent:
         if handler is None:
             return (f"UNKNOWN TOOL: {name}. Available: {sorted(HANDLERS)}",
                     f"UNKNOWN TOOL: {name}. Available: {sorted(HANDLERS)}")
+        #: Refuse an exact repeat that has already run ``DUPLICATE_CALL_LIMIT``
+        #: times in this run. This is the enforceable half of the duplicate
+        #: machinery: the notice informs and was ignored 123 times in one
+        #: measured run, so past a generous polling allowance the call is not
+        #: executed at all. Recorded through the normal action/log paths so an
+        #: audit still sees every ATTEMPT, and returned as text rather than
+        #: raised so a refusal can never end a run.
+        limit = getattr(config, "DUPLICATE_CALL_LIMIT", 0)
+        if limit > 0 and self._repeat_count(name, args) >= limit:
+            attempt = self._next_repeat_count(name, args)
+            refusal = (
+                f"REFUSED: this exact {name} call has already been made "
+                f"{attempt} times in this run (repeat cap "
+                f"{limit}). It was NOT executed, so nothing has changed since "
+                f"the previous identical results. Do not send it again: either "
+                f"change the arguments to ask a DIFFERENT question, use "
+                f"information you already have, stage the fix you have already "
+                f"diagnosed, or write your final report. Set "
+                f"AGENT_DUPLICATE_CALL_LIMIT=0 to disable this cap.")
+            self._say(f"\n\033[36m[{name}]\033[0m "
+                      f"{json.dumps(args, default=str)[:300]}")
+            self._say(f"\033[33m{refusal}\033[0m")
+            self._log({"event": "duplicate_call_blocked", "tool": name,
+                       "args_hash": session_mod.args_hash(args),
+                       "repeats": attempt, "limit": limit})
+            if self.session is not None:
+                try:
+                    self.session.event(
+                        "duplicate_call_blocked", tool=name,
+                        args_hash=session_mod.args_hash(args),
+                        repeats=attempt, limit=limit)
+                    self.session.action(self.steps, name, args, refusal, 0.0)
+                except Exception:  # noqa: BLE001 -- never let recording kill a run
+                    pass
+            return refusal, refusal
         self._say(f"\n\033[36m[{name}]\033[0m "
                   f"{json.dumps(args, default=str)[:300]}")
         started = time.monotonic()
@@ -994,6 +1029,20 @@ class Agent:
         return self._call_fingerprints.get(
             session_mod.fingerprint(name, args), 0)
 
+    def _next_repeat_count(self, name: str, args: Dict[str, Any]) -> int:
+        """Record this attempt and return its ordinal for an exact repeat.
+
+        The SINGLE place the fingerprint counter is incremented, used by both
+        the notice path (a call that ran and repeated) and the refusal path (a
+        call stopped before running). Two independent increments would
+        double-count and make the number in the log, the notice and the refusal
+        disagree -- the audit property ``_repeat_count`` exists to protect.
+        """
+        key = session_mod.fingerprint(name, args)
+        seen = self._call_fingerprints.get(key, 0) + 1
+        self._call_fingerprints[key] = seen
+        return seen
+
     def _duplicate_call_notice(self, name: str,
                                args: Dict[str, Any]) -> Optional[str]:
         """A notice when this exact call has already been made in this run.
@@ -1019,9 +1068,7 @@ class Agent:
         case it is in, so the notice states the fact, states that it is not
         blocked, and names both readings instead of assuming the wasteful one.
         """
-        key = session_mod.fingerprint(name, args)
-        seen = self._call_fingerprints.get(key, 0) + 1
-        self._call_fingerprints[key] = seen
+        seen = self._next_repeat_count(name, args)
         if seen < 2 or not getattr(config, "DUPLICATE_CALL_NOTICE", 1):
             return None
         return (

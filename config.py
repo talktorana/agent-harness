@@ -249,6 +249,22 @@ ROUTE_TIMEOUT_LIMIT = int(os.environ.get("AGENT_ROUTE_TIMEOUT_LIMIT", "4") or "0
 #: only the model knows whether that is what it is doing. 0 disables it.
 DUPLICATE_CALL_NOTICE = int(os.environ.get("AGENT_DUPLICATE_CALL_NOTICE",
                                            "1") or "0")
+#: Refuse an EXACT repeated tool call once it has already been made this many
+#: times in one run. The notice above tells the model it is repeating itself;
+#: this stops it. Both are needed, because the notice alone was measured to be
+#: insufficient at scale -- 2026-11-06 run `25599ed1` made 1,285 tool calls
+#: CONTAINING 123 exact repeats after each one had already been told it was a
+#: repeat, burned 382 turns, staged no deploy, and self-reported FAILED
+#: DELIVERY; the next run made 981 calls (43 repeats) and hit the wall clock.
+#: A line the model has already ignored 123 times is not a lever.
+#:
+#: The allowance is deliberately generous so legitimate polling keeps working:
+#: the first DUPLICATE_CALL_LIMIT identical calls execute normally, which is far
+#: more than draining one asynchronous receipt needs. Refusal returns text
+#: instead of running the tool -- it never raises, so a blocked repeat cannot
+#: end a run. 0 disables this and restores pure notice behaviour.
+DUPLICATE_CALL_LIMIT = int(os.environ.get("AGENT_DUPLICATE_CALL_LIMIT",
+                                          "8") or "0")
 
 # --- bounded request history ----------------------------------------------
 # Every model call resends ``messages``. Left unbounded, the Nth turn costs
