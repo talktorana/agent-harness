@@ -24,6 +24,16 @@ import retention
 import sync_source
 
 ROOT = Path(__file__).resolve().parent
+#: The compose EXAMPLE is a non-Python artifact, and the image copies only
+#: `*.py`. Inside a built image this path does not exist, so the two assertions
+#: that read it must be gated on its presence rather than erroring -- a red
+#: suite in the shipped image is worse than a skipped assertion, because every
+#: later image verification then reads FAILED and stops being believed. In a
+#: checkout the file is present and both assertions run in full.
+COMPOSE_EXAMPLE = ROOT / "docker-compose.agent.yml.example"
+COMPOSE_EXAMPLE_WHY = (
+    "requires the checkout artifact docker-compose.agent.yml.example, which is "
+    "not present inside the built image (it copies only *.py)")
 
 
 class ReadOnlyReferenceMountTest(unittest.TestCase):
@@ -36,6 +46,7 @@ class ReadOnlyReferenceMountTest(unittest.TestCase):
         self.assertIn("AGENT_REFERENCES_DIR", text)
         return text
 
+    @unittest.skipUnless(COMPOSE_EXAMPLE.is_file(), COMPOSE_EXAMPLE_WHY)
     def test_reference_mount_is_outside_the_read_only_project_root(self):
         text = self._document()
         volume_lines = [line.strip() for line in text.splitlines()
@@ -53,6 +64,7 @@ class ReadOnlyReferenceMountTest(unittest.TestCase):
         self.assertTrue(any("/project:ro" in line for line in volume_lines),
                         "the target application must remain read-only")
 
+    @unittest.skipUnless(COMPOSE_EXAMPLE.is_file(), COMPOSE_EXAMPLE_WHY)
     def test_reference_mount_does_not_disable_the_project_or_config_guards(self):
         text = self._document()
         self.assertIn("${AGENT_CONFIG_DIR:-./config}:/agent-config:ro", text)
