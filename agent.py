@@ -1338,7 +1338,14 @@ class Agent:
 
             if not tool_calls:
                 # The model has stopped asking for tools: it is answering.
-                answer = msg.content or ""
+                answer = (msg.content or "").strip()
+                if not answer:
+                    # Model stopped calling tools but emitted empty content (e.g.
+                    # reasoning consumed all tokens or gateway emitted empty completion).
+                    # Rather than logging an empty answer and closing 'ok', salvage
+                    # a written report through _final_answer with tools disabled.
+                    self._say("\n\033[33m[empty answer turn] salvaging report via _final_answer\033[0m")
+                    answer = self._final_answer("The previous turn emitted no text.")
                 self._log({"event": "answer", "steps": step, "text": answer})
                 if self.session:
                     self.session.answer(answer)
