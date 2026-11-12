@@ -394,13 +394,17 @@ RUNS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <script>
 const NICE={ok:'ok',success:'ok',running:'running',no_end_record:'no end record',
             error:'error',failed:'failed',timeout:'timeout',crashed:'crashed',
+            stopped:'stopped',
             step_limit_with_answer:'step limit (partial)',
-            step_limit:'step limit (no answer)'};
-// 'step_limit_with_answer' really occurs: the agent ran out of steps but still
-// produced a report. Colouring that red would train an operator to ignore red,
-// which is the opposite of what a status column is for.
+            step_limit:'step limit (no answer)',
+            time_limit_with_answer:'time limit (partial)',
+            time_limit:'time limit (no answer)'};
+// 'step_limit_with_answer' and 'time_limit_with_answer' really occur: the agent
+// ran out of steps or wall-clock time but still produced a report. Colouring
+// those red would train an operator to ignore red, which is the opposite of
+// what a status column is for.
 function cls(s){return s==='ok'||s==='success'?'ok':
-                    (s==='running'||s==='step_limit_with_answer'?'warn':'bad');}
+                    (s==='running'||s==='stopped'||s==='step_limit_with_answer'||s==='time_limit_with_answer'?'warn':'bad');}
 function ago(iso){
   if(!iso)return '';
   const t=Date.parse(iso); if(isNaN(t))return iso;

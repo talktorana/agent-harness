@@ -107,7 +107,8 @@ def is_forbidden(target: str) -> bool:
 #: Cache for the policy's refuse list, invalidated on mtime. Re-read every call
 #: would stat and parse a file per target; caching forever would miss an
 #: operator tightening the policy while the web UI process keeps running.
-_POLICY_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "forbid": None}
+_POLICY_CACHE: Dict[str, Any] = {"path": None, "mtime": None, "forbid": None,
+                                  "target_map": None}
 
 
 def reset_policy_cache() -> None:
@@ -117,7 +118,8 @@ def reset_policy_cache() -> None:
     later read does ``cache["path"]`` -- a KeyError on a shape that exists only
     between the two. Tests and config reloads must reset keys, not drop them.
     """
-    _POLICY_CACHE.update({"path": None, "mtime": None, "forbid": None})
+    _POLICY_CACHE.update({"path": None, "mtime": None, "forbid": None,
+                          "target_map": None})
 
 
 def _policy_path() -> Optional[Path]:
@@ -128,39 +130,47 @@ def _policy_path() -> Optional[Path]:
     return p if p.is_absolute() else (Path(config.PROJECT_ROOT) / p)
 
 
-def policy_forbid() -> Dict[str, Any]:
-    """The refuse list from the deployment's own policy file.
-
-    Reading the SAME file the host applier enforces is what stops the two
-    lists drifting apart. Live 2026-10-30: the policy gained the gate's own
-    control-plane filenames, and the ``AGENT_DEPLOY_FORBIDDEN`` env list did
-    not, so the agent could stage a request to rewrite ``ops/deploy_policy.json``
-    -- caught only later, by the host gate. Defence in depth still held, but
-    two disagreeing lists is precisely the condition that turns a second-layer
-    failure into a silent bypass.
-
-    Never raises: the host gate remains authoritative, so an unreadable policy
-    degrades to "no extra early refusals" rather than making every deploy fail.
-    """
+def _load_policy_cached() -> Tuple[Dict[str, Any], Dict[str, str]]:
     p = _policy_path()
     if p is None:
-        return {}
+        return {}, {}
     try:
         mtime = p.stat().st_mtime
     except OSError:
-        return {}
+        return {}, {}
     cache = _POLICY_CACHE
     if cache["path"] == str(p) and cache["mtime"] == mtime \
-            and isinstance(cache["forbid"], dict):
-        return cache["forbid"]
+            and isinstance(cache["forbid"], dict) \
+            and isinstance(cache.get("target_map"), dict):
+        return cache["forbid"], cache["target_map"]
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return {}, {}
     forbid = doc.get("forbid") if isinstance(doc, dict) else None
-    result = forbid if isinstance(forbid, dict) else {}
-    cache.update(path=str(p), mtime=mtime, forbid=result)
-    return result
+    result_forbid = forbid if isinstance(forbid, dict) else {}
+    tmap = doc.get("target_map") if isinstance(doc, dict) else None
+    raw_files = tmap.get("files") if isinstance(tmap, dict) else None
+    result_map: Dict[str, str] = {}
+    if isinstance(raw_files, dict):
+        for k, v in raw_files.items():
+            ks = str(k or "").strip().replace("\\", "/").lstrip("/")
+            vs = str(v or "").strip().replace("\\", "/").lstrip("/")
+            if ks and vs and ".." not in ks.split("/") and ".." not in vs.split("/"):
+                result_map[ks] = vs
+    cache.update(path=str(p), mtime=mtime, forbid=result_forbid,
+                 target_map=result_map)
+    return result_forbid, result_map
+
+
+def policy_forbid() -> Dict[str, Any]:
+    """The refuse list from the deployment's own policy file."""
+    return _load_policy_cached()[0]
+
+
+def policy_target_map() -> Dict[str, str]:
+    """Optional target path rewrites from the deployment's policy file."""
+    return _load_policy_cached()[1]
 
 
 def forbidden_dirs() -> frozenset:
@@ -223,14 +233,14 @@ STAGED_AGAINST_UNREADABLE = "unreadable"
 def _current_sha256(target: str) -> str:
     """Hash of the target as it stands NOW, for the request to carry.
 
-    Reads through :func:`deploy_root` so it hashes the copy the host will
-    overwrite -- not a copy in some other checkout that happens to be nearby.
-    This used to call an undefined ``_deploy_root()``; the broad exception then
-    recorded EVERY base as "unreadable", so writes could not detect being
-    overwritten by a newer request and deletion preconditions could not work.
+    Reads through :func:`deploy_root` (honouring ``policy_target_map()``) so it
+    hashes the exact copy the host will overwrite -- not a copy in some other
+    checkout that happens to be nearby.
     """
     try:
-        path = deploy_root() / target
+        raw = str(target or "").strip().replace("\\", "/").lstrip("/")
+        mapped = policy_target_map().get(raw, raw)
+        path = deploy_root() / mapped
     except Exception:  # noqa: BLE001 - a bad root must not stop staging
         return STAGED_AGAINST_UNREADABLE
     try:
@@ -393,7 +403,7 @@ def compose_deploy_request(purpose: str,
             #: so a mixed write+delete request cannot be half-applied by a host
             #: that predates deletion support. That fail-closed property is why
             #: the schema version stays 1.
-            if any(k in entry for k in ("content", "source", "sha256",
+            if any(k in entry for k in ("content", "edits", "source", "sha256",
                                         "payload_path")):
                 raise DeployError(
                     f"files[{i}] delete cannot also carry content, source or "
@@ -418,11 +428,32 @@ def compose_deploy_request(purpose: str,
                 raise DeployError(f"files[{i}].content must be a string")
             payload = content.encode("utf-8")
             row = {"target": target, "content": content}
+        elif "edits" in entry:
+            edits = entry.get("edits")
+            if not isinstance(edits, list) or not edits:
+                raise DeployError(
+                    f"files[{i}].edits must be a non-empty list of "
+                    f"{{'old': ..., 'new': ...}} replacements")
+            patched, err = apply_in_files(target, edits)
+            if patched is None:
+                raise DeployError(f"files[{i}] ({target}): {err}")
+            if target.lower().endswith(".py"):
+                import ast as _ast
+                try:
+                    _ast.parse(patched, filename=target)
+                except SyntaxError as exc:
+                    lineno = getattr(exc, "lineno", None)
+                    loc = f" at line {lineno}" if lineno else ""
+                    raise DeployError(
+                        f"files[{i}] ({target}) failed Python syntax check{loc}: "
+                        f"{exc}") from exc
+            payload = patched.encode("utf-8")
+            row = {"target": target, "content": patched}
         else:
             source = entry.get("source")
             if not source:
                 raise DeployError(
-                    f"files[{i}] needs 'content', 'source', or 'delete': true")
+                    f"files[{i}] needs 'content', 'edits', 'source', or 'delete': true")
             src_path = Path(str(source)).expanduser()
             if not src_path.is_absolute():
                 src_path = Path(config.PROJECT_ROOT) / src_path
@@ -1008,6 +1039,216 @@ def deploy_request(purpose: str,
                 + ", so the host will NOT apply it. Re-issue it without "
                   "dry_run to actually make the change.")
     return header + tail + "\n\n" + _summarise_outcome(outcome) + note
+
+
+def apply_in_files(path: str,
+                   edits: List[Dict[str, str]],
+                   expected_replacements: int = 1,
+                   base_dir: Optional[Path] = None) -> Tuple[Optional[str], str]:
+    """Read a source file (which may live on a read-only mount), apply exact
+    Copilot-style string replacements in memory, and return ``(new_text, error)``.
+
+    This gives an agent running on a read-only deployment root the exact same
+    precision edit UX as ``replace_in_file`` / ``multi_replace_in_file`` without
+    having to copy files to scratch or paste thousands of lines into ``content``.
+    """
+    base = Path(base_dir) if base_dir is not None else deploy_root()
+    raw_p = Path(str(path).strip())
+    if raw_p.is_absolute():
+        target = raw_p
+    else:
+        rel_norm = str(path).strip().replace("\\", "/").lstrip("/")
+        mapped = policy_target_map().get(rel_norm, rel_norm)
+        target = base / mapped
+        if not target.is_file():
+            alt = Path(config.PROJECT_ROOT) / rel_norm
+            if alt.is_file():
+                target = alt
+    if not target.is_file():
+        return None, f"NOT FOUND: {target}"
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"ERROR reading {target}: {exc}"
+    if not edits:
+        return None, "NO EDITS SUPPLIED: edits list is empty"
+    sim = text
+    problems: List[str] = []
+    want = max(1, int(expected_replacements or 1))
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            problems.append(f"edit {i}: must be an object {{'old': ..., 'new': ...}}")
+            continue
+        old = edit.get("old", "")
+        new = edit.get("new", "")
+        per_want = int(edit.get("expected_replacements") or want)
+        if not old:
+            problems.append(f"edit {i}: empty old string")
+            continue
+        cnt = sim.count(old)
+        if cnt != per_want:
+            orig_cnt = text.count(old)
+            note = (f" (was {orig_cnt} before earlier edits in this batch)"
+                    if orig_cnt != cnt else "")
+            problems.append(
+                f"edit {i}: old string appears {cnt} time(s) in {target.name}, "
+                f"expected {per_want}{note}")
+            continue
+        sim = sim.replace(old, new, per_want)
+    if problems:
+        return None, "NO EDITS APPLIED (atomic): " + "; ".join(problems)
+    return sim, ""
+
+
+def deploy_patch(purpose: str,
+                 target: str,
+                 edits: List[Dict[str, str]],
+                 services: Optional[List[str]] = None,
+                 verify_command: Optional[str] = None,
+                 dry_run: bool = False,
+                 wait_sec: float = 0.0) -> str:
+    """Apply exact Copilot-style string replacements to a deployed file in
+    memory and stage (or apply) the resulting ``deploy_request`` in ONE step.
+
+    Eliminates copying files to scratch, editing scratch copies, running
+    checksums, and staging giant whole-file strings when fixing code on a
+    read-only deployment mount. If ``wait_sec > 0`` in gated mode, also polls
+    the outbox until the host applier writes the receipt (or ``wait_sec``
+    elapses) and returns the live receipt verdict immediately.
+    """
+    clean_target = str(target or "").strip()
+    try:
+        _check_target(clean_target)
+    except DeployError as exc:
+        return f"DEPLOY PATCH REFUSED: {exc}"
+    patched, err = apply_in_files(clean_target, edits or [])
+    if patched is None:
+        return f"DEPLOY PATCH FAILED on {clean_target}: {err}"
+    if clean_target.lower().endswith(".py"):
+        import ast as _ast
+        try:
+            _ast.parse(patched, filename=clean_target)
+        except SyntaxError as exc:
+            lineno = getattr(exc, "lineno", None)
+            loc = f" at line {lineno}" if lineno else ""
+            return (f"DEPLOY PATCH REFUSED ({clean_target}): patched Python "
+                    f"has SyntaxError{loc}: {exc}. Nothing was staged.")
+    res = deploy_request(
+        purpose=purpose,
+        files=[{"target": clean_target, "content": patched}],
+        services=services,
+        verify_command=verify_command,
+        dry_run=dry_run,
+    )
+    if wait_sec and float(wait_sec) > 0 and not dry_run and is_gated() \
+            and res.startswith("STAGED "):
+        first_line = res.splitlines()[0]
+        req_path = Path(first_line[len("STAGED "):].strip())
+        rid = (req_path.name[:-len(REQUEST_SUFFIX)]
+               if req_path.name.endswith(REQUEST_SUFFIX) else req_path.stem)
+        waited = deploy_wait(request_id=rid, timeout_sec=float(wait_sec))
+        return res + "\n\n--- deploy_wait ---\n" + waited
+    return res
+
+
+def deploy_wait(request_id: str = "", timeout_sec: float = 210.0,
+                poll_sec: float = 3.0) -> str:
+    """Wait for the host applier to decide a staged deploy request and return
+    its receipt verdict (status, verification rc/output, service restarts,
+    pause containment, post_apply hooks, and git push state).
+
+    When ``request_id`` is omitted, waits on the newest pending request in the
+    outbox (or returns the newest decided receipt if none is pending). Gives a
+    gated agent dynamic synchronous-feeling deploy feedback in ONE tool call
+    instead of burning turns polling ``deploy_status``.
+    """
+    outbox = outbox_dir()
+    if not outbox.is_dir():
+        return f"OUTBOX NOT FOUND: {outbox}"
+    rid = str(request_id or "").strip()
+    if rid.endswith(REQUEST_SUFFIX):
+        rid = rid[:-len(REQUEST_SUFFIX)]
+    elif rid.endswith(RECEIPT_SUFFIX):
+        rid = rid[:-len(RECEIPT_SUFFIX)]
+    if not rid:
+        pending = sorted(outbox.glob(f"*{REQUEST_SUFFIX}"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        if pending:
+            rid = pending[0].name[:-len(REQUEST_SUFFIX)]
+        else:
+            receipts = sorted(outbox.glob(f"*{RECEIPT_SUFFIX}"),
+                              key=lambda p: p.stat().st_mtime, reverse=True)
+            if not receipts:
+                return "(no pending requests or receipts in outbox)"
+            rid = receipts[0].name[:-len(RECEIPT_SUFFIX)]
+
+    receipt_file = outbox / f"{rid}{RECEIPT_SUFFIX}"
+    req_file = outbox / f"{rid}{REQUEST_SUFFIX}"
+    deadline = time.monotonic() + max(0.0, min(float(timeout_sec or 0.0), 600.0))
+    step_sleep = max(0.2, min(float(poll_sec or 3.0), 15.0))
+
+    while True:
+        if receipt_file.is_file() and not req_file.is_file():
+            try:
+                doc = json.loads(receipt_file.read_text(encoding="utf-8"))
+                return _format_receipt_summary(rid, receipt_file, doc)
+            except (OSError, ValueError):
+                pass
+        if receipt_file.is_file() and req_file.is_file():
+            # PendingWindow: receipt exists AND request stays queued; check if
+            # receipt was written recently and carries pending_window=True.
+            try:
+                doc = json.loads(receipt_file.read_text(encoding="utf-8"))
+                if doc.get("pending_window"):
+                    return _format_receipt_summary(rid, receipt_file, doc)
+            except (OSError, ValueError):
+                pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if receipt_file.is_file():
+                try:
+                    doc = json.loads(receipt_file.read_text(encoding="utf-8"))
+                    return _format_receipt_summary(rid, receipt_file, doc)
+                except (OSError, ValueError):
+                    pass
+            still = "still PENDING in outbox" if req_file.is_file() else "not found"
+            return (f"TIMEOUT waiting {timeout_sec:.0f}s for {rid} ({still}). "
+                    f"The host applier timer has not drained it yet; check "
+                    f"deploy_status later rather than re-staging.")
+        time.sleep(min(step_sleep, remaining))
+
+
+def _format_receipt_summary(rid: str, receipt_file: Path,
+                            doc: Mapping[str, Any]) -> str:
+    lines = [
+        f"request: {rid}",
+        f"receipt: {receipt_file}",
+        f"status: {doc.get('status')}",
+        f"at: {doc.get('at')}",
+        f"reason: {doc.get('reason') or '(none)'}",
+    ]
+    if doc.get("verify_rc") is not None:
+        lines.append(
+            f"verify_rc: {doc.get('verify_rc')}"
+            + (" (advisory)" if doc.get("verify_advisory") else ""))
+        if doc.get("verify_output"):
+            lines.append("verify_output (tail):\n  " + "\n  ".join(
+                str(doc["verify_output"])[-600:].splitlines()))
+    for r in doc.get("restart") or []:
+        paused_note = " [paused --no-start]" if r.get("paused_no_start") else ""
+        lines.append(
+            f"service {r.get('service')}: {r.get('cmd')} -> rc={r.get('rc')}"
+            f"{paused_note}")
+    for h in doc.get("post_apply") or []:
+        lines.append(
+            f"post_apply ({h.get('prefix')}): rc={h.get('rc')} "
+            f"{str(h.get('output') or '')[-200:]}")
+    git_info = doc.get("git")
+    if isinstance(git_info, Mapping) and git_info.get("state"):
+        lines.append(
+            f"git: {git_info.get('state')} "
+            f"{git_info.get('sha') or git_info.get('reason') or ''}".rstrip())
+    return "\n".join(lines)
 
 
 def deploy_status() -> str:

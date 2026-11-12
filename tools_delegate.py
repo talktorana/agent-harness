@@ -33,15 +33,17 @@ def run_subagent(prompt: str, steps: int = 12) -> str:
                 f"AGENT_MAX_SUBAGENT_DEPTH={MAX_DEPTH}. Do the work yourself.")
     if not (prompt or "").strip():
         return "REFUSED: empty subagent prompt."
+    step_cap = max(2, int(steps))
     env = dict(os.environ)
     env["AGENT_DEPTH"] = str(depth + 1)
-    env["AGENT_MAX_STEPS"] = str(max(2, int(steps)))
+    env["AGENT_MAX_STEPS"] = str(step_cap)
     env["AGENT_CONFIRM_WRITES"] = "0"      # child is read-only by instruction
     env["AGENT_CONFIRM_PYTHON_MUTATIONS"] = "0"
     entry = Path(__file__).resolve().parent / "run.py"
     try:
         proc = subprocess.run(
-            [sys.executable, str(entry), "--quiet", prompt],
+            [sys.executable, str(entry), "--quiet", "--steps", str(step_cap),
+             prompt],
             cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True,
             timeout=SUBAGENT_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:

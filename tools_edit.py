@@ -84,10 +84,9 @@ def replace_in_file(path: str, old: str, new: str,
 def multi_replace_in_file(path: str, edits: List[Dict[str, str]]) -> str:
     """Apply several exact replacements to one file, in order, atomically.
 
-    Each edit is {"old": ..., "new": ...}. If ANY edit fails its uniqueness
-    check the WHOLE batch is refused and the file is untouched -- a partial
-    application is worse than none, because the model then reasons about a
-    file state that never existed.
+    Each edit is {"old": ..., "new": ...}. Validated sequentially against a
+    simulated buffer before writing, so an earlier edit that overlaps or alters
+    a later edit's anchor is caught cleanly without touching the file on disk.
     """
     p = _resolve(path)
     refusal = guard_project_write(str(p))
@@ -99,21 +98,28 @@ def multi_replace_in_file(path: str, edits: List[Dict[str, str]]) -> str:
         text = p.read_text(encoding="utf-8")
     except OSError as exc:
         return f"ERROR reading {p}: {exc}"
+    if not edits:
+        return "NO EDITS APPLIED: edits list is empty"
+    sim = text
     problems = []
-    for i, edit in enumerate(edits or []):
+    for i, edit in enumerate(edits):
         old = (edit or {}).get("old", "")
         if not old:
             problems.append(f"edit {i}: empty old string")
             continue
-        if text.count(old) != 1:
+        cnt = sim.count(old)
+        if cnt != 1:
+            orig_cnt = text.count(old)
+            note = (f" (was {orig_cnt} before earlier edits in this batch)"
+                    if orig_cnt != cnt else "")
             problems.append(
-                f"edit {i}: old string appears {text.count(old)} time(s)")
+                f"edit {i}: old string appears {cnt} time(s){note}")
+            continue
+        sim = sim.replace(old, edit.get("new", ""), 1)
     if problems:
         return _fail(path, "NO EDITS APPLIED (atomic batch): "
                      + "; ".join(problems))
-    for edit in edits:
-        text = text.replace(edit["old"], edit.get("new", ""), 1)
-    p.write_text(text, encoding="utf-8")
+    p.write_text(sim, encoding="utf-8")
     _succeed(path)
     return f"EDITED {p} ({len(edits)} replacement(s))"
 

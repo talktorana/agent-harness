@@ -28,6 +28,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -161,12 +162,19 @@ class PythonSandbox:
             pass
 
     def close(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    pass
+            for stream in (self.proc.stdin, self.proc.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     # ------------------------------------------------------------------ run
 
@@ -187,8 +195,11 @@ class PythonSandbox:
         self.proc.stdin.write(payload)
         self.proc.stdin.flush()
 
-        deadline_left = float(timeout)
+        deadline = time.monotonic() + float(timeout)
         while True:
+            deadline_left = deadline - time.monotonic()
+            if deadline_left <= 0:
+                return ""  # caller treats "" as a timeout
             try:
                 line = self._queue.get(timeout=deadline_left)
             except queue.Empty:

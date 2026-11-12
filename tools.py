@@ -21,7 +21,9 @@ from config import (CONFIRM_PYTHON_MUTATIONS, CONFIRM_WRITES, MAX_TOOL_CHARS,
 from memory import MemoryStore
 from python_exec import PythonSandbox
 from tools_delegate import run_subagent
-from tools_deploy import deploy_request, deploy_status, guard_project_write
+from tools_deploy import (deploy_patch, deploy_request, deploy_status,
+                          deploy_wait, guard_project_write)
+from tools_diagnostics import check_syntax
 from tools_edit import glob_files, multi_replace_in_file, replace_in_file
 from tools_browser import (browser_click, browser_close, browser_navigate,
                            browser_open, browser_read, browser_screenshot,
@@ -165,6 +167,15 @@ def run_command(command: str, cwd: str = None, timeout_sec: int = None,
     timeout = timeout_sec or TOOL_TIMEOUT_SEC
     command, note = _normalize_paths(command)
     note = (why + "\n" if why else "") + note
+    run_env = None
+    if not os.environ.get("PYTHONPYCACHEPREFIX"):
+        try:
+            from config import SESSIONS_DIR
+            pyc_dir = Path(SESSIONS_DIR).parent / "work" / "pyc"
+            pyc_dir.mkdir(parents=True, exist_ok=True)
+            run_env = dict(os.environ, PYTHONPYCACHEPREFIX=str(pyc_dir))
+        except OSError:
+            run_env = None
     try:
         if BASH:
             proc = subprocess.run(
@@ -172,12 +183,14 @@ def run_command(command: str, cwd: str = None, timeout_sec: int = None,
                 # a different shell on Windows than shutil.which found.
                 [BASH, "-lc", command],
                 cwd=str(_resolve(cwd)) if cwd else str(PROJECT_ROOT),
+                env=run_env,
                 capture_output=True, text=True, timeout=timeout,
             )
         else:
             proc = subprocess.run(
                 command, shell=True,
                 cwd=str(_resolve(cwd)) if cwd else str(PROJECT_ROOT),
+                env=run_env,
                 capture_output=True, text=True, timeout=timeout,
             )
     except subprocess.TimeoutExpired:
@@ -260,8 +273,11 @@ def search(pattern: str, include: str = "*", path: str = ".",
 
     Pure Python rather than a ``grep`` shell-out: grep is absent on Windows,
     and a search that silently returns nothing would let the agent conclude a
-    symbol has no other callers when it has several.
+    symbol has no other callers when it has several. Skips VCS, cache and
+    vendor directories just like ``glob_files`` and ``repo_map``.
     """
+    from tools_edit import matches_skip
+
     root = _resolve(path)
     if not root.exists():
         return f"NOT FOUND: {root}"
@@ -270,8 +286,9 @@ def search(pattern: str, include: str = "*", path: str = ".",
     except re.error:
         rx = re.compile(re.escape(pattern))
     out = []
-    files = [root] if root.is_file() else [p for p in root.rglob(include)
-                                            if p.is_file()]
+    files = ([root] if root.is_file()
+             else [p for p in root.rglob(include)
+                   if p.is_file() and not matches_skip(p.relative_to(root))])
     for p in files:
         try:
             lines = p.read_text(encoding="utf-8",
@@ -902,8 +919,8 @@ TOOLS = [
                                        "reviewer would want."},
             "files": {"type": "array",
                       "description": "Files to change. Each item is "
-                                     "{target, content}, {target, source}, or "
-                                     "{target, delete: true} for removal. "
+                                     "{target, content}, {target, edits: [{old, new}, ...]}, "
+                                     "{target, source}, or {target, delete: true} for removal. "
                                      "target is RELATIVE to the deploy root "
                                      "and source is an existing file to stage "
                                      "bytes from.",
@@ -911,6 +928,15 @@ TOOLS = [
                                 "properties": {
                                     "target": {"type": "string"},
                                     "content": {"type": "string"},
+                                    "edits": {
+                                        "type": "array",
+                                        "description": "Exact Copilot-style string replacements applied to the deployed target in memory.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "old": {"type": "string"},
+                                                "new": {"type": "string"}},
+                                            "required": ["old", "new"]}},
                                     "source": {"type": "string"},
                                     "delete": {"type": "boolean"}}}},
             "services": {"type": "array", "items": {"type": "string"},
@@ -948,6 +974,75 @@ TOOLS = [
                                        "receipt, but change no file."},
         },
         ["purpose"],
+    ),
+    _fn(
+        "check_syntax",
+        "Check Python syntax and high-signal AST diagnostics (SyntaxError with "
+        "line/column snippet, duplicate dict literal keys) across files or "
+        "directories WITHOUT writing __pycache__ or .pyc files. Safe on "
+        "read-only deployment mounts where `python -m py_compile` fails. Omit "
+        "paths to validate the entire project tree.",
+        {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of file or directory paths to "
+                               "check (relative to project root or absolute)."},
+        },
+        [],
+    ),
+    _fn(
+        "deploy_patch",
+        "Apply exact Copilot-style string replacements (`edits`: [{old, new}, ...]) "
+        "directly against a deployed file (even on a read-only mount!) and "
+        "stage or apply the resulting `deploy_request` in ONE atomic step. "
+        "Preferred over copying files to a scratch directory or pasting an "
+        "entire file into `content`. Python targets are AST syntax-checked "
+        "before staging. Pass `wait_sec` (e.g. 90) in gated mode to wait for "
+        "the host applier receipt and receive verification, container restart, "
+        "post-apply hook, and git push outcomes immediately in the same call.",
+        {
+            "purpose": {"type": "string",
+                        "description": "Why this change is needed (recorded in receipt and git commit)."},
+            "target": {"type": "string",
+                       "description": "Path relative to the deploy root (e.g. 'engine/foo.py')."},
+            "edits": {
+                "type": "array",
+                "description": "Sequential exact string replacements. Every `old` must match uniquely.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old": {"type": "string"},
+                        "new": {"type": "string"},
+                        "expected_replacements": {"type": "integer"}},
+                    "required": ["old", "new"]}},
+            "services": {"type": "array", "items": {"type": "string"},
+                         "description": "Optional compose services to rebuild/recreate on apply."},
+            "verify_command": {"type": "string",
+                               "description": "Shell command the host runs after applying; non-zero rolls back."},
+            "dry_run": {"type": "boolean",
+                        "description": "Evaluate gates without changing files."},
+            "wait_sec": {"type": "number",
+                         "description": "Seconds to wait for the host applier receipt in gated mode (0 = return immediately after staging)."},
+        },
+        ["purpose", "target", "edits"],
+    ),
+    _fn(
+        "deploy_wait",
+        "Wait for the host applier to decide a staged deploy request and "
+        "return the full receipt verdict (status, verify_rc/output, container "
+        "restarts, pause containment, post_apply hooks, and git push SHA). "
+        "Omit `request_id` to wait on the newest pending request. Replaces "
+        "manual sleep/deploy_status polling loops with one clean call.",
+        {
+            "request_id": {"type": "string",
+                           "description": "Optional request ID (e.g. 'req-...'). Omit for newest."},
+            "timeout_sec": {"type": "number",
+                            "description": "Max seconds to wait (default 210, max 600)."},
+            "poll_sec": {"type": "number",
+                         "description": "Poll interval in seconds (default 3)."},
+        },
+        [],
     ),
     _fn(
         "deploy_status",
@@ -998,6 +1093,9 @@ HANDLERS = {
     "browser_read": browser_read,
     "browser_screenshot": browser_screenshot,
     "browser_close": browser_close,
+    "check_syntax": check_syntax,
     "deploy_request": deploy_request,
+    "deploy_patch": deploy_patch,
+    "deploy_wait": deploy_wait,
     "deploy_status": deploy_status,
 }

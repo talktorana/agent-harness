@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -166,6 +167,29 @@ class Policy:
                  name: str = "default") -> None:
         doc = doc if isinstance(doc, dict) else {}
         self.name = name
+
+        #: Optional target path rewrites for deploy layouts that flatten a
+        #: source path onto a different host location (e.g. a repo script under
+        #: ``ops/script.sh`` that runs from ``script.sh`` at the deploy root).
+        #: Without this, staging ``ops/script.sh`` writes a new file in ``ops/``
+        #: while ``sync_applied_files`` commits ``ops/script.sh``, leaving the
+        #: host's live ``script.sh`` untouched (or staging ``script.sh`` writes
+        #: the host file and commits a duplicate root ``script.sh`` in git!).
+        #:
+        #: ``target_map.files`` maps a request target (repo-subdir-relative) ->
+        #: the deploy-root-relative path written on disk, while ``sync_applied_files``
+        #: maps that disk path BACK to the repo-subdir-relative path when
+        #: committing to the git mirror.
+        tmap_doc = doc.get("target_map")
+        tmap_doc = tmap_doc if isinstance(tmap_doc, dict) else {}
+        raw_tfiles = tmap_doc.get("files")
+        raw_tfiles = raw_tfiles if isinstance(raw_tfiles, dict) else {}
+        self.target_map_files: Dict[str, str] = {}
+        for k, v in raw_tfiles.items():
+            ks = str(k or "").strip().replace("\\", "/").lstrip("/")
+            vs = str(v or "").strip().replace("\\", "/").lstrip("/")
+            if ks and vs and ".." not in ks.split("/") and ".." not in vs.split("/"):
+                self.target_map_files[ks] = vs
         readiness = doc.get("readiness")
         readiness = readiness if isinstance(readiness, dict) else {}
         self.status_file = str(readiness.get("status_file") or "").strip()
@@ -295,6 +319,42 @@ class Policy:
         git_doc = doc.get("git")
         self.git: Dict[str, Any] = git_doc if isinstance(git_doc, dict) else {}
 
+        #: Operator-pause containment for service restarts, and post-apply
+        #: target hooks (e.g. non-compose container publishers).
+        #:
+        #: ``pause.marker_file``: relative or absolute path to an operator Stop
+        #: marker. While that file exists, services in ``pause.services`` are
+        #: built with ``--no-start`` (so the image and container definition stay
+        #: current without starting a service the operator deliberately stopped).
+        #:
+        #: ``post_apply``: list of ``{"prefix": "ui/", "argv": [...],
+        #: "timeout_sec": 300}`` hooks run after ``write_payloads`` (with
+        #: ``--allow-restart``) whenever any applied target matches ``prefix``.
+        #: Lets non-compose containers be updated immediately instead of waiting
+        #: for a slow external polling timer.
+        pause_doc = doc.get("pause")
+        pause_doc = pause_doc if isinstance(pause_doc, dict) else {}
+        self.pause_marker_file = str(
+            pause_doc.get("marker_file") or "").strip()
+        self.pause_services: Tuple[str, ...] = tuple(
+            str(s) for s in (pause_doc.get("services") or [])
+            if isinstance(s, str) and s.strip())
+
+        raw_hooks = doc.get("post_apply")
+        raw_hooks = raw_hooks if isinstance(raw_hooks, list) else []
+        self.post_apply: List[Dict[str, Any]] = []
+        for h in raw_hooks:
+            if not isinstance(h, dict):
+                continue
+            prefix = str(h.get("prefix") or "").strip().lstrip("/")
+            argv = _argv_list(h.get("argv"))
+            if prefix and argv:
+                self.post_apply.append({
+                    "prefix": prefix,
+                    "argv": argv,
+                    "timeout_sec": float(h.get("timeout_sec") or 300.0),
+                })
+
     @property
     def readiness_enabled(self) -> bool:
         return bool(self.status_file)
@@ -334,6 +394,9 @@ class Policy:
                     "mirror_dir": str(self.git.get("mirror_dir") or ""),
                     "remote": str(self.git.get("remote") or ""),
                     "branch": str(self.git.get("branch") or "")},
+            "pause": {"marker_file": self.pause_marker_file or None,
+                      "services": list(self.pause_services)},
+            "post_apply_prefixes": [h["prefix"] for h in self.post_apply],
         }
 
     @classmethod
@@ -658,8 +721,9 @@ def gate_paths(pairs: List[Tuple[str, Any]], root: Path,
             raise Refused(
                 f"target must be relative to the deploy root, not an absolute "
                 f"path: {target!r}")
-        raw = target.strip().replace("\\", "/")
-        unresolved = base / raw.lstrip("/")
+        raw = target.strip().replace("\\", "/").lstrip("/")
+        mapped = policy.target_map_files.get(raw, raw)
+        unresolved = base / mapped
         # Symlink FIRST, on the path as written. Containment resolves the link,
         # so a target pointing outside the root would otherwise be reported as
         # an escape -- a true statement that hides the actual mechanism, and a
@@ -1122,12 +1186,33 @@ def run_command(cmd: List[str], cwd: Path,
     return proc.returncode, tail
 
 
+def _is_paused_for_service(svc: str, root: Path,
+                           policy: Optional[Policy]) -> bool:
+    """True when the policy's pause marker exists and ``svc`` is pause-gated."""
+    if policy is None or not policy.pause_marker_file:
+        return False
+    if svc not in policy.pause_services:
+        return False
+    marker = _resolve_status(root, policy.pause_marker_file)
+    return marker.is_file()
+
+
 def restart_services(services: List[str], root: Path,
-                     timeout: float) -> List[Dict[str, Any]]:
-    """Rebuild+recreate the named compose services. Only with --allow-restart."""
+                     timeout: float,
+                     policy: Optional[Policy] = None) -> List[Dict[str, Any]]:
+    """Rebuild+recreate the named compose services. Only with --allow-restart.
+
+    When a service is listed in ``policy.pause_services`` and the policy's
+    ``pause.marker_file`` exists, the image is still built and the container
+    definition is updated with ``up -d --no-deps --no-start`` so an operator's
+    deliberate Stop is never overridden by a deploy request.
+    """
     out: List[Dict[str, Any]] = []
     for svc in services:
-        for args in (["build", svc], ["up", "-d", "--no-deps", svc]):
+        paused_svc = _is_paused_for_service(svc, root, policy)
+        up_args = (["up", "-d", "--no-deps", "--no-start", svc]
+                   if paused_svc else ["up", "-d", "--no-deps", svc])
+        for args in (["build", svc], up_args):
             cmd = ["docker", "compose"] + args
             try:
                 rc, tail = run_command(cmd, root, timeout)
@@ -1135,11 +1220,43 @@ def restart_services(services: List[str], root: Path,
                 out.append({"service": svc, "cmd": " ".join(args),
                             "rc": None, "error": "timeout"})
                 return out
-            out.append({"service": svc, "cmd": " ".join(args), "rc": rc,
-                        "output": tail[-600:]})
+            row: Dict[str, Any] = {"service": svc, "cmd": " ".join(args),
+                                   "rc": rc, "output": tail[-600:]}
+            if paused_svc and args is up_args:
+                row["paused_no_start"] = True
+            out.append(row)
             if rc != 0:
                 return out
         _record_image_stamp(root, svc, out)
+    return out
+
+
+def run_post_apply_hooks(targets: List[Path], root: Path,
+                         policy: Optional[Policy]) -> List[Dict[str, Any]]:
+    """Run policy-configured post-apply hooks matching any applied target."""
+    if policy is None or not policy.post_apply or not targets:
+        return []
+    rels: List[str] = []
+    for t in targets:
+        try:
+            rels.append(t.resolve().relative_to(root.resolve()).as_posix())
+        except (OSError, ValueError):
+            continue
+    out: List[Dict[str, Any]] = []
+    for hook in policy.post_apply:
+        prefix = hook["prefix"]
+        matched = [r for r in rels if r == prefix or r.startswith(prefix)]
+        if not matched:
+            continue
+        argv = _fmt_argv(hook["argv"], root=str(root))
+        rc, tail = _run_argv(argv, hook["timeout_sec"])
+        out.append({
+            "prefix": prefix,
+            "matched": matched,
+            "argv": argv,
+            "rc": rc,
+            "output": tail[-600:],
+        })
     return out
 
 
@@ -1851,12 +1968,17 @@ def sync_applied_files(targets: List[Path], root: Path, *,
                 "retry": f"cd {mirror} && git fetch {cfg['remote']} && "
                          f"git status"}
 
+    reverse_map: Dict[str, str] = {
+        v: k for k, v in getattr(policy, "target_map_files", {}).items()
+    }
     copied: List[str] = []
     for src in rels:
         rel = src.resolve().relative_to(root.resolve())
+        rel_posix = rel.as_posix()
+        repo_rel = Path(reverse_map.get(rel_posix, rel_posix))
         #: Repo-relative, i.e. where the file belongs in the CLONE -- which is
         #: not the same as where it sits under the deploy root.
-        in_repo = (prefix / rel) if prefix is not None else rel
+        in_repo = (prefix / repo_rel) if prefix is not None else repo_rel
         dest = mirror / in_repo
         try:
             if not src.exists():
@@ -2368,13 +2490,15 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
 
         services = list(req.get("services") or [])
         if services and allow_restart:
-            plan["restart"] = restart_services(services, root, test_timeout)
+            sig = inspect.signature(restart_services)
+            if "policy" in sig.parameters:
+                plan["restart"] = restart_services(
+                    services, root, test_timeout, policy=policy)
+            else:
+                plan["restart"] = restart_services(
+                    services, root, test_timeout)
             if any(r.get("rc") not in (0, None) or r.get("error")
                    for r in plan["restart"]):
-                #: Same honesty rule as the success reason below: a
-                #: rebuild-only request applies no files, so "files applied but
-                #: a service restart failed" describes a step that never
-                #: happened. The reader needs to know the IMAGE is still old.
                 failed_reason = (
                     "the service rebuild FAILED; no files were involved, so the "
                     "running image is unchanged -- inspect the receipt's "
@@ -2388,6 +2512,15 @@ def handle_request(path: Path, outbox: Path, root: Path, *, dry_run: bool,
         elif services:
             plan["restart_skipped"] = (
                 "run with --allow-restart to rebuild/recreate these services")
+
+        if targets and allow_restart and policy.post_apply:
+            plan["post_apply"] = run_post_apply_hooks(targets, root, policy)
+            if any(h.get("rc") not in (0, None) for h in plan["post_apply"]):
+                return _record_failure(
+                    outbox, path,
+                    "files applied but a post_apply hook failed; inspect the "
+                    "receipt before retrying",
+                    {**plan, "backups": made}, dry_run=dry_run)
 
         #: WHAT ACTUALLY HAPPENED, said plainly.
         #:

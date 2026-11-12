@@ -37,13 +37,21 @@ right up until they were checked against the data.
 SMALL STEPS. Prefer one verified change over three plausible ones. Re-read
 what you just wrote before moving on.
 
-## Editing
+## Editing & Deploying
 
 Use `replace_in_file` (or `multi_replace_in_file` for several separated spots
 in one file) for any change smaller than a full rewrite: it replaces an EXACT
 string and refuses to write when the anchor is missing or ambiguous, so an
 edit can never half-apply. `write_file` remains correct only for new files or
-deliberate whole-file rewrites after a read.
+deliberate whole-file rewrites after a read. Use `check_syntax` to validate
+Python files in-memory without writing `__pycache__`.
+
+When running in `gated` deploy mode (read-only project mount), use
+`deploy_patch` to apply exact string edits directly against a deployed file
+and stage the change in one step (or `deploy_request` with `edits` / `content`
+for multi-file changes), then `deploy_wait` (or `wait_sec` on `deploy_patch`)
+to verify the host applier receipt, test output, service restarts, and git
+push in one turn instead of copying files to scratch or polling manually.
 
 If an edit fails three times on the same file, STOP editing it: the result
 text will tell you the rollback command (`git_restore`). A fourth blind
@@ -137,9 +145,10 @@ run_python gives you a Python interpreter that REMEMBERS across calls in this
 task. Use it for analysis that would otherwise take a dozen tool calls:
 parse a JSONL once, then aggregate, filter and diff it in later steps.
 
-It is not how you change the system. Edit source with write_file, then verify
-with run_command and the real test suites. A number produced by a throwaway
-script is not a verified result -- say where it came from.
+It is not how you change the system. Edit source with `replace_in_file` (or
+`deploy_patch` on a gated read-only mount), check syntax with `check_syntax`,
+and verify with `run_command` and the real test suites. A number produced by a
+throwaway script is not a verified result -- say where it came from.
 
 ## Scope your searches
 

@@ -332,7 +332,8 @@ class Agent:
                  on_event=None,
                  provider: Optional[str] = None,
                  model: Optional[str] = None,
-                 origin: Optional[str] = None):
+                 origin: Optional[str] = None,
+                 max_steps_override: Optional[int] = None):
         # max_retries=0 because _complete() does its own backoff. The SDK's
         # internal retries stacked on top of ours turned one hung call into
         # many minutes of silence with nothing in the transcript to explain it.
@@ -361,6 +362,14 @@ class Agent:
         #: run history -- which every entry point shares -- can still say which
         #: rows were the timed mission. See SessionLog.origin.
         self.origin = origin or ""
+        #: Explicit step ceiling from ``--steps`` or ``run_subagent(steps=N)``.
+        #: When set, wins over ``run_settings.json`` so bounded subagents and
+        #: explicit CLI step budgets are not overridden by a 600-step console
+        #: ceiling saved in ``run_settings.json``.
+        self._max_steps_override = (
+            max(1, int(max_steps_override))
+            if max_steps_override is not None else None
+        )
         # Cooperative cancellation: the web UI's Stop button sets this and the
         # step loop exits before the next model call. Set, never kill.
         self.stop_requested = False
@@ -1216,7 +1225,10 @@ class Agent:
         #: warning fires on an exact equality -- so the run could skip the only
         #: chance it gets to write an answer. Pinning at task start keeps the
         #: budget coherent for the run and applies the new value to the next.
-        max_steps = _effective_max_steps()
+        max_steps_ovr = getattr(self, "_max_steps_override", None)
+        max_steps = (max_steps_ovr
+                     if max_steps_ovr is not None
+                     else _effective_max_steps())
         warn_steps = _effective_answer_warn_steps(max_steps)
         self.max_steps = max_steps
         #: The run's wall-clock ceiling. ``0`` means unbounded; see
@@ -1432,7 +1444,8 @@ def run_task(task: str, verbose: bool = True,
              on_token=None,
              provider: Optional[str] = None,
              model: Optional[str] = None,
-             origin: Optional[str] = None) -> str:
+             origin: Optional[str] = None,
+             max_steps_override: Optional[int] = None) -> str:
     """Convenience entry point.
 
     ``origin`` names the entry point (``schedule``, ``chat``, ``cli``). It is
@@ -1441,4 +1454,5 @@ def run_task(task: str, verbose: bool = True,
     tag a console smoke test is indistinguishable from a scheduled mission.
     """
     return Agent(verbose=verbose, on_token=on_token, provider=provider,
-                 model=model, origin=origin).run(task, images=images)
+                 model=model, origin=origin,
+                 max_steps_override=max_steps_override).run(task, images=images)
