@@ -187,16 +187,98 @@ class ToolRegistrationTest(unittest.TestCase):
 
 
 class PublicMissionTemplateTest(unittest.TestCase):
-    def test_template_contains_the_bounded_healthy_and_deep_policy(self):
+    #: These tests skip (not fail) inside the deployed image, which ships
+    #: Python source but not documentation artifacts.
+    def _template_text(self):
         path = Path(__file__).resolve().parent / "mission.md.example"
         if not path.is_file():
             self.skipTest("the deployed image ships Python source, not documentation")
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
+
+    def test_template_contains_the_bounded_healthy_and_deep_policy(self):
+        text = self._template_text()
         self.assertIn("mission_preflight", text)
         self.assertIn("HEALTHY PATH", text)
         self.assertIn("DEEP PATH", text)
         self.assertIn("report and STOP", text)
         self.assertIn("ONE GREEN CHECK IS FINAL", text)
+
+    def test_template_carries_the_no_handoff_rule_as_a_failed_delivery(self):
+        """A diagnosed incident that ends in a handover checklist is a FAILED
+        delivery. Pinned at PARAGRAPH level, and scoped to the BODY below the
+        divider (the part the model actually receives -- the documentation
+        above it may only mention the rule; only the body binds a run)."""
+        text = self._template_text()
+        body = text.split("\n---\n", 1)[1]
+        paragraphs = [p for p in body.split("\n\n") if "NO-HANDOFF RULE" in p]
+        self.assertTrue(paragraphs, "NO-HANDOFF RULE missing from the "
+                                    "mission body")
+        self.assertIn("FAILED delivery", paragraphs[0],
+                      "the no-handoff paragraph must call the handover-only "
+                      "outcome a FAILED delivery, not merely discourage it")
+        self.assertIn("deployed", paragraphs[0].lower())
+        self.assertIn("ZERO times", paragraphs[0],
+                      "the paragraph must name the observed failure shape: a "
+                      "full budget spent with zero deploy calls")
+
+    def test_template_contains_first_then_diagnoses_from_stable_ground(self):
+        text = self._template_text()
+        self.assertIn("HALF the wall budget", text)
+        self.assertIn("CONTAINMENT fix FIRST", text)
+        self.assertIn("Contain, then diagnose", text)
+
+    def test_template_carries_evidence_discipline_labels(self):
+        text = self._template_text()
+        for label in ("**VERIFIED**", "**INHERITED**",
+                      "UNVERIFIABLE FROM HERE"):
+            self.assertIn(label, text)
+        self.assertIn("THIS pass", text, "suite counts must come from this pass")
+        self.assertIn("prove the probe can fail", text)
+        self.assertIn("RETRACT", text)
+
+    def test_template_carries_the_drift_direction_rule(self):
+        text = self._template_text()
+        self.assertIn("SUSPECT DRIFT BEFORE CODE", text)
+        self.assertIn("BACKPORT first", text)
+        self.assertIn("you are behind", text,
+                      "the rule must name the usual direction, or a pass will "
+                      "again overwrite a host-ahead fix")
+
+    def test_template_separates_pushed_from_shipped(self):
+        text = self._template_text()
+        self.assertIn("Pushed is STILL not shipped", text)
+        self.assertIn("RUNNING process/container", text)
+        self.assertIn("never from a build log", text)
+
+    def test_template_keeps_the_parallel_actor_rule(self):
+        text = self._template_text()
+        self.assertIn("another actor", text)
+        self.assertIn("Stage exactly your own files", text)
+
+    def test_output_format_names_bounds_gaps_and_processes_touched(self):
+        text = self._template_text()
+        self.assertIn("Write the report FIRST", text)
+        self.assertIn("Executed mission(s)", text)
+        self.assertIn("wall clock", text,
+                      "the report must distinguish WHICH bound ended a run")
+        self.assertIn("Production processes touched", text)
+
+    def test_template_body_keeps_every_make_schedule_probe(self):
+        """`read_mission()` refuses a brief missing any probe string; the
+        template's prompt half must carry all of them so `cp mission.md.example
+        mission.md` stays a working starting point."""
+        from make_schedule import read_mission  # noqa: local import on purpose
+        text = self._template_text()
+        body = text.split("\n---\n", 1)[1]
+        for probe in ("MISSION:", "TERMINAL SAFELIGHTS", "OUTPUT FORMAT"):
+            self.assertIn(probe, body)
+        # And the whole file must round-trip through the real reader.
+        tmp = Path(tempfile.mkdtemp()) / "mission.md"
+        tmp.write_text(text, encoding="utf-8")
+        mission = read_mission(tmp)
+        self.assertIn("NO-HANDOFF RULE", mission)
+        self.assertNotIn("What to customise", mission,
+                         "documentation above the divider must not be embedded")
 
     def test_operations_guide_says_cache_is_not_recurring_maintenance(self):
         path = Path(__file__).resolve().parent / "docs" / "PERFORMANCE.md"

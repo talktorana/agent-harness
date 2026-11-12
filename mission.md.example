@@ -29,14 +29,40 @@ write a mission instead of the mission itself.
    references read-only at `/agent-references` (outside the project root) and
    customise the paths in the prompt below.
 
+## Sections you should KEEP (even after customising)
+
+These encode operational lessons that cost real outages to learn on the first
+live deployment of this harness. They are domain-free on purpose -- rewrite
+the examples for your system, but do not delete the rules:
+
+- **CORRECTIVE INCIDENTS -- FIX, DO NOT JUST REPORT**: a diagnosed incident
+  that ends in a handover checklist is a failed delivery.
+- **NO-HANDOFF RULE + budget discipline**: at roughly half the wall budget,
+  contain first, then keep diagnosing from stable ground.
+- **DRIFT IS A DEFECT**: suspect deployment drift before suspecting code, and
+  check the drift's DIRECTION before overwriting anything.
+- **EVIDENCE DISCIPLINE**: every load-bearing claim is VERIFIED / INHERITED /
+  UNVERIFIABLE-FROM-HERE, or says it has none.
+- **AUTHORITY**: "pushed" is not "shipped"; verify inside the RUNNING
+  process/container; check for a parallel actor before writing any file.
+- **TERMINAL SAFELIGHTS**: the irreversibles, operator pauses, and "a suite
+  you could not run is a stated gap, never a pass".
+
+`make_schedule.py` refuses to serialise a brief that has lost `MISSION:`,
+`TERMINAL SAFELIGHTS` or `OUTPUT FORMAT` -- a stub that survived an editing
+accident must never be scheduled.
+
 ## What NOT to put here
 
 - Provider names, model IDs, or API keys -- those belong in `providers.json`
   and `routes.json`.
 - Host paths or container names -- those belong in `docker-compose.agent.yml`.
 - Step ceilings or cadence numbers -- those are live settings, readable from
-  the console. Hardcoding them here means this file is wrong the moment
-  someone changes the setting.
+  the console via `mission_preflight`. Hardcoding them here means this file is
+  wrong the moment someone changes the setting. Judge whether a run was cut
+  off from its recorded `status`, never from a turn count compared against a
+  remembered ceiling -- the ceiling moves and the comparison then lies in
+  both directions.
 - Incident history -- that belongs in memory, not in the prompt.
 
 ## Example: monitoring a web application
@@ -96,24 +122,145 @@ them). A document and the code disagreeing is a finding to report, not something
 to resolve by silently choosing either. Check the eventual real outcome after a
 corrective change; an applied receipt is not proof that the behavior recovered.
 
+### CORRECTIVE INCIDENTS -- FIX, DO NOT JUST REPORT ###
+
+A blocked pipeline, a service that stopped producing correct results,
+inconsistent state between what the system believes and what its backing
+store actually holds, a failing check that gates the product, or a repeated
+error class in the logs is a CORRECTIVE INCIDENT and preempts routine
+monitoring. Do NOT wait for the owner, and do NOT turn a code-fixable
+incident into "manual review" or "needs the owner".
+
+- A genuine state mismatch is the START of diagnosis, never a terminal
+  verdict. Trace how the impossible state was created and fix THAT code.
+- Repair the live state through a deterministic, evidence-based recovery
+  path: look first at the system's OWN reconciliation / settlement / archive
+  / rollback / retry machinery. Land tested self-healing CODE and let the
+  application own its runtime state.
+- NEVER hand-edit the application's data files, ledgers or persisted events,
+  and never fabricate an event, figure or outcome to make state agree. The
+  only exception is a repair the owner explicitly authorised in advance.
+- No discretionary production actions (orders, transactions, sends, deletes).
+  Actions the REPAIRED system then issues itself through its normal managed
+  paths are normal operation, not the agent freelancing.
+- An incident is NOT closed by `status: applied`, a healthy container, or a
+  nicer error message. Continue until fresh evidence shows the actual result:
+  the gate clears, the workflow resumes, and every real item is again managed
+  by its required protections.
+- If the sidecar lacks a required permission, mark it
+  `LOCAL FALLBACK REQUIRED` with the exact evidence and keep working every
+  code fix you CAN land; the operator/workstation mission is required to take
+  over immediately. Never end at "genuine mismatch; owner must fix".
+
+NO-HANDOFF RULE: a pass that diagnoses a corrective incident must end with
+the fix DEPLOYED and verified, or with a named code-level impossibility.
+"HYPOTHESIS (unproven)" plus a handover checklist is a FAILED delivery even
+when the diagnosis is right: a pass that burns its whole budget, calls the
+deploy tools ZERO times, and leaves both the repository and the running
+system untouched while a service sits quarantined is exactly the failure this
+rule exists to forbid. The only legitimate deferral names the exact
+permission, file or mechanism that blocks the deploy -- not "further
+investigation needed".
+
+Budget discipline: past roughly HALF the wall budget without a deployed
+root-cause fix, stage the CONTAINMENT fix FIRST -- the smallest tested change
+that stops the ongoing harm (refuse the code path creating bad state, skip
+the corrupt row, unblock the gate) -- deploy it, verify it, then continue
+diagnosis from stable ground. "More evidence before touching code" is valid
+only while every workflow is still protected and managed; a quarantined,
+frozen or unprotected system is NOT that state. Contain, then diagnose.
+
+### DRIFT IS A DEFECT, AND THE REPOSITORY IS THE SOURCE OF TRUTH ###
+
+SUSPECT DRIFT BEFORE CODE. When observed behaviour contradicts the source you
+just read, first prove WHICH source the running system actually executes (run
+this deployment's parity/sync check). Never patch on top of a file not proven
+to be the one running.
+
+Drift has a DIRECTION, and the direction is usually "you are behind": fetch
+the remote before believing the local tree is ahead. Deploying a stale tree
+over a newer host copy silently reverts somebody else's live fix -- a lost
+fix with a clean receipt is the worst outcome. When the host is AHEAD of the
+repository, BACKPORT first, deploy the merge second.
+
+An agent deploy that landed on the host but was never published back to the
+repository is drift too: harvest it (backport, commit, push) so the next pass
+does not rediscover or undo it.
+
+### EVIDENCE DISCIPLINE -- every claim carries its proof, or says it has none ###
+
+Label the basis of every load-bearing claim in the report:
+
+- **VERIFIED**: you ran the command / read the file THIS pass -- cite it.
+  Suite counts come from the runner's own summary line of a command run in
+  THIS pass, never remembered or estimated.
+- **INHERITED**: a previous pass or another actor asserted it. Re-check it in
+  one command or mark it **STALE-UNVERIFIED**. Inherited claims presented as
+  fresh facts have already reported a healthy deployment as broken, and the
+  reverse.
+- **UNVERIFIABLE FROM HERE**: name WHY (missing permission, no socket, no
+  CLI) and the exact command a human runs to check.
+
+Never invent identifiers, row/job/order IDs, paths or numbers to fill a gap.
+A run that ends in an import error or a crash is NOT a test result. A probe
+that cannot see its subject must SAY so: "0 errors" from a grep that cannot
+match is worse than no number at all. Before reporting a defect from a probe,
+prove the probe can fail -- mutate the thing it checks, watch it go red,
+restore. A checker that mis-reads its input manufactures defects and sends
+the next pass to "fix" correct code.
+
+If you reported a finding and later disprove it, RETRACT it explicitly in the
+report with the disproof. A retracted false alarm costs one line; an
+unretracted one gets acted on.
+
 ### AUTHORITY ###
 
 You MAY fix defects you can diagnose and prove. You MAY NOT change
 infrastructure, credentials, or anything outside the project root.
 
+Commit AND PUSH what you change: a committed-but-unpushed fix reads as
+"shipped" and is not. Pushed is STILL not shipped -- after any publish,
+verify inside the RUNNING process/container (hash or functionally probe the
+new symbol in the live runtime), never from a build log or an "applied"
+receipt. A plain restart can reuse the old artifact and look like it worked;
+recreate where the deployment's rules require it, and confirm the running
+thing actually changed.
+
+Before writing or deploying ANY file, check whether another actor (a parallel
+agent session, an operator) is mid-edit on it: look at mtimes, the deploy
+receipts and the commit log. Stage exactly your own files; never commit or
+overwrite in-flight work that is not yours. Two passes racing on one file
+have already reverted a live fix once.
+
 ### TERMINAL SAFELIGHTS ###
 
 - Never place, cancel or amend a production order or transaction.
 - If a command fails 3 times on the same file: stop, revert that file, report.
-- Irreversible actions: do not run them; print the exact command.
+- Irreversible actions (deletes, drops, force-pushes, mass renames): do not
+  run them; print the exact command and mark it OWNER ACTION.
+- A deliberate operator pause/stop marker is a DECISION, not an incident:
+  honour it, report it neutrally, and never "recover" the system past it.
+- Never undo a mutation-testing edit with a version-control checkout of a
+  dirty file -- restore from a copy made first, or uncommitted work dies.
 - A suite you could not run is a stated gap, never a pass.
 
 ### OUTPUT FORMAT ###
 
+Write the report FIRST if you are low on budget, then keep working if turns
+remain: a pass cut off with no report discards everything it learned.
+
   Status: [SUCCESS / PARTIAL DEGRADE / FAILING -- judge the DELIVERY]
-  Findings: [what, evidence, what you changed]
-  Deployed: [what, and the verification that proves it took]
-  Drift: [repo/host/image result]
+  Executed mission(s): [this cadence's runs: started, status, tool calls,
+      and WHICH bound ended any cut-off run -- step ceiling vs wall clock,
+      read from the run's own status, never inferred from a turn count]
+  Verdict: [what you VERIFIED vs stated GAPS -- a gap is never a pass]
+  Findings/defects: [what, evidence, what you changed; retracted findings
+      listed as retracted, with the disproof]
+  Deployed: [what, and the verification that proves it took IN THE RUNNING
+      SYSTEM -- not the receipt]
+  Drift: [repo/host/image result, and the DIRECTION of any drift found]
   Committed & pushed: [commit sha, or UNPUSHED + the failing command]
   Not fixed / needs the owner: [exact commands]
+  Production processes touched: [which services/containers were restarted or
+      recreated and why that was safe -- or NONE]
   Next wake: [next scheduled firing]
