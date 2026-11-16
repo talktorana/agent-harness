@@ -113,6 +113,37 @@ def _is_transient(exc: BaseException) -> bool:
 # point of the chain.
 _ROUTE_DEAD_STATUS = {400, 401, 402, 403, 404, 405, 410, 413, 422}
 
+#: A provider's own words for "I have nothing to serve this with". These arrive
+#: as **503**, which `_is_transient` retries by design (a genuine 503 blip does
+#: deserve a retry). The wording is what separates the two cases: a capacity
+#: refusal states that every offer is exhausted or cooling down, so waiting
+#: cannot help and the NEXT ROUTE is the only thing that can.
+#:
+#: Measured 2026-11-16 19:35-21:00: `ali/deepseek-v4-pro-0813` returned
+#: "503 - no available provider ... (all offers exhausted or in cooldown)" 95
+#: times across 112 calls. Each was retried with backoff, burning
+#: 1236 seconds of a 5400-second run -- 20.6 minutes, ~23% of the wall budget
+#: -- on a route that never served a single call. Only 4 of the 99 retries were
+#: real timeouts, so the route-timeout stepping never fired either: it counts
+#: TIMEOUTS, and this failure is not one.
+_PROVIDER_EXHAUSTED_MARKERS = (
+    "no available provider",
+    "all offers exhausted",
+    "offers exhausted or in cooldown",
+    "in cooldown",
+)
+
+
+def _is_provider_exhausted(exc: BaseException) -> bool:
+    """True when the provider says it has nothing to serve this with.
+
+    Deliberately narrow: it requires one of the provider-exhaustion phrases, so
+    an ordinary 503 (gateway hiccup, deploy restart) keeps its retry. Status
+    alone is NOT sufficient -- that would skip a route on a momentary blip.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _PROVIDER_EXHAUSTED_MARKERS)
+
 
 def _is_route_dead(exc: BaseException) -> bool:
     """True when the current route should be skipped without further retries."""
@@ -122,6 +153,8 @@ def _is_route_dead(exc: BaseException) -> bool:
         status = getattr(exc, "status_code", None)
         if status in _ROUTE_DEAD_STATUS:
             return True
+    if _is_provider_exhausted(exc):
+        return True
     text = str(exc).lower()
     if "model_not_found" in text or "does not exist" in text:
         return True
