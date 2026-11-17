@@ -594,7 +594,13 @@ class Agent:
             #: call and make the optimisation impossible to audit.
             "reasoning_effort": getattr(
                 self, "_active_reasoning_effort", config.REASONING_EFFORT) or None,
-            "max_tokens": config.MAX_TOKENS or None,
+            #: The budget THIS model actually ran at, not the run-wide default.
+            #: A model declaring maxOutputTokens overrides AGENT_MAX_TOKENS on
+            #: the wire, so reporting the global value here made every usage
+            #: row claim 32000 while the request sent 262144 -- the exact
+            #: "configured vs actual are separately checkable facts" gap this
+            #: record exists to close. Measured 2026-11-17 on ali/qwen4-max.
+            "max_tokens": self._wire_max_tokens() or None,
         }
         clean = {k: v for k, v in record.items() if v is not None}
 
@@ -832,6 +838,20 @@ class Agent:
             except Exception:  # noqa: BLE001 -- diagnostics must not kill a run
                 pass
 
+    def _wire_max_tokens(self) -> int:
+        """The completion budget the ACTIVE model actually receives.
+
+        A model's declared ``maxOutputTokens`` overrides the run-wide
+        ``AGENT_MAX_TOKENS`` in build_request, so every record that claims a
+        budget must read it from here rather than from config -- otherwise the
+        log and the wire disagree and the capability setting is unauditable.
+        """
+        caps = getattr(self, "_active_caps", {}) or {}
+        budget = caps.get("maxOutputTokens")
+        if isinstance(budget, int) and budget > 0:
+            return budget
+        return config.MAX_TOKENS
+
     def _next_reasoning_effort(self) -> str:
         """The effort for the next request in this run."""
         if getattr(self, "_deep_reasoning", False):
@@ -955,9 +975,7 @@ class Agent:
                 # global budget while the model runs at its own would make the
                 # capability settings unauditable.
                 caps = getattr(resolved, "capabilities", {}) or {}
-                cap_budget = caps.get("maxOutputTokens")
-                wire_budget = (cap_budget if isinstance(cap_budget, int)
-                               and cap_budget > 0 else config.MAX_TOKENS)
+                wire_budget = self._wire_max_tokens()
                 wire_effort = effort
                 supports = caps.get("supportsReasoningEffort")
                 if isinstance(supports, list):

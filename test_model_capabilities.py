@@ -15,6 +15,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import agent
@@ -137,6 +138,54 @@ class ResolveCapabilitiesTest(unittest.TestCase):
         self.assertEqual(inf["model_ids"]["inferhub-qwen4-max"], "ali/qwen4-max")
         self.assertEqual(inf["capabilities"]["inferhub-qwen4-max"]["maxOutputTokens"], 262144)
         self.assertNotIn("api_key", json.dumps(cat))
+
+
+class UsageReportsWireBudgetTest(unittest.TestCase):
+    """The usage row must report the budget the model ACTUALLY ran at.
+
+    Measured 2026-11-17: a production ali/qwen4-max mission sent
+    max_tokens=262144 on the wire but every ``model_usage`` row said 32000,
+    because the record read the run-wide AGENT_MAX_TOKENS. That makes the
+    capability setting unauditable -- the one thing this record exists to
+    prevent.
+    """
+
+    def _agent(self, caps):
+        res = SimpleNamespace(provider="inferhub", model="m",
+                              model_id="ali/qwen4-max", base_url="https://x/v1",
+                              api_key="k", capabilities=caps)
+        events = []
+        # NEVER write into the live sessions dir: Agent() opens a SessionLog.
+        # Pin SESSIONS_DIR (and the transcript root) at a temp dir for the
+        # whole construction, which is what test_live_data_isolation requires.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(config, "SESSIONS_DIR", Path(tmp.name)), \
+                mock.patch.object(llm, "route_chain", return_value=[("inferhub", "m")]), \
+                mock.patch.object(llm, "resolve", return_value=res), \
+                mock.patch.object(llm, "client_for", return_value=mock.MagicMock()):
+            a = agent.Agent(verbose=False, on_event=events.append)
+        a._active_caps = caps
+        return a, events
+
+    def test_usage_reports_model_budget_not_global(self):
+        a, events = self._agent(QWEN_CAPS)
+        with mock.patch.object(config, "MAX_TOKENS", 32000):
+            self.assertEqual(a._wire_max_tokens(), 262144)
+            a._record_usage(SimpleNamespace(prompt_tokens=10,
+                                            completion_tokens=20), "inferhub/m")
+        rows = [e for e in events if e.get("event") == "model_usage"]
+        self.assertTrue(rows, "no model_usage record emitted")
+        self.assertEqual(rows[-1]["max_tokens"], 262144)
+
+    def test_usage_falls_back_to_global_without_caps(self):
+        a, events = self._agent({})
+        with mock.patch.object(config, "MAX_TOKENS", 32000):
+            self.assertEqual(a._wire_max_tokens(), 32000)
+            a._record_usage(SimpleNamespace(prompt_tokens=1,
+                                            completion_tokens=2), "inferhub/m")
+        rows = [e for e in events if e.get("event") == "model_usage"]
+        self.assertEqual(rows[-1]["max_tokens"], 32000)
 
 
 if __name__ == "__main__":
