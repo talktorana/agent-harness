@@ -295,8 +295,36 @@ def assemble_stream(chunks, emit=None, on_think=None, on_usage=None) -> SimpleNa
                            finish_reason=finish_reason)
 
 
+def _effort_rank(level: str) -> int:
+    order = ["none", "low", "medium", "high", "xhigh", "max"]
+    try:
+        return order.index(str(level).lower())
+    except ValueError:
+        return -1
+
+
+def clamp_effort(requested: str, supports: list) -> str:
+    """Map a requested effort onto the model's declared supported levels.
+
+    A gateway may accept any string, but sending a level the model does not
+    support is a silent no-op or a 400. Pick the highest supported level at or
+    below the request; if the request is below every supported level, use the
+    lowest supported one. This is what keeps a deep-reasoning escalation from
+    asking a model for a level it cannot honour.
+    """
+    levels = [str(s) for s in supports if _effort_rank(s) >= 0]
+    if not levels:
+        return ""
+    want = _effort_rank(requested)
+    at_or_below = [s for s in levels if _effort_rank(s) <= want]
+    if at_or_below:
+        return max(at_or_below, key=_effort_rank)
+    return min(levels, key=_effort_rank)
+
+
 def build_request(model: str, messages: list, use_tools: bool,
-                  reasoning_effort: Optional[str] = None) -> dict:
+                  reasoning_effort: Optional[str] = None,
+                  caps: Optional[dict] = None) -> dict:
     """The chat-completions payload for one model call.
 
     Extracted from the call site so the payload -- which is where reasoning
@@ -337,19 +365,34 @@ def build_request(model: str, messages: list, use_tools: bool,
     still offered lets the model reach for one more call it will never get to
     make.
     """
-    request: dict = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-    }
-    if config.MAX_TOKENS > 0:
-        request["max_tokens"] = config.MAX_TOKENS
+    caps = caps or {}
+    request: dict = {"model": model, "messages": messages}
+    # A thinking/reasoning model is driven by its completion budget and effort,
+    # not by sampling temperature; sending temperature can be rejected or
+    # ignored. Omit it when the model declares thinking.
+    if not caps.get("thinking"):
+        request["temperature"] = 0.2
+    # Per-model completion ceiling wins over the run-wide budget so a model's
+    # declared maxOutputTokens is actually utilised rather than documented.
+    budget = caps.get("maxOutputTokens")
+    if not (isinstance(budget, int) and budget > 0):
+        budget = config.MAX_TOKENS
+    if budget > 0:
+        request["max_tokens"] = budget
     effort = config.REASONING_EFFORT if reasoning_effort is None else reasoning_effort
+    supports = caps.get("supportsReasoningEffort")
+    if isinstance(supports, list):
+        if not supports:
+            effort = ""                      # model honours no effort levels
+        elif effort and effort not in supports:
+            effort = clamp_effort(effort, supports)
     if effort:
         request["reasoning_effort"] = effort
     if getattr(config, "PROMPT_CACHE_KEY", ""):
         request["prompt_cache_key"] = config.PROMPT_CACHE_KEY
-    if use_tools:
+    # toolCalling defaults to True for backward compatibility; a model that
+    # declares False must not be offered tools it cannot use.
+    if use_tools and caps.get("toolCalling", True):
         request["tools"] = TOOLS
         request["tool_choice"] = "auto"
     return request
@@ -425,6 +468,9 @@ class Agent:
         #: request, not merely the base environment setting.
         self._deep_reasoning = False
         self._route_reasoning_efforts = llm.route_reasoning_efforts()
+        #: Capabilities of the route currently in force; set on each resolve.
+        #: Used to bound input history by the model's declared maxInputTokens.
+        self._active_caps: Dict[str, Any] = {}
         self._active_reasoning_effort = config.REASONING_EFFORT
         #: Set to the elapsed seconds when the WALL-CLOCK bound ends the run,
         #: and only then. It is the difference between "ran out of turns" and
@@ -883,6 +929,7 @@ class Agent:
                 continue
             client = self._client_for(resolved)
             model = resolved.model_id
+            self._active_caps = getattr(resolved, "capabilities", {}) or {}
 
             #: Bind the route label by DEFAULT ARGUMENT, not by closure. The
             #: loop rebinds `label` on every iteration, so a closure would
@@ -902,6 +949,22 @@ class Agent:
                 if route_effort and not getattr(self, "_deep_reasoning", False):
                     effort = route_effort
                 self._active_reasoning_effort = effort
+                # Reflect what will ACTUALLY reach the wire for this model:
+                # its declared completion ceiling and its supported effort
+                # levels, not the run-wide defaults. A log that reports the
+                # global budget while the model runs at its own would make the
+                # capability settings unauditable.
+                caps = getattr(resolved, "capabilities", {}) or {}
+                cap_budget = caps.get("maxOutputTokens")
+                wire_budget = (cap_budget if isinstance(cap_budget, int)
+                               and cap_budget > 0 else config.MAX_TOKENS)
+                wire_effort = effort
+                supports = caps.get("supportsReasoningEffort")
+                if isinstance(supports, list):
+                    if not supports:
+                        wire_effort = ""
+                    elif effort and effort not in supports:
+                        wire_effort = clamp_effort(effort, supports)
                 # Recorded BEFORE the request so that a hung call leaves a
                 # trail: the last event in the session says which model we
                 # were waiting on, instead of the log simply stopping.
@@ -912,13 +975,13 @@ class Agent:
                            #: at instead of assuming the configured values
                            #: reached the wire. A setting nobody can see from
                            #: the transcript is a setting nobody can audit.
-                           "max_tokens": config.MAX_TOKENS or None,
-                           "reasoning_effort": effort or None})
+                           "max_tokens": wire_budget or None,
+                           "reasoning_effort": wire_effort or None})
                 if self.session:
                     self.session.model_call(model, attempt + 1)
                 try:
                     request = build_request(model, self.messages, use_tools,
-                                            reasoning_effort=effort)
+                                            reasoning_effort=effort, caps=caps)
                     if config.STREAM and (self.verbose or self.on_token):
                         # Streamed: tokens print as they arrive and the web
                         # UI shows the answer forming. assemble_stream folds
@@ -1033,14 +1096,23 @@ class Agent:
         A malformed budget is reported and leaves the history untouched rather
         than killing a monitoring pass for a configuration error.
         """
-        if not getattr(config, "HISTORY_MAX_CHARS", 0):
+        max_chars = getattr(config, "HISTORY_MAX_CHARS", 0)
+        if not max_chars:
+            # No global budget: fall back to the active model's declared input
+            # window so maxInputTokens is utilised, not just documented. Chars
+            # are a conservative proxy (~4 chars/token); this only bounds the
+            # resend size, never deletes the session record.
+            mit = (getattr(self, "_active_caps", {}) or {}).get("maxInputTokens")
+            if isinstance(mit, int) and mit > 0:
+                max_chars = mit * 4
+        if not max_chars:
             return
         session_file = (self.session.jsonl_path.name
                         if self.session is not None else "")
         try:
             compacted, info = history.compact_history(
                 self.messages,
-                max_chars=config.HISTORY_MAX_CHARS,
+                max_chars=max_chars,
                 keep_chars=config.HISTORY_KEEP_CHARS,
                 summary_chars=config.HISTORY_SUMMARY_CHARS,
                 session_file=session_file)

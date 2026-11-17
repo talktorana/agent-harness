@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,6 +57,30 @@ PROVIDERS_FILE = Path(os.environ.get(
     str(Path(__file__).resolve().parent / "providers.json")))
 
 
+def split_model_entry(entry: Any) -> Tuple[str, Dict[str, Any]]:
+    """Normalise a ``models`` value into (wire_id, capabilities).
+
+    Backward compatible: a plain string is the wire id with no capabilities.
+    An object carries the wire id under ``id``/``model``/``model_id`` plus
+    optional capability fields (maxInputTokens, maxOutputTokens, toolCalling,
+    vision, thinking, supportsReasoningEffort, reasoningEffortFormat) that the
+    request builder consumes. This is what lets a deployment declare a model's
+    real limits instead of leaving them as documentation.
+    """
+    if isinstance(entry, str):
+        return entry, {}
+    if isinstance(entry, dict):
+        wire = str(entry.get("id") or entry.get("model")
+                   or entry.get("model_id") or "").strip()
+        if not wire:
+            raise ProviderError(
+                "a model object must name its wire id via 'id'/'model'.")
+        caps = {k: v for k, v in entry.items()
+                if k not in ("id", "model", "model_id")}
+        return wire, caps
+    raise ProviderError(f"unsupported model entry type: {type(entry).__name__}")
+
+
 @dataclass(frozen=True)
 class Resolved:
     """One concrete endpoint choice: where, with what key, which model id."""
@@ -65,6 +89,9 @@ class Resolved:
     model_id: str         # the real id on the wire
     base_url: str
     api_key: str
+    #: Per-model capabilities declared in providers.json (empty for a plain
+    #: string alias). Consumed by agent.build_request / compaction.
+    capabilities: Dict[str, Any] = field(default_factory=dict)
 
     def label(self) -> str:
         return f"{self.provider}:{self.model}"
@@ -253,12 +280,19 @@ def resolve(provider: Optional[str] = None,
     models = pcfg.get("models") or {}
     if not isinstance(models, dict):
         models = {}
+    capabilities: Dict[str, Any] = {}
     if model in models:
-        model_id = str(models[model])
-    elif model in models.values():
+        model_id, capabilities = split_model_entry(models[model])
+    elif any(split_model_entry(v)[0] == model for v in models.values()):
         # A real id typed straight in is accepted: convenient for one-offs
-        # and for providers whose alias table is empty by choice.
+        # and for providers whose alias table is empty by choice. Recover the
+        # capabilities of whichever alias maps to that wire id.
         model_id = model
+        for v in models.values():
+            wire, caps = split_model_entry(v)
+            if wire == model:
+                capabilities = caps
+                break
     elif provider == "env":
         # The environment provider is the legacy escape hatch: a raw model id
         # on AGENT_BASE_URL must keep working without being listed anywhere.
@@ -278,7 +312,8 @@ def resolve(provider: Optional[str] = None,
     if not base_url:
         raise ProviderError(f"provider {provider!r} has no base_url.")
     return Resolved(provider=provider, model=model, model_id=model_id,
-                    base_url=base_url, api_key=_key_for(pcfg, provider))
+                    base_url=base_url, api_key=_key_for(pcfg, provider),
+                    capabilities=capabilities)
 
 
 def client_for(res: Resolved):
@@ -312,7 +347,9 @@ def catalog() -> Dict[str, Any]:
             # for the wire id in the dropdown, saw the alias, and concluded the
             # model was missing. Model ids are not secret; keys still never
             # leave the process.
-            "model_ids": {a: str(models[a]) for a in aliases},
+            "model_ids": {a: split_model_entry(models[a])[0] for a in aliases},
+            "capabilities": {a: split_model_entry(models[a])[1]
+                             for a in aliases},
             "key_configured": _has_key(pcfg),
         }
     # The fallback chain as labels: the UI shows "a → b → c" so the operator
