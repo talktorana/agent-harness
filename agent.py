@@ -1203,13 +1203,23 @@ class Agent:
         seen = self._next_repeat_count(name, args)
         if seen < 2 or not getattr(config, "DUPLICATE_CALL_NOTICE", 1):
             return None
+        #: NAME THE CALL, not just the tool. A pass makes many calls to the same
+        #: tool -- 17 run_command calls in the 2026-11-23 16:30 mission -- so
+        #: "you repeated `run_command`" cannot be acted on or reported honestly.
+        #: That pass guessed "the dashboard suite, twice"; the measured repeat
+        #: was a python heredoc, three times. The hash lets an audit join this
+        #: notice to the exact action row, and the detail lets the model recognise
+        #: its own command. Same renderer as the action row, so the two agree.
         return (
             "\n\n[duplicate call] You have now run `%s` with these EXACT "
-            "arguments %d times in this run. This was not blocked -- if you are "
-            "polling for something that changes elsewhere, say so in your "
-            "narration and keep going. If you are re-checking a fact the "
-            "previous result already gave you, the earlier answer is still "
-            "true and each repeat costs a turn." % (name, seen))
+            "arguments %d times in this run (args_hash %s: %s). This was not "
+            "blocked -- if you are polling for something that changes "
+            "elsewhere, say so in your narration and keep going. If you are "
+            "re-checking a fact the previous result already gave you, the "
+            "earlier answer is still true and each repeat costs a turn. Name "
+            "THIS call if you report the repeat."
+            % (name, seen, session_mod.args_hash(args),
+               session_mod.detail_line(args, session_mod.NOTICE_ARG_CHARS)))
 
     def _slowest_route(self) -> Optional[Tuple["str", int]]:
         """(route, timeouts) for the route that cost this run the most clock."""

@@ -92,6 +92,39 @@ def _args_hash(args: Any) -> str:
 #: drifting apart.
 args_hash = _args_hash
 
+#: How much of one argument the runtime DUPLICATE NOTICE shows.
+#:
+#: Larger than ``DETAIL_ARG_CHARS`` on purpose. A timeline row is scanned; the
+#: notice is read by a model that has to recognise its OWN call out of many.
+#: Measured 2026-11-23: the repeated command began
+#: ``cd /project/app && python3 - <<'PY' import json rows=[...`` and the
+#: token that identified it (``closed_positions.jsonl``) fell past 90 characters
+#: -- so a 90-char notice still could not name the call, which is the whole
+#: problem. Same renderer, different budget, one place to change either.
+NOTICE_ARG_CHARS = 240
+
+
+def detail_line(args: Any, limit: int = DETAIL_ARG_CHARS) -> str:
+    """The human-readable rendering of one call's arguments.
+
+    Public because TWO readers need the identical RULES: the action row a later
+    audit pass reads, and the runtime duplicate notice the model reads. Without
+    a shared renderer the notice has to invent its own summary, and then the
+    thing the model was warned about and the thing the audit counts are
+    described differently. ``limit`` is the only difference, and it is explicit.
+
+    Measured 2026-11-23: a pass was told "you have run `run_command` with these
+    EXACT arguments 3 times" -- 17 run_command calls in that run, and no way to
+    tell which one -- so it reported the waste as "the dashboard suite, twice".
+    The real repeat was a python heredoc, three times. The notice was true and
+    still produced a false report, because it withheld the call's identity.
+
+    Truncated per argument: this is for READING. Use ``args_hash``/``fingerprint``
+    to COMPARE -- two commands differing past ANY cut render identically here.
+    """
+    return " ".join(f"{k}={_one_line(v, limit)}"
+                    for k, v in (args or {}).items()) or "(no arguments)"
+
 
 def fingerprint(name: str, args: Any) -> str:
     """The identity of one tool call: its name plus a fingerprint of its args.
@@ -213,8 +246,7 @@ class SessionLog:
     def action(self, step: int, name: str, args: Dict[str, Any],
                result: str, seconds: float) -> None:
         """Record one tool call. This is the spine of the timeline."""
-        detail = " ".join(f"{k}={_one_line(v, DETAIL_ARG_CHARS)}"
-                          for k, v in (args or {}).items()) or "(no arguments)"
+        detail = detail_line(args)
         ok = not _failed(result)
         if not ok:
             self._errors += 1
