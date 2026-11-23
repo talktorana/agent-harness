@@ -145,6 +145,59 @@ def run_project_collector() -> tuple[dict[str, Any], list[str]]:
     return payload, []
 
 
+#: A console cadence override at or above this multiple of the DECLARED interval
+#: is a hold on the mission, not a tuning choice.
+CADENCE_HOLD_RATIO = 4.0
+
+
+def _positive_number(value: Any) -> float | None:
+    """A usable positive number, or None -- never a guess and never a zero."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def cadence_override_attention(settings: Any, schedule: Any) -> list[str]:
+    """Name a console cadence override that is silently holding the mission.
+
+    ``overdue`` structurally cannot catch this: it compares the elapsed gap to
+    the override itself, so raising the interval moves the goalposts and a
+    stopped mission reads healthy. Only the DECLARED interval is independent of
+    the override, so that is the comparison that can see it.
+
+    Measured 2026-11-23: a pass POSTed ``every_min=4500`` against a declared 45
+    (100x) at 02:08:45 -- one minute into its own run -- and never restored it,
+    then reported SUCCESS. The mission stopped for 62 hours while ``overdue``
+    stayed False, because 62h is less than the 75h it had just invented.
+
+    An operator hold explains a pause and is never reported as a defect.
+    """
+    if not isinstance(settings, dict):
+        return []
+    if settings.get("every_min_source") != "console":
+        return []                       # a declared cadence is owner intent
+    hold = schedule.get("hold") if isinstance(schedule, dict) else None
+    if isinstance(hold, dict) and hold.get("held"):
+        return []                       # a real operator pause: deliberate
+    live = _positive_number(settings.get("every_min"))
+    if live is None:
+        return []
+    declared = _positive_number(settings.get("declared_every_min"))
+    if declared is None:
+        return ["the console cadence override cannot be compared: "
+                "declared_every_min is not readable, so a hold is not detectable"]
+    ratio = live / declared
+    if ratio < CADENCE_HOLD_RATIO:
+        return []
+    saved = settings.get("saved_at") or "unknown time"
+    return [f"console cadence override is holding the mission: every_min={live:g} "
+            f"against declared {declared:g} ({ratio:.0f}x, saved {saved}); no "
+            f"operator hold is present, so this is an unrestored hold and not a "
+            f"pause -- restore every_min to {declared:g} and verify next_due"]
+
+
 def build_snapshot(*, now: datetime | None = None,
                    fetch: JsonFetcher = fetch_json,
                    collector: Collector = run_project_collector,
@@ -174,6 +227,7 @@ def build_snapshot(*, now: datetime | None = None,
                      "seconds_until", "running", "in_progress_since", "in_progress_sec",
                      "duration_sec", "overdue_reason")
     settings = console.get("settings") or {}
+    attention.extend(cadence_override_attention(settings, console.get("schedule")))
     try:
         usage = shutil.disk_usage(config.PROJECT_ROOT)
         storage = {"free_gb": round(usage.free / 1e9, 2),
@@ -186,8 +240,12 @@ def build_snapshot(*, now: datetime | None = None,
         "fast_path_eligible": not attention,
         "attention_required": attention,
         "schedule": {key: job.get(key) for key in schedule_keys if key in job},
+        #: declared_every_min and saved_at are the ONLY independent evidence of
+        #: an unrestored cadence hold; without them the projection shows the
+        #: override with nothing to compare it to.
         "settings": {key: settings.get(key) for key in
-                     ("max_steps", "max_steps_source", "every_min", "every_min_source")
+                     ("max_steps", "max_steps_source", "every_min", "every_min_source",
+                      "declared_every_min", "saved_at")
                      if isinstance(settings, dict) and key in settings},
         "previous_scheduled_delivery": previous,
         "project_health": project,
