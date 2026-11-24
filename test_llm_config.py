@@ -165,7 +165,7 @@ class ConsoleModelChoiceTest(unittest.TestCase):
         self.assertEqual(llm.choice_source(), "catalogue")
 
     def test_a_saved_choice_outranks_the_catalogue_default(self):
-        llm.save_default_choice("alpha", "smart")
+        llm.save_default_choice("alpha", "smart", probe=False)
         self.assertEqual(llm.default_choice(), ("alpha", "smart"))
         self.assertEqual(llm.choice_source(), "console")
         # And it is what a caller that names nothing actually resolves to --
@@ -175,7 +175,7 @@ class ConsoleModelChoiceTest(unittest.TestCase):
                          ("alpha", "smart", "alpha-smart-2"))
 
     def test_the_saved_file_records_the_wire_id(self):
-        llm.save_default_choice("alpha", "smart")
+        llm.save_default_choice("alpha", "smart", probe=False)
         saved = json.loads(self.choice.read_text(encoding="utf-8"))
         self.assertEqual(saved["model_id"], "alpha-smart-2",
                          "the file must show the id the wire will see, not "
@@ -191,21 +191,21 @@ class ConsoleModelChoiceTest(unittest.TestCase):
         would die on it with nobody watching, and the console would still be
         displaying the selected name as if it were working.
         """
-        llm.save_default_choice("alpha", "fast")
+        llm.save_default_choice("alpha", "fast", probe=False)
         with self.assertRaises(llm.ProviderError):
-            llm.save_default_choice("alpha", "no-such-alias")
+            llm.save_default_choice("alpha", "no-such-alias", probe=False)
         self.assertEqual(llm.default_choice(), ("alpha", "fast"))
 
     def test_a_provider_without_a_key_cannot_be_saved(self):
         """Same rule for the other half of a route: a keyless provider is a
         configuration error, so it must never become the persisted default."""
         with self.assertRaises(llm.ProviderError):
-            llm.save_default_choice("nokey", "m")
+            llm.save_default_choice("nokey", "m", probe=False)
         self.assertFalse(self.choice.exists(),
                          "a rejected choice must not create the file")
 
     def test_clearing_returns_to_the_catalogue_default(self):
-        llm.save_default_choice("alpha", "smart")
+        llm.save_default_choice("alpha", "smart", probe=False)
         self.assertTrue(llm.clear_default_choice())
         self.assertEqual(llm.default_choice(), ("alpha", "fast"))
         self.assertEqual(llm.choice_source(), "catalogue")
@@ -238,7 +238,7 @@ class ConsoleModelChoiceTest(unittest.TestCase):
     def test_the_page_state_reports_the_effective_model_and_its_source(self):
         """The panel is rendered from this payload, so a stale or absent
         source here becomes a page that lies about which model is in force."""
-        llm.save_default_choice("alpha", "smart")
+        llm.save_default_choice("alpha", "smart", probe=False)
         state = webui._model_state()
         self.assertEqual(state["source"], "console")
         self.assertEqual(state["model"], "smart")

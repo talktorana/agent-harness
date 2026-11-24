@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -212,7 +213,8 @@ def default_choice() -> Tuple[str, str]:
     return "env", config.MODEL
 
 
-def save_default_choice(provider: str, model: str) -> Resolved:
+def save_default_choice(provider: str, model: str, *,
+                        probe: bool = True) -> Resolved:
     """Persist the console's choice for runs that do not name a model.
 
     RESOLVES BEFORE WRITING. Persisting an alias that does not exist, or a
@@ -221,8 +223,27 @@ def save_default_choice(provider: str, model: str) -> Resolved:
     here, while the operator is still looking at the page, and the previous
     choice stays in force. The write itself is atomic, so a crash mid-save can
     never leave a half-written file that breaks the next mission.
+
+    AND PROVES THE MODEL CAN COMPLETE A TURN (2026-11-24). Resolving only says
+    the alias and key exist. A model was promoted to default that resolved
+    cleanly and then stalled on every real mission turn, surviving only by
+    fallback. So the default -- the one choice every unattended mission
+    inherits -- must also pass :func:`probe_turn`, which sends a real
+    tool-enabled request. On failure the choice is REFUSED with the probe's
+    own reason and nothing is written. ``probe=False`` skips the network call
+    for callers that have already established liveness.
+
+    Raises ``ProviderError`` when the choice is unusable.
     """
     res = resolve(provider, model)      # raises ProviderError when unusable
+    if probe:
+        verdict = probe_turn(res.provider, res.model)
+        if not verdict.get("ok"):
+            raise ProviderError(
+                f"{res.label()} resolved but cannot complete an agentic turn "
+                f"({verdict.get('error')}: {verdict.get('detail', '')}). "
+                f"The previous default is unchanged. A model that stalls here "
+                f"would time out on every mission turn.")
     path = config.MODEL_CHOICE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / (path.name + ".tmp")
@@ -231,6 +252,91 @@ def save_default_choice(provider: str, model: str) -> Resolved:
                    encoding="utf-8")
     os.replace(tmp, path)
     return res
+
+
+#: Seconds a liveness probe may take before the model is judged stalled.
+#:
+#: Deliberately FAR below ``config.API_TIMEOUT_SEC`` (120 s by default). A
+#: probe exists to reject a model that cannot finish a turn, and waiting the
+#: full mission timeout to learn that would tie up the console for two minutes
+#: per attempt. A model that needs more than this to answer one tool call is
+#: not usable as an unattended default anyway.
+PROBE_TIMEOUT_SEC = float(os.environ.get("AGENT_PROBE_TIMEOUT_SEC", "45"))
+
+
+def probe_turn(provider: str, model: str, *,
+               timeout: Optional[float] = None) -> Dict[str, Any]:
+    """Can this model COMPLETE one real agentic turn? Report, never raise.
+
+    Resolving is not the same as working. ``resolve`` proves the alias exists
+    and a key is present; it says nothing about whether the model answers.
+    Measured 2026-11-24: a newly added model resolved cleanly and even replied
+    "ok" to a bare 32-token chat with one no-op tool, so it was promoted to
+    default. Its FIRST MISSION then stalled on every real turn -- four calls,
+    zero completions, each dying at the 120 s timeout -- and the run survived
+    only by falling back to the previous model, paying two minutes per turn.
+    The difference between the two probes was the REAL request: the full tool
+    schema and a real completion budget. So that is what this sends.
+
+    Uses :func:`agent.build_request` -- the one authority for what a mission
+    actually transmits -- so the probe can never test a lighter payload than
+    the one that matters. ``tool_choice`` is forced to a tool so a model that
+    only chats cannot pass by ignoring tools.
+
+    Returns a dict: ``ok`` (bool), ``seconds``, and on failure ``error`` --
+    one of ``timeout`` / ``http`` / ``exception`` / ``no_tool_call`` / ``bad_response``.
+    Never raises: callers report, and a probe must not be the thing that
+    breaks a console page.
+    """
+    started = time.monotonic()
+    out: Dict[str, Any] = {"provider": provider, "model": model}
+    try:
+        import agent as _agent  # lazy: avoids an import cycle at module load
+        res = resolve(provider, model)
+        out["model_id"] = res.model_id
+        request = _agent.build_request(
+            res.model_id,
+            [{"role": "user", "content":
+              "Call the manage_todo_list tool once to add a single item whose "
+              "title is 'liveness probe'. Do not reply in text."}],
+            use_tools=True, caps=res.capabilities)
+        if not request.get("tools"):
+            return {**out, "ok": False, "error": "bad_response",
+                    "detail": "model declares toolCalling False; it cannot "
+                              "run an agent mission"}
+        request["tool_choice"] = "required"
+        request["max_tokens"] = min(int(request.get("max_tokens") or 256),
+                                    512)
+        budget = PROBE_TIMEOUT_SEC if timeout is None else float(timeout)
+        #: ``client_for`` builds with the long MISSION timeout on purpose (a
+        #: reasoning model may think for minutes). The probe overrides it for
+        #: THIS request only, so a stalled model is rejected in seconds.
+        client = client_for(res)
+        response = client.chat.completions.create(**request, timeout=budget)
+        choice = (response.choices or [None])[0]
+        message = getattr(choice, "message", None) if choice else None
+        calls = list(getattr(message, "tool_calls", None) or []) if message else []
+        if not calls:
+            return {**out, "ok": False, "error": "no_tool_call",
+                    "detail": "the model answered without calling a tool; it "
+                              "cannot drive an agent loop"}
+        function = getattr(calls[0], "function", None)
+        try:
+            json.loads(getattr(function, "arguments", None) or "{}")
+        except (TypeError, ValueError):
+            return {**out, "ok": False, "error": "bad_response",
+                    "detail": "the tool call's arguments were not valid JSON"}
+        return {**out, "ok": True, "tool": getattr(function, "name", None),
+                "seconds": round(time.monotonic() - started, 2)}
+    except Exception as exc:  # noqa: BLE001 -- a probe reports, it never raises
+        name = type(exc).__name__
+        error = ("timeout" if "timeout" in name.lower()
+                 or "timed out" in str(exc).lower()
+                 else "http" if getattr(exc, "status_code", None)
+                 else "exception")
+        return {**out, "ok": False, "error": error,
+                "seconds": round(time.monotonic() - started, 2),
+                "detail": f"{name}: {str(exc)[:240]}"}
 
 
 def clear_default_choice() -> bool:

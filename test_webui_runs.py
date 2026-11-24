@@ -506,6 +506,30 @@ class HandlerRouteTest(TempDirs):
         from http.server import ThreadingHTTPServer
         import socket
 
+        #: The fake ``alpha`` provider must be able to COMPLETE a tool call.
+        #: Since 2026-11-24 ``save_default_choice`` probes liveness before it
+        #: promotes a model to default (a model that resolves but stalls was
+        #: once promoted and timed out on every mission turn). These tests
+        #: drive the real /model route against a provider that has no real
+        #: endpoint, so the probe's network seam is answered here -- otherwise
+        #: every save would be refused for a reason that has nothing to do
+        #: with the route under test.
+        import llm
+        from types import SimpleNamespace
+
+        def _live_client(_res):
+            def _create(**_request):
+                fn = SimpleNamespace(name="read_file", arguments='{"path": "x"}')
+                msg = SimpleNamespace(content=None,
+                                      tool_calls=[SimpleNamespace(function=fn)])
+                return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+            return SimpleNamespace(chat=SimpleNamespace(
+                completions=SimpleNamespace(create=_create)))
+
+        patcher = mock.patch.object(llm, "client_for", side_effect=_live_client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -642,6 +666,39 @@ class HandlerRouteTest(TempDirs):
                          "the response does not say the console is now "
                          "deciding, so the page cannot report it")
         self.assertEqual(llm.default_choice(), ("alpha", "smart"))
+
+    def test_post_model_refuses_a_model_that_stalls_and_keeps_the_old_choice(self):
+        """The operator sees WHY, on the page, instead of a dead default.
+
+        2026-11-24: a model that resolved cleanly was promoted to default and
+        then timed out on every mission turn. The route must now refuse it
+        with the probe's reason, answer 400 (the request was unusable), and
+        leave the previous choice in force.
+        """
+        import llm
+        self.write_catalog()
+        self.post("/model", {"provider": "alpha", "model": "fast"})
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"))
+
+        class _Stalled(Exception):
+            pass
+
+        def _stalled_client(_res):
+            def _create(**_request):
+                raise _Stalled("Request timed out.")
+            return types.SimpleNamespace(chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=_create)))
+
+        with mock.patch.object(llm, "client_for", side_effect=_stalled_client):
+            status, body = self.post("/model", {"provider": "alpha",
+                                                "model": "smart"})
+        self.assertEqual(status, 400)
+        doc = json.loads(body)
+        self.assertFalse(doc["ok"])
+        self.assertIn("cannot complete an agentic turn", doc["error"])
+        self.assertIn("timeout", doc["error"])
+        self.assertEqual(llm.default_choice(), ("alpha", "fast"),
+                         "a stalled model must not displace the working one")
 
     def test_post_model_refuses_an_unknown_alias_and_keeps_the_old_choice(self):
         import llm
