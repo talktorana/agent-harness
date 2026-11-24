@@ -701,6 +701,33 @@ def _rate_limited(message: str, last: List[Any]) -> Optional[str]:
     return message
 
 
+def _cadence_hold_message() -> str:
+    """One log line naming an unrestored console cadence hold, else "".
+
+    Returns the first attention item from ``preflight.cadence_override_attention``
+    (the single authority for the rule), prefixed so a reader of the daemon log
+    can tell it from a loop error. Empty string when the cadence is healthy, so
+    the caller's rate limiter stays quiet. Never raises: this is a diagnostic,
+    and a diagnostic must not be the reason the loop stops scheduling.
+    """
+    try:
+        import preflight  # lazy: keeps --once/--list free of preflight's deps
+        declared = None
+        for job in _load().get("jobs", []):
+            if isinstance(job, dict) and job.get("every_min") is not None:
+                declared = job.get("every_min")
+                break
+        items = preflight.cadence_override_attention(
+            run_settings.state(every_declared=declared),
+            {"hold": hold()},
+        )
+        if not items:
+            return ""
+        return "[scheduler] CADENCE HOLD (missions will not fire): " + str(items[0])
+    except Exception as exc:  # noqa: BLE001
+        return f"[scheduler] cadence-hold check failed: {type(exc).__name__}: {exc}"
+
+
 def daemon(poll_sec: float = 30.0) -> None:
     """Block forever, running due jobs. One bad job never kills the loop."""
     print(f"[scheduler] watching {config.SCHEDULE_FILE} every {poll_sec:.0f}s "
@@ -726,6 +753,10 @@ def daemon(poll_sec: float = 30.0) -> None:
               flush=True)
     #: [message, last_printed_monotonic, first_seen_monotonic]
     last_error: List[Any] = []
+    #: [message, ...] for the cadence-hold line. Kept SEPARATE from
+    #: ``last_error`` so a hold and a loop error can each be reported without
+    #: one suppressing the other.
+    last_hold: List[Any] = []
     while True:
         message: Optional[str] = None
         try:
@@ -749,6 +780,19 @@ def daemon(poll_sec: float = 30.0) -> None:
         line = _rate_limited(message or "", last_error)
         if line:
             print(line, flush=True)
+        #: THE LOOP MUST SEE A CADENCE HOLD, BECAUSE NOTHING ELSE CAN.
+        #:
+        #: ``preflight.cadence_override_attention`` runs INSIDE a mission. A
+        #: console override large enough to stop missions therefore stops the
+        #: only check that would name it -- which is why 2026-11-21's
+        #: every_min=4500 lasted 62 hours, and why the SAME override recurred
+        #: on 2026-11-23 at 22:05Z after a guard for it had already shipped.
+        #: The daemon loop runs whether or not missions do, so the detection
+        #: belongs here. The RULE is not duplicated: the loop builds the same
+        #: payload preflight consumes and calls the one shared function.
+        hold_line = _rate_limited(_cadence_hold_message(), last_hold)
+        if hold_line:
+            print(hold_line, flush=True)
         time.sleep(poll_sec)
 
 
