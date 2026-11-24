@@ -236,6 +236,22 @@ TOOL_TIMEOUT_SEC = int(os.environ.get("AGENT_TOOL_TIMEOUT_SEC", "180"))
 #: Counted per route, per run, and NEVER persisted: a provider that hiccups
 #: tonight is still eligible as tomorrow's primary. ``0`` disables demotion.
 ROUTE_TIMEOUT_LIMIT = int(os.environ.get("AGENT_ROUTE_TIMEOUT_LIMIT", "4") or "0")
+#: How long a route that ended a turn UNSERVED is stepped over on later turns:
+#: after it spent every retry on transient errors, or after its provider said
+#: outright that the whole pool is exhausted. The timeout demotion above cannot
+#: see that case -- it counts TIMEOUTS -- so a capacity-starved primary was
+#: retried from attempt 1 on EVERY turn. Measured live 2026-11-24 14:19: the
+#: default model answered "429 - 292 of 310 providers for this model are out of
+#: quota or cooling down" on all 15 attempts of a 4-turn fast path; each attempt
+#: was held ~35 s before failing and the backoff added ~65 s, so every turn
+#: re-paid ~4.6 min and an 876-second run held about three minutes of work.
+#:
+#: A COOLDOWN, not a ban: once the window lapses the route is probed again, so
+#: a pool that recovers is back in use (at the cost of one failed call per
+#: window if it has not). Like the timeout count it lives per run and is never
+#: persisted. ``0`` disables the park and restores per-turn retries.
+ROUTE_EXHAUST_COOLDOWN_SEC = float(
+    os.environ.get("AGENT_ROUTE_EXHAUST_COOLDOWN_SEC", "600") or "0")
 #: Tell the model when it repeats an EXACT tool call within one run. The
 #: fingerprint this uses was already computed for every call -- but only ever
 #: written into the session record, so its sole consumer was a later audit.

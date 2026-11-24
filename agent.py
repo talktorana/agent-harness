@@ -126,11 +126,23 @@ _ROUTE_DEAD_STATUS = {400, 401, 402, 403, 404, 405, 410, 413, 422}
 #: -- on a route that never served a single call. Only 4 of the 99 retries were
 #: real timeouts, so the route-timeout stepping never fired either: it counts
 #: TIMEOUTS, and this failure is not one.
+#:
+#: Measured again 2026-11-24 14:19, as a **429** in a different wording: the
+#: default model answered "292 of 310 providers for this model are out of
+#: quota or cooling down ... every provider within your price limit is busy or
+#: rate-limited right now" on all 15 attempts of a 4-turn fast path. Not one
+#: phrase matched, so it was classed an ordinary transient 429: six backoff
+#: retries a turn, each held ~35 s before failing -- 876 s for a run holding
+#: about three minutes of work. The status code keeps changing; the meaning
+#: ("my whole pool is exhausted") is what the match must be on.
 _PROVIDER_EXHAUSTED_MARKERS = (
     "no available provider",
     "all offers exhausted",
     "offers exhausted or in cooldown",
     "in cooldown",
+    "out of quota",
+    "cooling down",
+    "within your price limit",
 )
 
 
@@ -456,6 +468,11 @@ class Agent:
         #: run for an old route's timeouts.
         self._run_started_monotonic = 0.0
         self._route_timeouts: Dict[str, int] = {}
+        #: Monotonic deadlines for routes parked after ending a turn UNSERVED
+        #: (``ROUTE_EXHAUST_COOLDOWN_SEC``). Reset when a run starts, for the
+        #: same reason as ``_route_timeouts``: never persisted, so a provider
+        #: that was starved in one run is the next run's primary again.
+        self._route_parked_until: Dict[str, float] = {}
         #: Fingerprints of the tool calls made so far in THIS run, so an exact
         #: repeat can be named to the model. Declared here and RESET when a run
         #: starts (``_run_impl``), because one Agent object can run more than one
@@ -858,8 +875,70 @@ class Agent:
             return getattr(config, "DEEP_REASONING_EFFORT", "") or config.REASONING_EFFORT
         return config.REASONING_EFFORT
 
+    def _route_cooldown_left(self, label: str) -> float:
+        """Seconds (never negative) before an exhaustion park on ``label`` lapses."""
+        until = getattr(self, "_route_parked_until", {}).get(label)
+        if not until:
+            return 0.0
+        return max(0.0, until - time.monotonic())
+
+    def _parked_routes(self) -> Dict[str, float]:
+        """{route: seconds left} for every route parked right now."""
+        now = time.monotonic()
+        return {lab: round(max(0.0, until - now), 1)
+                for lab, until in (getattr(self, "_route_parked_until", {})
+                                   or {}).items()
+                if until > now}
+
+    def _park_route(self, label: str, why: str) -> None:
+        """Step over ``label`` on later turns until the cooldown lapses.
+
+        A COOLDOWN, deliberately not the run-long ban the timeout limit is:
+        a pool that was starved a minute ago may have capacity in ten, and the
+        operator picked this route first on purpose. Once the window lapses the
+        route is probed again, so the cost of a wrong park is one failed call
+        per window -- and the cost of no park was measured at ~4.6 minutes per
+        turn (2026-11-24 14:19). ``0`` disables the park entirely.
+        """
+        window = getattr(config, "ROUTE_EXHAUST_COOLDOWN_SEC", 0) or 0
+        if window <= 0:
+            return
+        until = time.monotonic() + window
+        parked = getattr(self, "_route_parked_until", None)
+        if parked is None:
+            parked = {}
+            self._route_parked_until = parked
+        parked[label] = until
+        self._log({"event": "route_parked", "route": label, "reason": why,
+                   "cooldown_sec": window})
+        if self.session:
+            try:
+                self.session.event("route_parked", route=label, reason=why,
+                                   cooldown_sec=window)
+            except Exception:  # noqa: BLE001 -- never let logging kill a run
+                pass
+
+    def _route_park_reason(self, label: str) -> str:
+        """Why ``label`` is being stepped over, in the operator's words."""
+        hits = getattr(self, "_route_timeouts", {}).get(label, 0)
+        limit = getattr(config, "ROUTE_TIMEOUT_LIMIT", 0)
+        if limit > 0 and hits >= limit:
+            return f"parked for this run ({hits} timeouts, limit {limit})"
+        left = self._route_cooldown_left(label)
+        return (f"parked for {left:.0f}s more (it ended an earlier turn "
+                f"unserved; cooldown "
+                f"{getattr(config, 'ROUTE_EXHAUST_COOLDOWN_SEC', 0):.0f}s)")
+
     def _route_demoted(self, label: str) -> bool:
-        """True once ``label`` has hit its per-run timeout limit.
+        """True once ``label`` must be stepped over for the turn about to run.
+
+        Two things park a route:
+
+        * it reached its per-run TIMEOUT limit (``ROUTE_TIMEOUT_LIMIT``), for
+          the rest of the run; or
+        * it ended an earlier turn UNSERVED -- every retry spent on transient
+          errors, or a provider that said its whole pool is exhausted -- and
+          the ``ROUTE_EXHAUST_COOLDOWN_SEC`` window has not lapsed yet.
 
         The chain walk must consult this at the TOP of the loop, not only when a
         timeout occurs. Until it did, demotion fired only on the turn where the
@@ -875,7 +954,9 @@ class Agent:
         """
         limit = getattr(config, "ROUTE_TIMEOUT_LIMIT", 0)
         timeouts = getattr(self, "_route_timeouts", {}).get(label, 0)
-        return limit > 0 and timeouts >= limit
+        if limit > 0 and timeouts >= limit:
+            return True
+        return self._route_cooldown_left(label) > 0
 
     # ----------------------------------------------------------------- api
 
@@ -921,20 +1002,24 @@ class Agent:
             label = f"{prov}/{alias}"
             if skip_demoted and self._route_demoted(label):
                 hits = getattr(self, "_route_timeouts", {}).get(label, 0)
-                why = (f"{label}: parked for this run ({hits} timeouts, limit "
-                       f"{config.ROUTE_TIMEOUT_LIMIT})")
+                left = round(self._route_cooldown_left(label), 1)
+                why = f"{label}: {self._route_park_reason(label)}"
                 problems.append(why)
-                self._say(f"\n\033[33m[route] {label} already hit its "
-                          f"per-run timeout limit ({hits}) -- trying next "
+                self._say(f"\n\033[33m[route] {label} "
+                          f"{self._route_park_reason(label)} -- trying next "
                           f"route\033[0m")
                 #: Auditable: a parked route must be visible in the record, or
                 #: a later pass sees it vanish from the chain with no reason.
                 self._log({"event": "route_skipped", "route": label,
-                           "timeouts": hits})
+                           "timeouts": hits,
+                           "reason": self._route_park_reason(label),
+                           "cooldown_left_sec": left})
                 if self.session:
                     try:
-                        self.session.event("route_skipped", route=label,
-                                           timeouts=hits)
+                        self.session.event(
+                            "route_skipped", route=label, timeouts=hits,
+                            reason=self._route_park_reason(label),
+                            cooldown_left_sec=left)
                     except Exception:  # noqa: BLE001 -- never let logging kill a run
                         pass
                 continue
@@ -1028,8 +1113,16 @@ class Agent:
                         self._say(f"\n\033[33m[route] {label} refused "
                                   f"({type(exc).__name__}: {str(exc)[:120]}) "
                                   f"-- trying next route\033[0m")
+                        pool_gone = _is_provider_exhausted(exc)
                         self._log({"event": "route_dead", "route": label,
-                                   "error": str(exc)[:500]})
+                                   "error": str(exc)[:500],
+                                   "pool_exhausted": pool_gone})
+                        if pool_gone:
+                            #: Also step over it on LATER turns, for the
+                            #: cooldown window: a pool that has just said it
+                            #: has nothing will say it again next turn, and a
+                            #: per-turn fallback re-pays the call every time.
+                            self._park_route(label, "provider pool exhausted")
                         break
                     if not _is_transient(exc):
                         raise
@@ -1062,6 +1155,13 @@ class Agent:
                     if attempt == config.API_RETRIES - 1:
                         problems.append(
                             f"{label}: {type(exc).__name__}: {exc}")
+                        #: Every retry is spent and this route never served the
+                        #: turn. The fallback below covers THIS turn; the park
+                        #: keeps the NEXT one from paying for all of it again
+                        #: (measured 2026-11-24: ~4.6 min per turn).
+                        self._park_route(
+                            label, f"{type(exc).__name__} on all "
+                                   f"{config.API_RETRIES} attempts")
                         break
                     delay = _backoff(attempt, _retry_after(exc))
                     self._say(f"\n\033[33m[{type(exc).__name__}] "
@@ -1092,6 +1192,7 @@ class Agent:
                     return response
                 if attempt == config.API_RETRIES - 1:
                     problems.append(f"{label}: empty completion")
+                    self._park_route(label, "empty completion on every attempt")
                     break
                 delay = _backoff(attempt, None)
                 self._say(f"\n\033[33m[empty completion] retry {attempt + 1}/"
@@ -1309,6 +1410,7 @@ class Agent:
         self._bound_storage()
         self._run_started_monotonic = time.monotonic()
         self._route_timeouts = {}
+        self._route_parked_until = {}
         self._call_fingerprints = {}
         self._deep_reasoning = False
         self._active_reasoning_effort = config.REASONING_EFFORT
@@ -1405,10 +1507,12 @@ class Agent:
                     self._log({"event": "time_limit", "step": step,
                                "elapsed_sec": round(elapsed, 1),
                                "budget_sec": max_run_sec,
-                               "route_timeouts": dict(self._route_timeouts)})
+                               "route_timeouts": dict(self._route_timeouts),
+                               "parked": self._parked_routes()})
                     if self.session:
                         self.session.event(
                             "route_health", timeouts=self._route_timeouts or {},
+                            parked=self._parked_routes() or {},
                             slowest_route=(str(slowest_route[0])
                                            if slowest_route else None),
                             slowest_timeouts=(slowest_route[1]
@@ -1534,6 +1638,12 @@ class Agent:
             cause = (f"; the slowest route was {slowest[0]} with "
                      f"{slowest[1]} timeout(s)"
                      if slowest and len(self._route_timeouts) else "")
+            parked_now = self._parked_routes()
+            if parked_now:
+                cause += ("; parked after serving nothing: "
+                          + ", ".join(f"{lab} ({sec:.0f}s)"
+                                      for lab, sec in
+                                      sorted(parked_now.items())))
             self._say(f"\n[stopped] used {int(spent)}s of the "
                       f"{int(max_run_sec)}s wall-clock budget on turn "
                       f"{self.steps} of {max_steps}{cause}")
