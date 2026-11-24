@@ -177,13 +177,44 @@ class TheProbeSendsWhatAMissionSends(unittest.TestCase):
         self.assertEqual(request["model"], "alpha-smart-2",
                          "it must call the WIRE id, not the alias")
 
-    def test_the_completion_budget_is_bounded(self):
+    def test_the_probe_sends_the_models_real_budget_not_a_capped_one(self):
+        # THE 2026-11-24 INCIDENT: a model's declared maxOutputTokens (262144,
+        # copied from a sibling) was above the provider's limit (131072). The
+        # first probe capped max_tokens at 512, so it PASSED, the model was
+        # promoted, and every real mission turn was a 400. The probe must send
+        # what a mission sends, or it cannot catch a refused capability.
         seen = []
         with mock.patch.object(llm, "client_for",
                                return_value=_client(_response([_call()]),
                                                     seen=seen)):
             llm.probe_turn("alpha", "smart")
-        self.assertLessEqual(int(seen[0]["max_tokens"]), 512)
+        self.assertNotIn("max_tokens", seen[0],
+                         "a plain-string alias declares no budget; the probe "
+                         "must not invent a small one that a mission never sends")
+
+    def test_a_declared_budget_the_provider_refuses_fails_the_probe(self):
+        refused = json.loads(json.dumps(CATALOG))
+        refused["providers"]["alpha"]["models"]["smart"] = {
+            "id": "alpha-smart-2", "maxOutputTokens": 262144,
+            "toolCalling": True}
+
+        class _Refused(Exception):
+            status_code = 400
+
+        def create(**request):
+            if request.get("max_tokens") == 262144:
+                raise _Refused("The max_tokens parameter is illegal: "
+                               "limit [1,131072]")
+            return _response([_call()])
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=create)))
+        with mock.patch.object(llm, "_load_file", return_value=refused), \
+                mock.patch.object(llm, "client_for", return_value=client):
+            verdict = llm.probe_turn("alpha", "smart")
+        self.assertFalse(verdict["ok"], verdict)
+        self.assertEqual(verdict["error"], "http")
+        self.assertIn("max_tokens", verdict["detail"])
 
     def test_the_request_timeout_is_far_below_the_mission_timeout(self):
         seen_timeouts = []

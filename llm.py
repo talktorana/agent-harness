@@ -305,8 +305,13 @@ def probe_turn(provider: str, model: str, *,
                     "detail": "model declares toolCalling False; it cannot "
                               "run an agent mission"}
         request["tool_choice"] = "required"
-        request["max_tokens"] = min(int(request.get("max_tokens") or 256),
-                                    512)
+        #: SEND THE MODEL'S REAL COMPLETION BUDGET, uncapped. The first version
+        #: of this probe capped ``max_tokens`` at 512 -- and so PASSED a model
+        #: whose declared ``maxOutputTokens`` (262144, copied from a sibling)
+        #: its provider rejects (limit 131072). Every real mission turn was a
+        #: 400, and the run survived only by fallback. A probe that sends a
+        #: lighter payload than a mission cannot catch a capability the
+        #: provider refuses, so it sends exactly what a mission would.
         budget = PROBE_TIMEOUT_SEC if timeout is None else float(timeout)
         #: ``client_for`` builds with the long MISSION timeout on purpose (a
         #: reasoning model may think for minutes). The probe overrides it for
