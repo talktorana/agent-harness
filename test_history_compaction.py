@@ -253,5 +253,60 @@ class RequestCacheTest(unittest.TestCase):
         self.assertNotIn("cache_write_tokens", transcript[0])
 
 
+class HistoryBudgetWarningTest(unittest.TestCase):
+    def _agent_with_messages(self, messages):
+        instance = agent_mod.Agent.__new__(agent_mod.Agent)
+        instance.messages = list(messages)
+        instance._history_budget_warned = False
+        instance._active_caps = {}
+        transcript = []
+        instance._log = transcript.append
+
+        class Session:
+            jsonl_path = pathlib.Path("run.jsonl")
+
+            def __init__(self):
+                self.events = []
+
+            def event(self, kind, **fields):
+                self.events.append((kind, fields))
+
+        instance.session = Session()
+        return instance, transcript
+
+    def test_compact_history_warns_once_when_budget_below_prefix_plus_keep(self):
+        msgs = [
+            {"role": "system", "content": "S" * 600},
+            {"role": "user", "content": "U" * 600},
+        ] + turn(1, result_chars=200) + turn(2, result_chars=200)
+        instance, transcript = self._agent_with_messages(msgs)
+        with mock.patch.object(config, "HISTORY_MAX_CHARS", 1500), \
+                mock.patch.object(config, "HISTORY_KEEP_CHARS", 400), \
+                mock.patch.object(config, "HISTORY_SUMMARY_CHARS", 500):
+            instance._compact_history()
+            instance.messages.extend(turn(3, result_chars=200))
+            instance._compact_history()
+        warnings = [r for r in transcript if r.get("event") == "history_warning"]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("HISTORY_MAX_CHARS (1500)", warnings[0]["error"])
+        self.assertIn("static prefix (1200)", warnings[0]["error"])
+        sess_warnings = [e for e in instance.session.events
+                         if e[0] == "history_warning"]
+        self.assertEqual(len(sess_warnings), 1, sess_warnings)
+
+    def test_compact_history_does_not_warn_when_budget_has_headroom(self):
+        msgs = [
+            {"role": "system", "content": "S" * 600},
+            {"role": "user", "content": "U" * 600},
+        ] + turn(1, result_chars=200) + turn(2, result_chars=200)
+        instance, transcript = self._agent_with_messages(msgs)
+        with mock.patch.object(config, "HISTORY_MAX_CHARS", 5000), \
+                mock.patch.object(config, "HISTORY_KEEP_CHARS", 400), \
+                mock.patch.object(config, "HISTORY_SUMMARY_CHARS", 500):
+            instance._compact_history()
+        warnings = [r for r in transcript if r.get("event") == "history_warning"]
+        self.assertEqual(warnings, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1226,6 +1226,24 @@ class Agent:
                 max_chars = mit * 4
         if not max_chars:
             return
+        if (len(self.messages) >= 2
+                and not getattr(self, "_history_budget_warned", False)):
+            prefix_chars = history.history_chars(self.messages[:2])
+            floor = (prefix_chars + config.HISTORY_KEEP_CHARS
+                     + config.HISTORY_SUMMARY_CHARS)
+            if floor >= max_chars:
+                self._history_budget_warned = True
+                warn_msg = (
+                    f"HISTORY_MAX_CHARS ({max_chars}) <= static prefix "
+                    f"({prefix_chars}) + keep ({config.HISTORY_KEEP_CHARS}) "
+                    f"+ summary ({config.HISTORY_SUMMARY_CHARS}) = {floor}; "
+                    f"compaction will fire on every turn")
+                self._log({"event": "history_warning", "error": warn_msg})
+                if self.session is not None:
+                    try:
+                        self.session.event("history_warning", error=warn_msg)
+                    except Exception:  # noqa: BLE001
+                        pass
         session_file = (self.session.jsonl_path.name
                         if self.session is not None else "")
         try:
@@ -1413,6 +1431,7 @@ class Agent:
         self._route_parked_until = {}
         self._call_fingerprints = {}
         self._deep_reasoning = False
+        self._history_budget_warned = False
         self._active_reasoning_effort = config.REASONING_EFFORT
         self._run_elapsed_at_stop = None
 
