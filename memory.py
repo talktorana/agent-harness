@@ -41,6 +41,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -55,6 +56,15 @@ from config import (
 #: Serialises every memory mutation in this process. See the module docstring:
 #: a lock is what makes "one container, two surfaces" safe.
 _LOCK = threading.RLock()
+
+
+def _serialized_memory_mutation(method):
+    """Keep a mutator's initial read, validation and final write indivisible."""
+    @wraps(method)
+    def locked(*args, **kwargs):
+        with _LOCK:
+            return method(*args, **kwargs)
+    return locked
 
 
 def _atomic_write(p: Path, text: str) -> None:
@@ -260,6 +270,7 @@ class MemoryStore:
         except OSError:
             return None
 
+    @_serialized_memory_mutation
     def revise(self, scope: str, old: str, new: str) -> str:
         """Correct a note in place instead of stacking a correction on top.
 
@@ -312,6 +323,7 @@ class MemoryStore:
                 f"{before} -> {after} lines."
                 + (f"\nPrevious version saved to {bak}" if bak else ""))
 
+    @_serialized_memory_mutation
     def retire(self, scope: str, heading: str) -> str:
         """Remove one whole titled note from a scope.
 
